@@ -1,0 +1,192 @@
+name: Spec to App
+
+on:
+  push:
+    branches: [main]
+    paths:
+      - "specs/**/*.md"
+      - "!specs/TEMPLATE.md"
+  workflow_dispatch:
+    inputs:
+      spec_path:
+        description: "Path to the specification markdown file"
+        required: true
+        default: "specs/example-app.md"
+        type: string
+      skip_research:
+        description: "Skip research & judge stages to save tokens"
+        required: false
+        default: true
+        type: boolean
+      clean_app_dir:
+        description: "Clean app/ before writing newly generated files"
+        required: false
+        default: true
+        type: boolean
+      max_fix_rounds:
+        description: "Maximum auto-fix verification rounds"
+        required: false
+        default: "3"
+        type: string
+
+permissions:
+  contents: write
+  pull-requests: write
+
+concurrency:
+  group: spec-to-app-${{ github.ref }}
+  cancel-in-progress: false
+
+jobs:
+  build-and-verify:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          fetch-depth: 2
+
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+          cache: "pip"
+
+      - uses: actions/setup-node@v4
+        with:
+          node-version: "20"
+
+      - name: Install Atlas and verification tools
+        run: pip install -e . pytest ruff
+
+      - name: Resolve target specification
+        id: spec
+        env:
+          EVENT_NAME: ${{ github.event_name }}
+          SPEC_PATH_INPUT: ${{ inputs.spec_path }}
+        run: |
+          if [ "$EVENT_NAME" = "workflow_dispatch" ]; then
+            SPEC_PATH="$SPEC_PATH_INPUT"
+          else
+            SPEC_PATH=$(git diff --name-only --diff-filter=AM HEAD~1 HEAD -- 'specs/*.md' 'specs/**/*.md' ':!specs/TEMPLATE.md' | head -n 1 || true)
+            if [ -z "$SPEC_PATH" ]; then
+              SPEC_PATH="specs/example-app.md"
+            fi
+          fi
+
+          python - "$SPEC_PATH" <<'PY'
+          import re
+          import os
+          import sys
+          from pathlib import Path, PurePosixPath
+
+          value = sys.argv[1]
+          path = PurePosixPath(value)
+          if (
+              not re.fullmatch(r"specs/[A-Za-z0-9._/-]+\.md", value)
+              or path.as_posix() != value
+              or any(part in {".", ".."} for part in path.parts)
+              or not Path(value).is_file()
+          ):
+              raise SystemExit("Choose an existing Markdown spec inside specs/.")
+
+          with open(os.environ["GITHUB_OUTPUT"], "a", encoding="utf-8") as output:
+              output.write(f"path={value}\n")
+          print(f"Resolved spec: {value}")
+          PY
+
+      - name: Build, test, and verify application
+        id: build
+        env:
+          ANTHROPIC_API_KEY: ${{ secrets.ANTHROPIC_API_KEY }}
+          OPENAI_API_KEY: ${{ secrets.OPENAI_API_KEY }}
+          GEMINI_API_KEY: ${{ secrets.GEMINI_API_KEY }}
+          EVENT_NAME: ${{ github.event_name }}
+          SPEC_PATH: ${{ steps.spec.outputs.path }}
+          SKIP_RESEARCH: ${{ inputs.skip_research }}
+          CLEAN_APP_DIR: ${{ inputs.clean_app_dir }}
+          MAX_FIX_ROUNDS: ${{ inputs.max_fix_rounds }}
+        run: |
+          FLAGS=(--app-dir app --out runs --report-out run-report.md)
+          if [ "$EVENT_NAME" = "workflow_dispatch" ]; then
+            if [ "$SKIP_RESEARCH" = "true" ]; then
+              FLAGS+=(--skip-research)
+            elif [ "$SKIP_RESEARCH" != "false" ]; then
+              echo "skip_research must be true or false" >&2
+              exit 2
+            fi
+            if [ "$CLEAN_APP_DIR" = "true" ]; then
+              FLAGS+=(--clean)
+            elif [ "$CLEAN_APP_DIR" != "false" ]; then
+              echo "clean_app_dir must be true or false" >&2
+              exit 2
+            fi
+            if [ -n "$MAX_FIX_ROUNDS" ]; then
+              if [[ ! "$MAX_FIX_ROUNDS" =~ ^[0-9]{1,2}$ ]] || (( 10#$MAX_FIX_ROUNDS > 10 )); then
+                echo "max_fix_rounds must be an integer from 0 to 10" >&2
+                exit 2
+              fi
+              FLAGS+=(--max-fix-rounds "$MAX_FIX_ROUNDS")
+            fi
+          else
+            FLAGS+=(--clean --skip-research)
+          fi
+
+          set +e
+          atlas build "$SPEC_PATH" "${FLAGS[@]}"
+          EXIT_CODE=$?
+          set -e
+
+          echo "exit_code=$EXIT_CODE" >> "$GITHUB_OUTPUT"
+          if [ -f run-report.md ]; then
+            cat run-report.md >> "$GITHUB_STEP_SUMMARY"
+          fi
+
+      - name: Upload run artifacts (manifest, tokens.json, report.md)
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: atlas-run-artifacts
+          path: |
+            runs/
+            run-report.md
+
+      - name: Open Pull Request with generated app and token report
+        if: always()
+        env:
+          GH_TOKEN: ${{ github.token }}
+          SPEC_PATH: ${{ steps.spec.outputs.path }}
+          RUN_ID: ${{ github.run_id }}
+          BUILD_EXIT_CODE: ${{ steps.build.outputs.exit_code }}
+        run: |
+          if [ -z "$(git status --porcelain app/)" ]; then
+            echo "No changes in app/ to open a PR for."
+            exit 0
+          fi
+
+          git config user.name "atlas-bot"
+          git config user.email "atlas-bot@users.noreply.github.com"
+
+          BRANCH="atlas/build-${RUN_ID}"
+          git checkout -b "$BRANCH"
+          git add app/
+          git commit -m "feat(app): generate from ${SPEC_PATH}"
+          git push -u origin "$BRANCH"
+
+          STATUS_LABEL="verified"
+          if [ "$BUILD_EXIT_CODE" != "0" ]; then
+            STATUS_LABEL="verification-failed"
+          fi
+
+          BODY_FILE="run-report.md"
+          if [ ! -f "$BODY_FILE" ]; then
+            echo "Atlas build finished with exit code ${BUILD_EXIT_CODE}." > "$BODY_FILE"
+          fi
+
+          gh pr create \
+            --base main \
+            --head "$BRANCH" \
+            --title "feat(app): build from ${SPEC_PATH} [${STATUS_LABEL}]" \
+            --body-file "$BODY_FILE"
+
+      - name: Enforce build verification status
+        if: steps.build.outputs.exit_code != '0'
+        run: exit "${{ steps.build.outputs.exit_code }}"

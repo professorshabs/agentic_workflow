@@ -1,0 +1,32 @@
+# These LiteLLM aliases are maintained by their providers and can move to newer
+# models over time. Use pinned model IDs here when you need repeatable behavior.
+roles:
+  parser: [anthropic/claude-sonnet-latest]
+  researcher: [anthropic/claude-sonnet-latest]
+  judge: [anthropic/claude-sonnet-latest]
+  builder: [anthropic/claude-sonnet-latest]
+  fixer: [anthropic/claude-sonnet-latest]
+
+# Fallbacks are applied after the requested model. Prefer same-provider fallbacks
+# where possible. Add credentials for the providers you intend to use.
+role_fallbacks:
+  parser: [openai/gpt-mini-latest, gemini/gemini-3.8-flash]
+  researcher: [openai/gpt-mini-latest, gemini/gemini-3.8-flash]
+  judge: [openai/gpt-terra-latest, gemini/gemini-3.8-flash]
+  builder: [openai/gpt-terra-latest, gemini/gemini-3.8-flash]
+  fixer: [openai/gpt-mini-latest, gemini/gemini-3.8-flash]
+
+# Last-resort fallbacks if a role has no specific fallback configured.
+fallbacks: []
+
+limits:
+  max_parallel_calls: 6
+  max_tokens: 6000
+  timeout_seconds: 90
+  attempts_per_model: 2
+  repair_attempts: 1
+  max_fix_rounds: 3
+  verify_timeout_seconds: 180
+  # Optional hard caps to prevent runaway spend (null = unlimited):
+  max_total_tokens: null
+  max_cost_usd: null

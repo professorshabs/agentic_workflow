@@ -6,7 +6,8 @@ from pathlib import Path
 import pytest
 from pydantic import ValidationError
 
-from atlas.pipeline.verify import _verification_env, verify_app
+from atlas.pipeline.build import materialize_files, snapshot_app_files
+from atlas.pipeline.verify import _run_subprocess, _verification_env, detect_stack, verify_app
 from atlas.router import ModelRouter
 from atlas.runner import run_build
 from atlas.schemas import GeneratedFile
@@ -66,6 +67,8 @@ class MockBuildRouter(ModelRouter):
 def test_verification_environment_removes_credentials(monkeypatch):
     monkeypatch.setenv("PATH", "/tools/bin")
     monkeypatch.setenv("ANTHROPIC_API_KEY", "provider-secret")
+    monkeypatch.setenv("OPENROUTER_API_KEY", "openrouter-secret")
+    monkeypatch.setenv("GEMINI_API_KEY", "gemini-secret")
     monkeypatch.setenv("GITHUB_TOKEN", "github-secret")
     monkeypatch.setenv("GITHUB_STEP_SUMMARY", "/tmp/summary")
     monkeypatch.setenv("ACTIONS_RUNTIME_TOKEN", "runtime-secret")
@@ -78,6 +81,8 @@ def test_verification_environment_removes_credentials(monkeypatch):
 
     assert env["PATH"] == "/tools/bin"
     assert "ANTHROPIC_API_KEY" not in env
+    assert "OPENROUTER_API_KEY" not in env
+    assert "GEMINI_API_KEY" not in env
     assert "GITHUB_TOKEN" not in env
     assert "GITHUB_STEP_SUMMARY" not in env
     assert "ACTIONS_RUNTIME_TOKEN" not in env
@@ -376,3 +381,314 @@ def test_cli_verify_tokens_and_validate_config_smoke(tmp_path):
     )
     assert val_proc.returncode == 0, val_proc.stderr
     assert "Config valid:" in val_proc.stdout
+
+
+def test_materialize_files_clean_delete_and_snapshot(tmp_path):
+    app_dir = tmp_path / "app"
+    app_dir.mkdir()
+    (app_dir / ".gitkeep").write_text("", encoding="utf-8")
+    (app_dir / "stale.py").write_text("old\n", encoding="utf-8")
+    (app_dir / "old_dir").mkdir()
+    (app_dir / "old_dir" / "junk.txt").write_text("junk", encoding="utf-8")
+
+    written = materialize_files(
+        app_dir,
+        [GeneratedFile(path="main.py", content="print('ok')")],
+        clean=True,
+    )
+    assert written == ["main.py"]
+    assert (app_dir / ".gitkeep").is_file()
+    assert not (app_dir / "stale.py").exists()
+    assert not (app_dir / "old_dir").exists()
+    assert (app_dir / "main.py").read_text(encoding="utf-8") == "print('ok')\n"
+
+    materialize_files(
+        app_dir,
+        [GeneratedFile(path="extra.py", content="x = 1\n")],
+        delete_files=["main.py"],
+    )
+    assert not (app_dir / "main.py").exists()
+    assert (app_dir / "extra.py").is_file()
+
+    (app_dir / "__pycache__").mkdir()
+    (app_dir / "__pycache__" / "ignored.pyc").write_bytes(b"\x00\x01")
+    (app_dir / "z_big.txt").write_text("A" * 800, encoding="utf-8")
+
+    snap = snapshot_app_files(app_dir, max_total_chars=600)
+    assert "extra.py" in snap
+    assert ".gitkeep" not in snap
+    assert "__pycache__/ignored.pyc" not in snap
+    assert snap["z_big.txt"].endswith("... [truncated]")
+
+
+async def test_detect_stack_and_verify_app_edge_cases(tmp_path):
+    missing_stack, missing_checks = await verify_app(tmp_path / "does_not_exist")
+    assert missing_stack == "other"
+    assert missing_checks[0].name == "app-dir-exists"
+    assert missing_checks[0].passed is False
+
+    empty_dir = tmp_path / "empty"
+    empty_dir.mkdir()
+    (empty_dir / ".gitkeep").write_text("", encoding="utf-8")
+    (empty_dir / ".venv").mkdir()
+    (empty_dir / ".venv" / "ignored.py").write_text("x = 1\n", encoding="utf-8")
+    assert detect_stack(empty_dir) == "other"
+    empty_stack, empty_checks = await verify_app(empty_dir)
+    assert empty_stack == "other"
+    assert empty_checks[0].name == "stack-detection"
+    assert empty_checks[0].passed is False
+
+    py_no_tests = tmp_path / "py_no_tests"
+    py_no_tests.mkdir()
+    (py_no_tests / "app.py").write_text("x = 1\n", encoding="utf-8")
+    assert detect_stack(py_no_tests) == "python"
+    stack, checks = await verify_app(py_no_tests)
+    assert stack == "python"
+    pytest_chk = next(c for c in checks if c.name == "python-pytest")
+    assert pytest_chk.passed is False
+    assert "0 tests" in pytest_chk.stderr
+
+    py_syntax_err = tmp_path / "py_syntax_err"
+    py_syntax_err.mkdir()
+    (py_syntax_err / "bad.py").write_text("def broken(:\n", encoding="utf-8")
+    _, syn_checks = await verify_app(py_syntax_err)
+    assert next(c for c in syn_checks if c.name == "python-compile").passed is False
+
+    node_bad_json = tmp_path / "node_bad"
+    node_bad_json.mkdir()
+    (node_bad_json / "package.json").write_text("{bad json", encoding="utf-8")
+    _, bad_node_checks = await verify_app(node_bad_json)
+    assert bad_node_checks[0].name == "node-package-json"
+    assert bad_node_checks[0].passed is False
+
+    node_no_tests = tmp_path / "node_no_tests"
+    node_no_tests.mkdir()
+    (node_no_tests / "package.json").write_text(
+        json.dumps({"name": "no-tests", "scripts": {"test": "echo Error: no test specified"}}),
+        encoding="utf-8",
+    )
+    _, no_test_checks = await verify_app(node_no_tests)
+    assert no_test_checks[0].name == "node-tests-present"
+    assert no_test_checks[0].passed is False
+
+    node_scripts = tmp_path / "node_scripts"
+    node_scripts.mkdir()
+    (node_scripts / "package.json").write_text(
+        json.dumps(
+            {
+                "name": "scripts-demo",
+                "scripts": {
+                    "typecheck": "node -e \"console.log('typecheck ok')\"",
+                    "build": "node -e \"console.log('build ok')\"",
+                    "lint": "node -e \"console.log('lint ok')\"",
+                },
+            }
+        ),
+        encoding="utf-8",
+    )
+    (node_scripts / "basic.test.mjs").write_text(
+        "import test from 'node:test';\nimport assert from 'node:assert/strict';\n"
+        "test('ok', () => assert.equal(1, 1));\n",
+        encoding="utf-8",
+    )
+    _, script_checks = await verify_app(node_scripts)
+    assert {c.name for c in script_checks} == {
+        "node-test",
+        "node-typecheck",
+        "node-build",
+        "node-lint",
+    }
+    assert all(c.passed for c in script_checks)
+
+    mixed_dir = tmp_path / "mixed"
+    (mixed_dir / "tests").mkdir(parents=True)
+    (mixed_dir / "tests" / "test_mix.py").write_text("def test_mix():\n    assert 1 == 1\n")
+    (mixed_dir / "package.json").write_text(
+        json.dumps({"name": "mix", "scripts": {"test": "node --test"}}),
+        encoding="utf-8",
+    )
+    (mixed_dir / "mix.test.mjs").write_text(
+        "import test from 'node:test';\ntest('mix', () => {});\n",
+        encoding="utf-8",
+    )
+    assert detect_stack(mixed_dir) == "mixed"
+    mix_stack, mix_checks = await verify_app(mixed_dir)
+    assert mix_stack == "mixed"
+    assert any(c.name == "python-pytest" and c.passed for c in mix_checks)
+    assert any(c.name == "node-test" and c.passed for c in mix_checks)
+
+    timeout_res = await _run_subprocess(
+        "slow",
+        [sys.executable, "-c", "import time; time.sleep(5)"],
+        tmp_path,
+        timeout=0.1,
+    )
+    assert timeout_res.passed is False
+    assert timeout_res.exit_code == 124
+    assert "timed out" in timeout_res.stderr.lower()
+
+
+async def test_run_build_patch_delete_and_failure_writes_report_out(tmp_path):
+    spec_file = tmp_path / "spec.md"
+    spec_file.write_text("# Demo\nBuild and test.\n", encoding="utf-8")
+
+    parsed_json = json.dumps(
+        {
+            "summary": "Demo",
+            "requirements": [{"id": "R1", "title": "T", "description": "D"}],
+        }
+    )
+    app_with_bad_file = json.dumps(
+        {
+            "summary": "Demo",
+            "stack": "python",
+            "files": [
+                {"path": "tests/test_good.py", "content": "def test_ok():\n    assert True\n"},
+                {"path": "tests/test_bad.py", "content": "def test_bad():\n    assert False\n"},
+            ],
+        }
+    )
+    delete_patch = json.dumps(
+        {
+            "diagnosis": "Remove obsolete broken test file.",
+            "files": [],
+            "delete_files": ["tests/test_bad.py"],
+        }
+    )
+    router = MockBuildRouter(
+        {
+            ("parser", "m-parse"): [
+                {
+                    "text": parsed_json,
+                    "prompt_tokens": 10,
+                    "completion_tokens": 5,
+                    "cost_usd": 0.001,
+                }
+            ],
+            ("builder", "m-build"): [
+                {
+                    "text": app_with_bad_file,
+                    "prompt_tokens": 20,
+                    "completion_tokens": 10,
+                    "cost_usd": 0.002,
+                }
+            ],
+            ("fixer", "m-fix"): [
+                {
+                    "text": delete_patch,
+                    "prompt_tokens": 15,
+                    "completion_tokens": 5,
+                    "cost_usd": 0.001,
+                }
+            ],
+        }
+    )
+    app_dir = tmp_path / "app"
+    report_out = tmp_path / "ci" / "run-report.md"
+    out_dir = await run_build(
+        spec_file,
+        tmp_path / "runs",
+        app_dir,
+        router=router,
+        skip_research=True,
+        report_out=report_out,
+    )
+    manifest = json.loads((out_dir / "manifest.json").read_text(encoding="utf-8"))
+    assert manifest["status"] == "verified"
+    assert manifest["generated_files"] == ["tests/test_good.py"]
+    assert not (app_dir / "tests/test_bad.py").exists()
+    assert report_out.is_file()
+
+    # Now verify report_out + tokens.json are still written if run_build raises mid-run
+    class FailingBuildRouter(MockBuildRouter):
+        async def complete(self, model: str, system: str, user: str, role: str | None = None):
+            if role == "builder":
+                raise RuntimeError("Missing API key")
+            return await super().complete(model, system, user, role=role)
+
+    fail_router = FailingBuildRouter(
+        {
+            ("parser", "m-parse"): [
+                {
+                    "text": parsed_json,
+                    "prompt_tokens": 12,
+                    "completion_tokens": 8,
+                    "cost_usd": 0.001,
+                }
+            ]
+        }
+    )
+    fail_report_out = tmp_path / "ci" / "fail-report.md"
+    fail_runs = tmp_path / "fail_runs"
+    with pytest.raises(RuntimeError, match="Missing API key"):
+        await run_build(
+            spec_file,
+            fail_runs,
+            tmp_path / "fail_app",
+            router=fail_router,
+            skip_research=True,
+            report_out=fail_report_out,
+        )
+    assert fail_report_out.is_file()
+    fail_text = fail_report_out.read_text(encoding="utf-8")
+    assert "Missing API key" in fail_text
+    assert "## Token Usage & Cost" in fail_text
+
+
+def test_cli_error_codes_version_and_tokens_json(tmp_path):
+    ver_proc = subprocess.run(
+        [sys.executable, "-m", "atlas.cli", "--version"],
+        capture_output=True,
+        text=True,
+        check=False,
+    )
+    assert ver_proc.returncode == 0
+    assert "atlas" in ver_proc.stdout
+
+    missing_verify = subprocess.run(
+        [sys.executable, "-m", "atlas.cli", "verify", "--app-dir", str(tmp_path / "nope")],
+        capture_output=True,
+        text=True,
+        check=False,
+    )
+    assert missing_verify.returncode == 1
+
+    missing_spec = subprocess.run(
+        [sys.executable, "-m", "atlas.cli", "build", str(tmp_path / "missing.md")],
+        capture_output=True,
+        text=True,
+        check=False,
+    )
+    assert missing_spec.returncode == 2
+
+    missing_runs = subprocess.run(
+        [sys.executable, "-m", "atlas.cli", "tokens", "--runs-root", str(tmp_path / "no_runs")],
+        capture_output=True,
+        text=True,
+        check=False,
+    )
+    assert missing_runs.returncode == 2
+
+    run_dir = tmp_path / "runs" / "20261123T120000Z-12345678"
+    run_dir.mkdir(parents=True)
+    (run_dir / "tokens.json").write_text(
+        json.dumps(
+            {
+                "total_calls": 1,
+                "prompt_tokens": 5,
+                "completion_tokens": 7,
+                "cached_tokens": 0,
+                "reasoning_tokens": 0,
+                "total_tokens": 12,
+            }
+        ),
+        encoding="utf-8",
+    )
+    tok_json = subprocess.run(
+        [sys.executable, "-m", "atlas.cli", "tokens", str(run_dir), "--json"],
+        capture_output=True,
+        text=True,
+        check=False,
+    )
+    assert tok_json.returncode == 0
+    assert json.loads(tok_json.stdout)["total_tokens"] == 12

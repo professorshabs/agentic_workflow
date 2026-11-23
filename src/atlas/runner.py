@@ -116,6 +116,7 @@ async def run_build(
     clean_app_dir: bool = False,
     max_fix_rounds: int | None = None,
     verify_fn: VerifyFn | None = None,
+    report_out: Path | None = None,
 ) -> Path:
     """Run spec -> (optional research/plan) -> build -> verify/fix loop with token tracking."""
     if not spec_path.is_file():
@@ -278,6 +279,9 @@ async def run_build(
             error=error_text,
         )
         (out / "report.md").write_text(report_md, encoding="utf-8")
+        if report_out is not None:
+            report_out.parent.mkdir(parents=True, exist_ok=True)
+            report_out.write_text(report_md, encoding="utf-8")
         _write_manifest(out, manifest)
 
     return out

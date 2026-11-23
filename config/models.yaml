@@ -1,20 +1,29 @@
-# These LiteLLM aliases are maintained by their providers and can move to newer
-# models over time. Use pinned model IDs here when you need repeatable behavior.
+# Provider/model IDs must match your LiteLLM provider setup and account access.
+# Primary models route through OpenRouter (OPENROUTER_API_KEY) with direct
+# Google Gemini API (GEMINI_API_KEY) fallbacks. Local Ollama models use `ollama_chat/`.
 roles:
-  parser: [anthropic/claude-sonnet-latest]
-  researcher: [anthropic/claude-sonnet-latest]
-  judge: [anthropic/claude-sonnet-latest]
-  builder: [anthropic/claude-sonnet-latest]
-  fixer: [anthropic/claude-sonnet-latest]
+  parser: [openrouter/google/gemini-4-hydrogen]
+  researcher:
+    - openrouter/anthropic/claude-opus-5.5
+    - openrouter/google/gemini-4-neon
+    - openrouter/openai/gpt-6.2-sol
+  judge: [openrouter/anthropic/claude-opus-5]
+  # Default builder uses OpenRouter (OPENROUTER_API_KEY).
+  # Alternatives for lower-cost or local builds:
+  #   - Gemma 4 via OpenRouter: [openrouter/google/gemma-4-31b-it] or [openrouter/google/gemma-4-26b-a4b-it]
+  #   - Gemma 4 via Gemini API: [gemini/gemma-4-31b-it]
+  #   - Local Gemma 4 via Ollama (local CLI only; set OLLAMA_API_BASE): [ollama_chat/gemma4:26b]
+  builder: [openrouter/google/gemini-4-hydrogen]
+  fixer: [openrouter/anthropic/claude-sonnet-5.5]
 
-# Fallbacks are applied after the requested model. Prefer same-provider fallbacks
-# where possible. Add credentials for the providers you intend to use.
+# Fallbacks are applied after the requested model. Add credentials for every
+# provider you intend to use.
 role_fallbacks:
-  parser: [openai/gpt-mini-latest, gemini/gemini-3.8-flash]
-  researcher: [openai/gpt-mini-latest, gemini/gemini-3.8-flash]
-  judge: [openai/gpt-terra-latest, gemini/gemini-3.8-flash]
-  builder: [openai/gpt-terra-latest, gemini/gemini-3.8-flash]
-  fixer: [openai/gpt-mini-latest, gemini/gemini-3.8-flash]
+  parser: [gemini/gemini-4-hydrogen, gemini/gemini-3.8-flash]
+  researcher: [gemini/gemini-4-neon, gemini/gemini-4-hydrogen]
+  judge: [openrouter/anthropic/claude-opus-5.5, gemini/gemini-4-neon]
+  builder: [gemini/gemini-4-hydrogen, gemini/gemma-4-31b-it]
+  fixer: [openrouter/google/gemini-4-hydrogen, gemini/gemini-4-hydrogen]
 
 # Last-resort fallbacks if a role has no specific fallback configured.
 fallbacks: []

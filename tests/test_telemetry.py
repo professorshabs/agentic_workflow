@@ -134,3 +134,28 @@ limits:
 
     with pytest.raises(TokenBudgetExceededError, match="Token budget exceeded"):
         await router.complete("test-model", "sys", "usr", role="parser")
+
+
+def test_summarize_usage_empty_and_non_numeric_values():
+    empty = summarize_usage([])
+    assert empty.total_calls == 0
+    assert empty.total_tokens == 0
+    assert empty.cost_usd is None
+    md_empty = render_token_report_md(empty)
+    assert "| Estimated cost (USD) | n/a |" in md_empty
+
+    dirty = summarize_usage(
+        [
+            {
+                "role": "parser",
+                "used_model": "m",
+                "prompt_tokens": True,
+                "completion_tokens": "bad",
+                "cost_usd": "not-a-float",
+            }
+        ]
+    )
+    assert dirty.prompt_tokens == 0
+    assert dirty.completion_tokens == 0
+    assert dirty.cost_usd is None
+    assert dirty.unreported_usage_calls == 1

@@ -13,7 +13,7 @@ The current deliverable is the GitHub template and CLI. A hosted app or online f
 1. Push this repository to GitHub and enable **Settings → General → Template repository**.
 2. Choose **Use this template → Create a new repository** for each project.
 3. In the new repository's **Settings → Actions → General**, allow GitHub Actions to create pull requests and set workflow permissions to **Read and write permissions**.
-4. Add a provider key under **Settings → Secrets and variables → Actions**. Use the provider configured in `config/models.yaml` (`ANTHROPIC_API_KEY`, `OPENAI_API_KEY`, or `GEMINI_API_KEY`).
+4. Add provider keys under **Settings → Secrets and variables → Actions → Secrets**. By default `config/models.yaml` uses `OPENROUTER_API_KEY` as primary and `GEMINI_API_KEY` as fallback (`ANTHROPIC_API_KEY` and `OPENAI_API_KEY` are also passed through if you use direct providers).
 5. Write a spec at `specs/<project-name>.md`, using [specs/TEMPLATE.md](specs/TEMPLATE.md) as a guide.
 6. Push the spec to `main`, or run **Actions → Spec to App → Run workflow** and select the spec.
 7. Review the generated app pull request. Its description includes the test results and token report; the workflow run also retains the full JSON artifacts.
@@ -37,7 +37,7 @@ atlas build specs/example-app.md --skip-research --clean
 
 `atlas validate-config` checks configuration structure and limits. It does not check that a provider key is valid or that an account can use every configured model.
 
-The sample config tries Anthropic first, then OpenAI and Gemini fallbacks. It uses provider-maintained “latest” aliases for Anthropic and OpenAI; those aliases can change model behavior and pricing over time. Pin exact model IDs in `config/models.yaml` when you need a repeatable profile.
+The sample config routes primary roles through OpenRouter (`openrouter/...`) with direct Google Gemini API (`gemini/...`) fallbacks: `openrouter/google/gemini-4-hydrogen` for `parser` and `builder` (with commented OpenRouter/Gemini Gemma 4 and local `ollama_chat/gemma4:26b` options for `builder` — local Ollama models work only locally, not on GitHub-hosted runners), parallel `researcher` calls across `openrouter/anthropic/claude-opus-5.5`, `openrouter/google/gemini-4-neon`, and `openrouter/openai/gpt-6.2-sol`, `openrouter/anthropic/claude-opus-5` for `judge`, and `openrouter/anthropic/claude-sonnet-5.5` for `fixer`.
 
 | Command | What it does |
 | :--- | :--- |

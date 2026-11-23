@@ -96,6 +96,7 @@ jobs:
       - name: Build, test, and verify application
         id: build
         env:
+          OPENROUTER_API_KEY: ${{ secrets.OPENROUTER_API_KEY }}
           ANTHROPIC_API_KEY: ${{ secrets.ANTHROPIC_API_KEY }}
           OPENAI_API_KEY: ${{ secrets.OPENAI_API_KEY }}
           GEMINI_API_KEY: ${{ secrets.GEMINI_API_KEY }}
@@ -168,12 +169,30 @@ jobs:
           BRANCH="atlas/build-${RUN_ID}"
           git checkout -b "$BRANCH"
           git add app/
-          git commit -m "feat(app): generate from ${SPEC_PATH}"
+
+          TOTAL_TOKENS=$(python - <<'PY'
+          import json
+          from pathlib import Path
+
+          manifests = sorted(Path("runs").glob("*/manifest.json"), reverse=True)
+          tokens = "n/a"
+          if manifests:
+              data = json.loads(manifests[0].read_text(encoding="utf-8"))
+              val = data.get("token_usage", {}).get("total_tokens")
+              if val is not None:
+                  tokens = str(val)
+          print(tokens)
+          PY
+          )
+
+          git commit -m "feat(app): generate from ${SPEC_PATH} (tokens: ${TOTAL_TOKENS})"
           git push -u origin "$BRANCH"
 
           STATUS_LABEL="verified"
+          PR_FLAGS=()
           if [ "$BUILD_EXIT_CODE" != "0" ]; then
             STATUS_LABEL="verification-failed"
+            PR_FLAGS+=(--draft)
           fi
 
           BODY_FILE="run-report.md"
@@ -185,7 +204,8 @@ jobs:
             --base main \
             --head "$BRANCH" \
             --title "feat(app): build from ${SPEC_PATH} [${STATUS_LABEL}]" \
-            --body-file "$BODY_FILE"
+            --body-file "$BODY_FILE" \
+            "${PR_FLAGS[@]}"
 
       - name: Enforce build verification status
         if: steps.build.outputs.exit_code != '0'

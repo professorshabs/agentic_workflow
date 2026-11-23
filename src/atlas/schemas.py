@@ -277,6 +277,9 @@ class ModelCallRecord(BaseModel):
     cost_usd: float | None = None
     usage_reported: bool = False
     timestamp: str | None = None
+    # Set when the provider returned a response Atlas could not use (empty, or cut off at
+    # max_tokens). The call is usually still billed, so its tokens are counted.
+    error: str | None = None
 
 
 class UsageBucket(StrictModel):
@@ -301,6 +304,7 @@ class TokenUsageSummary(StrictModel):
     cost_usd: float | None = None
     elapsed_ms: float = 0.0
     unreported_usage_calls: int = 0
+    failed_calls: int = 0
     by_stage: list[UsageBucket] = Field(default_factory=list)
     by_model: list[UsageBucket] = Field(default_factory=list)
     calls: list[ModelCallRecord] = Field(default_factory=list)

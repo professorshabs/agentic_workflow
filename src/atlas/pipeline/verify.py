@@ -69,6 +69,16 @@ def _tail(text: str, limit: int = _MAX_OUTPUT_CHARS) -> str:
     return "... [truncated]\n" + text[-limit:]
 
 
+def _find_tool(name: str) -> str | None:
+    found = shutil.which(name)
+    if found:
+        return found
+    sibling = Path(sys.executable).parent / name
+    if sibling.is_file() and os.access(sibling, os.X_OK):
+        return str(sibling)
+    return None
+
+
 def _verification_env() -> dict[str, str]:
     """Build a subprocess environment without credentials from the Atlas run."""
     env = os.environ.copy()
@@ -237,15 +247,16 @@ async def _run_python_checks(
         timeout,
         env=env,
     )
-    if pytest_res.exit_code == 5 and not pytest_res.stderr:
-        pytest_res.stderr = "Pytest collected 0 tests (exit code 5)."
+    if pytest_res.exit_code == 5:
+        note = "Pytest collected 0 tests (exit code 5)."
+        pytest_res.stderr = f"{note}\n{pytest_res.stderr}".strip() if pytest_res.stderr else note
     checks.append(pytest_res)
 
-    ruff_exe = shutil.which("ruff")
+    ruff_exe = _find_tool("ruff")
     if ruff_exe:
         ruff_res = await _run_subprocess(
             "python-ruff",
-            [ruff_exe, "check", "."],
+            [ruff_exe, "check", "--isolated", "--no-cache", "."],
             app_dir,
             timeout,
             env=env,
@@ -265,10 +276,13 @@ async def _verify_python(app_dir: Path, timeout: float) -> list[CheckResult]:
 
     with tempfile.TemporaryDirectory(prefix="atlas-verify-") as tmpdir:
         venv_dir = Path(tmpdir) / "venv"
-        uv_exe = shutil.which("uv")
+        uv_exe = _find_tool("uv")
         if uv_exe:
             venv_res = await _run_subprocess(
-                "python-venv", [uv_exe, "venv", str(venv_dir)], app_dir, timeout
+                "python-venv",
+                [uv_exe, "venv", "--python", sys.executable, str(venv_dir)],
+                app_dir,
+                timeout,
             )
         else:
             venv_res = await _run_subprocess(

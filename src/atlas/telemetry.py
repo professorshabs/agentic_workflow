@@ -17,13 +17,18 @@ def _get_field(obj: Any, key: str, default: Any = None) -> Any:
     return getattr(obj, key, default)
 
 
-def _as_int(value: Any, default: int = 0) -> int:
+def _opt_int(value: Any) -> int | None:
     if value is None or isinstance(value, bool):
-        return default
+        return None
     try:
         return int(value)
     except (TypeError, ValueError):
-        return default
+        return None
+
+
+def _as_int(value: Any, default: int = 0) -> int:
+    parsed = _opt_int(value)
+    return parsed if parsed is not None else default
 
 
 def _as_float(value: Any) -> float | None:
@@ -38,20 +43,18 @@ def _as_float(value: Any) -> float | None:
 def extract_usage_metrics(response: Any) -> dict[str, Any]:
     """Safely extract token counts and estimated USD cost from a LiteLLM response."""
     usage = _get_field(response, "usage")
-    raw_prompt = _get_field(usage, "prompt_tokens")
+    raw_prompt = _opt_int(_get_field(usage, "prompt_tokens"))
     if raw_prompt is None:
-        raw_prompt = _get_field(usage, "input_tokens")
-    raw_completion = _get_field(usage, "completion_tokens")
+        raw_prompt = _opt_int(_get_field(usage, "input_tokens"))
+    raw_completion = _opt_int(_get_field(usage, "completion_tokens"))
     if raw_completion is None:
-        raw_completion = _get_field(usage, "output_tokens")
-    raw_total = _get_field(usage, "total_tokens")
+        raw_completion = _opt_int(_get_field(usage, "output_tokens"))
+    raw_total = _opt_int(_get_field(usage, "total_tokens"))
 
     usage_reported = any(v is not None for v in (raw_prompt, raw_completion, raw_total))
-    prompt_tokens = _as_int(raw_prompt, 0)
-    completion_tokens = _as_int(raw_completion, 0)
-    total_tokens = (
-        _as_int(raw_total, 0) if raw_total is not None else prompt_tokens + completion_tokens
-    )
+    prompt_tokens = raw_prompt if raw_prompt is not None else 0
+    completion_tokens = raw_completion if raw_completion is not None else 0
+    total_tokens = raw_total if raw_total is not None else prompt_tokens + completion_tokens
 
     prompt_details = _get_field(usage, "prompt_tokens_details")
     cached_raw = _get_field(prompt_details, "cached_tokens")
@@ -84,20 +87,18 @@ def extract_usage_metrics(response: Any) -> dict[str, Any]:
 
 
 def _normalize_call(raw: dict[str, Any]) -> ModelCallRecord:
-    raw_prompt = raw.get("prompt_tokens")
-    raw_completion = raw.get("completion_tokens")
-    raw_total = raw.get("total_tokens")
+    raw_prompt = _opt_int(raw.get("prompt_tokens"))
+    raw_completion = _opt_int(raw.get("completion_tokens"))
+    raw_total = _opt_int(raw.get("total_tokens"))
     explicit_usage = raw.get("usage_reported")
     if isinstance(explicit_usage, bool):
         usage_reported = explicit_usage
     else:
         usage_reported = any(v is not None for v in (raw_prompt, raw_completion, raw_total))
 
-    prompt_tokens = _as_int(raw_prompt, 0)
-    completion_tokens = _as_int(raw_completion, 0)
-    total_tokens = (
-        _as_int(raw_total, 0) if raw_total is not None else prompt_tokens + completion_tokens
-    )
+    prompt_tokens = raw_prompt if raw_prompt is not None else 0
+    completion_tokens = raw_completion if raw_completion is not None else 0
+    total_tokens = raw_total if raw_total is not None else prompt_tokens + completion_tokens
     cost_usd = _as_float(raw.get("cost_usd"))
     if cost_usd is not None:
         cost_usd = round(cost_usd, 6)
@@ -116,6 +117,7 @@ def _normalize_call(raw: dict[str, Any]) -> ModelCallRecord:
         cost_usd=cost_usd,
         usage_reported=usage_reported,
         timestamp=raw.get("timestamp"),
+        error=str(raw["error"]) if raw.get("error") else None,
     )
 
 
@@ -159,6 +161,7 @@ def summarize_usage(call_log: list[dict[str, Any]]) -> TokenUsageSummary:
         cost_usd=round(sum(costs), 6) if costs else None,
         elapsed_ms=round(sum(r.elapsed_ms for r in records), 1),
         unreported_usage_calls=sum(1 for r in records if not r.usage_reported),
+        failed_calls=sum(1 for r in records if r.error),
         by_stage=_aggregate_buckets(records, lambda r: r.role),
         by_model=_aggregate_buckets(records, lambda r: r.used_model),
         calls=records,
@@ -215,6 +218,13 @@ def render_token_report_md(summary: TokenUsageSummary) -> str:
                 f"{bucket.completion_tokens:,} | {bucket.total_tokens:,} | "
                 f"{_fmt_cost(bucket.cost_usd)} |"
             )
+
+    if summary.failed_calls > 0:
+        lines.extend([
+            "",
+            f"> Note: {summary.failed_calls} call(s) returned an unusable response (empty, or "
+            "cut off at max_tokens). Providers usually bill these, so their tokens are included.",
+        ])
 
     if summary.unreported_usage_calls > 0:
         lines.extend([

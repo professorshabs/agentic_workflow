@@ -111,12 +111,9 @@ def main() -> None:
                     skip_research=args.skip_research,
                     clean_app_dir=args.clean,
                     max_fix_rounds=args.max_fix_rounds,
+                    report_out=args.report_out,
                 )
             )
-            report_text = (out / "report.md").read_text(encoding="utf-8")
-            if args.report_out is not None:
-                args.report_out.parent.mkdir(parents=True, exist_ok=True)
-                args.report_out.write_text(report_text, encoding="utf-8")
             manifest = json.loads((out / "manifest.json").read_text(encoding="utf-8"))
             summary = _load_token_summary(out)
             print(f"Build status: {manifest['status']}")
@@ -168,6 +165,9 @@ def main() -> None:
     except (FileNotFoundError, ValueError) as exc:
         print(f"Error: {exc}", file=sys.stderr)
         sys.exit(2)
+    except RuntimeError as exc:
+        print(f"Error: {exc}", file=sys.stderr)
+        sys.exit(1)
 
 
 if __name__ == "__main__":

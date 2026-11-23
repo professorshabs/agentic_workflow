@@ -79,6 +79,7 @@ Use `atlas tokens runs/<run-id> --json` for the complete machine-readable breakd
 - `usage/ledger.jsonl` — one line per run with its token totals; created by the first run and committed with each generated app.
 - `.github/workflows/spec-to-app.yml` — spec-triggered build, verification, artifact upload, pull request, then `ci.yml` on that PR branch.
 - `.github/workflows/ci.yml` — Atlas quality checks and verification for generated app changes on pull requests (also called by `spec-to-app.yml`).
+- `.github/workflows/cd.yml` — Docker build and push to GitHub Container Registry (`ghcr.io`) after verified `app/` changes merge to `main`.
 - `runs/` — local run artifacts; ignored by Git and retained as GitHub Actions artifacts for cloud runs.
 
 See [ROADMAP.md](ROADMAP.md) for template experiments and the later hosted-framework direction.

@@ -26,7 +26,7 @@ def test_prompts_and_template_files_exist_and_load():
 
 def test_github_workflows_yaml_and_shell_syntax():
     workflow_files = sorted(WORKFLOW_DIR.glob("*.yml"))
-    assert {p.name for p in workflow_files} == {"ci.yml", "spec-to-app.yml"}
+    assert {p.name for p in workflow_files} == {"cd.yml", "ci.yml", "spec-to-app.yml"}
 
     for wf_path in workflow_files:
         data = yaml.safe_load(wf_path.read_text(encoding="utf-8"))
@@ -184,3 +184,23 @@ def test_generated_pr_gets_ci_and_status_step_is_safe():
     enforce = next(s for s in steps if s.get("name") == "Enforce build verification status")
     assert "${{" not in enforce["run"]  # no expression injected into the shell script
     assert "steps.build.outputs.exit_code != ''" in enforce["if"]
+
+
+def test_cd_workflow_structure_and_guards():
+    cd = yaml.safe_load((WORKFLOW_DIR / "cd.yml").read_text(encoding="utf-8"))
+    triggers = cd.get("on") or cd.get(True)
+    assert triggers["push"]["branches"] == ["main"]
+    assert triggers["push"]["paths"] == ["app/**", "!app/.gitkeep"]
+    assert "workflow_dispatch" in triggers
+    assert cd["permissions"]["packages"] == "write"
+
+    verify_job = cd["jobs"]["verify"]
+    assert verify_job["uses"] == "./.github/workflows/ci.yml"
+
+    publish = cd["jobs"]["publish-docker"]
+    assert publish["needs"] == "verify"
+    assert publish["environment"] == "production"
+    for step in publish["steps"]:
+        run_script = step.get("run")
+        if run_script:
+            assert "${{" not in run_script

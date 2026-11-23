@@ -1,0 +1,117 @@
+name: CD (Docker to GHCR)
+
+on:
+  push:
+    branches: [main]
+    paths:
+      - "app/**"
+      - "!app/.gitkeep"
+  workflow_dispatch:
+    inputs:
+      image_tag:
+        description: "Docker image tag (in addition to git short SHA)"
+        required: false
+        default: "latest"
+        type: string
+
+concurrency:
+  group: cd-ghcr-${{ github.ref }}
+  cancel-in-progress: false
+
+permissions:
+  contents: read
+  packages: write
+
+jobs:
+  verify:
+    uses: ./.github/workflows/ci.yml
+
+  publish-docker:
+    needs: verify
+    runs-on: ubuntu-latest
+    environment: production
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Detect app and prepare Dockerfile
+        id: detect
+        env:
+          IMAGE_TAG_INPUT: ${{ inputs.image_tag }}
+          REPO_NAME: ${{ github.repository }}
+          COMMIT_SHA: ${{ github.sha }}
+        run: |
+          if [ ! -d app ] || ! find app -mindepth 1 ! -name '.gitkeep' | grep -q .; then
+            echo "has_app=false" >> "$GITHUB_OUTPUT"
+            echo "No generated application files in app/; skipping Docker publish."
+            exit 0
+          fi
+
+          TAG="${IMAGE_TAG_INPUT:-latest}"
+          if [[ ! "$TAG" =~ ^[A-Za-z0-9._-]{1,64}$ ]]; then
+            echo "Invalid image_tag: must match ^[A-Za-z0-9._-]{1,64}$" >&2
+            exit 2
+          fi
+
+          IMAGE="ghcr.io/$(echo "$REPO_NAME" | tr '[:upper:]' '[:lower:]')"
+          SHORT_SHA="${COMMIT_SHA:0:7}"
+
+          if [ -f app/Dockerfile ]; then
+            DOCKERFILE_PATH="app/Dockerfile"
+          elif [ -f app/pyproject.toml ] || [ -f app/requirements.txt ] || find app -maxdepth 3 -name '*.py' | grep -q .; then
+            DOCKERFILE_PATH="/tmp/atlas.Dockerfile"
+            cat > "$DOCKERFILE_PATH" <<'EOF'
+          FROM python:3.12-slim
+          WORKDIR /app
+          COPY . /app
+          RUN if [ -f requirements.txt ]; then pip install --no-cache-dir -r requirements.txt; fi && \
+              if [ -f pyproject.toml ]; then pip install --no-cache-dir .; fi
+          CMD ["python", "--version"]
+          EOF
+          elif [ -f app/package.json ]; then
+            DOCKERFILE_PATH="/tmp/atlas.Dockerfile"
+            cat > "$DOCKERFILE_PATH" <<'EOF'
+          FROM node:20-slim
+          WORKDIR /app
+          COPY . /app
+          RUN if [ -f package-lock.json ]; then npm ci --omit=dev; else npm install --omit=dev; fi
+          CMD ["npm", "start"]
+          EOF
+          else
+            echo "No app/Dockerfile or supported Python/Node files found to containerize." >&2
+            exit 1
+          fi
+
+          {
+            echo "has_app=true"
+            echo "image=$IMAGE"
+            echo "tag=$TAG"
+            echo "short_sha=$SHORT_SHA"
+            echo "dockerfile=$DOCKERFILE_PATH"
+          } >> "$GITHUB_OUTPUT"
+
+      - name: Build and push Docker image to GHCR
+        if: steps.detect.outputs.has_app == 'true'
+        env:
+          GH_TOKEN: ${{ github.token }}
+          GH_ACTOR: ${{ github.actor }}
+          IMAGE: ${{ steps.detect.outputs.image }}
+          TAG: ${{ steps.detect.outputs.tag }}
+          SHORT_SHA: ${{ steps.detect.outputs.short_sha }}
+          DOCKERFILE_PATH: ${{ steps.detect.outputs.dockerfile }}
+        run: |
+          echo "$GH_TOKEN" | docker login ghcr.io -u "$GH_ACTOR" --password-stdin
+          docker build -f "$DOCKERFILE_PATH" -t "${IMAGE}:${SHORT_SHA}" -t "${IMAGE}:${TAG}" app
+          docker push "${IMAGE}:${SHORT_SHA}"
+          docker push "${IMAGE}:${TAG}"
+
+          {
+            echo "## Docker Image Published"
+            echo ""
+            echo "- \`${IMAGE}:${SHORT_SHA}\`"
+            echo "- \`${IMAGE}:${TAG}\`"
+            echo ""
+            echo "\`\`\`bash"
+            echo "docker pull ${IMAGE}:${TAG}"
+            echo "docker run --rm ${IMAGE}:${TAG}"
+            echo "\`\`\`"
+          } >> "$GITHUB_STEP_SUMMARY"

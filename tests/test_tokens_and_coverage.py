@@ -298,3 +298,146 @@ async def test_coverage_check_is_off_unless_configured(tmp_path):
     manifest = json.loads((out / "manifest.json").read_text(encoding="utf-8"))
     assert manifest["status"] == "verified"
     assert not (tmp_path / "usage").exists()  # no ledger unless a path is given
+
+
+# ---------------------------------------------------------------- provider failures
+
+DOWN_CFG = """
+roles:
+  parser: [openrouter/a]
+  researcher: [openrouter/r1, openrouter/r2, openrouter/r3]
+role_fallbacks:
+  parser: [openrouter/b, gemini/g]
+  researcher: [gemini/g]
+limits:
+  max_parallel_calls: 2
+  max_tokens: 100
+  timeout_seconds: 10
+  attempts_per_model: 2
+"""
+
+
+class _HTTPError(Exception):
+    def __init__(self, status_code, message="error"):
+        super().__init__(message)
+        self.status_code = status_code
+
+
+@pytest.fixture
+def down_router(tmp_path, monkeypatch):
+    monkeypatch.delenv("OPENROUTER_API_KEY_FALLBACK", raising=False)
+    cfg = tmp_path / "models.yaml"
+    cfg.write_text(DOWN_CFG, encoding="utf-8")
+    return ModelRouter(cfg)
+
+
+async def test_no_credit_skips_the_provider_for_the_rest_of_the_run(down_router, monkeypatch):
+    calls = []
+
+    async def fake(*, model, **kwargs):
+        calls.append(model)
+        if model.startswith("openrouter/"):
+            raise _HTTPError(402, "This request requires more credits")
+        return _response('{"ok": true}')
+
+    monkeypatch.setattr("atlas.router.litellm.acompletion", AsyncMock(side_effect=fake))
+    monkeypatch.setattr("atlas.router.asyncio.sleep", AsyncMock())
+
+    used, _ = await down_router.complete("openrouter/a", "s", "u", role="parser")
+    assert used == "gemini/g"
+    # one try at OpenRouter (no retry of a 402), then openrouter/b is skipped without a call
+    assert calls == ["openrouter/a", "gemini/g"]
+    assert down_router.unavailable_reason("openrouter/anything") is not None
+
+    calls.clear()
+    await down_router.complete("openrouter/a", "s", "u", role="parser")
+    assert calls == ["gemini/g"]  # later calls go straight to the working provider
+
+
+async def test_unknown_model_is_skipped_but_its_provider_is_not(down_router, monkeypatch):
+    calls = []
+
+    async def fake(*, model, **kwargs):
+        calls.append(model)
+        if model == "openrouter/a":
+            raise _HTTPError(404, "model not found")
+        return _response('{"ok": true}')
+
+    monkeypatch.setattr("atlas.router.litellm.acompletion", AsyncMock(side_effect=fake))
+    used, _ = await down_router.complete("openrouter/a", "s", "u", role="parser")
+    assert used == "openrouter/b"
+    assert calls == ["openrouter/a", "openrouter/b"]
+    assert down_router.unavailable_reason("openrouter/b") is None
+
+
+async def test_rate_limits_are_still_retried(down_router, monkeypatch):
+    replies = [_HTTPError(429, "slow down"), _response('{"ok": true}')]
+    fake = AsyncMock(side_effect=replies)
+    monkeypatch.setattr("atlas.router.litellm.acompletion", fake)
+    monkeypatch.setattr("atlas.router.asyncio.sleep", AsyncMock())
+    used, _ = await down_router.complete("openrouter/a", "s", "u", role="parser")
+    assert used == "openrouter/a"
+    assert fake.await_count == 2
+    assert down_router.unavailable_reason("openrouter/a") is None
+
+
+def test_credit_error_without_status_code_is_recognised():
+    from atlas.router import _status_code
+
+    assert _status_code(RuntimeError('{"error":{"code":402,"message":"..."}}')) == 402
+    assert _status_code(RuntimeError("This request requires more credits")) == 402
+    assert _status_code(RuntimeError("something else")) is None
+
+
+async def test_research_does_not_ask_the_same_fallback_model_three_times(
+    down_router, monkeypatch
+):
+    from atlas.pipeline.research import research
+    from atlas.schemas import ParsedSpec
+
+    down_router._mark_unavailable("openrouter/r1", 402, RuntimeError("no credit"))
+    fake = AsyncMock(return_value=_response('{"findings": ["use the standard library"]}'))
+    monkeypatch.setattr("atlas.router.litellm.acompletion", fake)
+    spec = ParsedSpec.model_validate({"summary": "s", "requirements": [
+        {"id": "R001", "title": "a", "description": "a"},
+        {"id": "R002", "title": "b", "description": "b"},
+    ]})
+
+    report = await research(down_router, spec)
+
+    assert fake.await_count == 2  # one call per requirement, not three
+    assert {n.model for n in report.notes} == {"gemini/g"}
+
+
+async def test_provider_switches_to_fallback_api_key_before_disabling_provider(
+    down_router, monkeypatch
+):
+    monkeypatch.setenv("OPENROUTER_API_KEY", "primary-key")
+    monkeypatch.setenv("OPENROUTER_API_KEY_FALLBACK", "backup-key")
+
+    seen_calls: list[tuple[str, str | None]] = []
+
+    async def fake(*, model, **kwargs):
+        api_key = kwargs.get("api_key")
+        seen_calls.append((model, api_key))
+        if model.startswith("openrouter/") and api_key != "backup-key":
+            raise _HTTPError(402, "This request requires more credits")
+        if model.startswith("openrouter/") and len(seen_calls) >= 4:
+            raise _HTTPError(402, "Backup key also out of credits")
+        return _response('{"ok": true}')
+
+    monkeypatch.setattr("atlas.router.litellm.acompletion", AsyncMock(side_effect=fake))
+    monkeypatch.setattr("atlas.router.asyncio.sleep", AsyncMock())
+
+    used1, _ = await down_router.complete("openrouter/a", "s", "u", role="parser")
+    assert used1 == "openrouter/a"
+    assert seen_calls == [("openrouter/a", None), ("openrouter/a", "backup-key")]
+
+    used2, _ = await down_router.complete("openrouter/a", "s", "u", role="parser")
+    assert used2 == "openrouter/a"
+    assert seen_calls[-1] == ("openrouter/a", "backup-key")
+
+    used3, _ = await down_router.complete("openrouter/a", "s", "u", role="parser")
+    assert used3 == "gemini/g"
+    assert seen_calls[-2:] == [("openrouter/a", "backup-key"), ("gemini/g", None)]
+    assert down_router.unavailable_reason("openrouter/anything") is not None

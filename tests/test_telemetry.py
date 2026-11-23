@@ -159,3 +159,16 @@ def test_summarize_usage_empty_and_non_numeric_values():
     assert dirty.completion_tokens == 0
     assert dirty.cost_usd is None
     assert dirty.unreported_usage_calls == 1
+
+
+def test_extract_usage_metrics_prefers_direct_provider_cost(monkeypatch):
+    monkeypatch.setattr(
+        "atlas.telemetry.litellm.completion_cost",
+        lambda **_: (_ for _ in ()).throw(RuntimeError("should not be called")),
+    )
+    resp = SimpleNamespace(
+        usage=SimpleNamespace(prompt_tokens=14, completion_tokens=4, total_tokens=18, cost=0.00016)
+    )
+    metrics = extract_usage_metrics(resp)
+    assert metrics["total_tokens"] == 18
+    assert metrics["cost_usd"] == 0.00016

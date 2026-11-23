@@ -16,6 +16,9 @@ from atlas.telemetry import extract_usage_metrics, summarize_usage
 
 logger = logging.getLogger("atlas.router")
 
+# LiteLLM prints a "Provider List" banner after every failed call; Atlas logs failures itself.
+litellm.suppress_debug_info = True
+
 DEFAULT_CONFIG = Path(__file__).resolve().parents[2] / "config" / "models.yaml"
 
 
@@ -28,6 +31,27 @@ class OutputTruncatedError(RuntimeError):
 
 
 _TRUNCATED_FINISH_REASONS = {"length", "max_tokens"}
+# A bad key (401) or no credit left (402) fails for every model of that provider.
+_PROVIDER_DOWN_STATUSES = {401, 402}
+# Not allowed (403) or unknown model (404): skip that model for the rest of the run.
+_MODEL_DOWN_STATUSES = {403, 404}
+# Client errors that the same request will hit again: do not retry the same model.
+_NO_RETRY_STATUSES = {400, 401, 402, 403, 404, 422}
+
+
+def _status_code(exc: BaseException) -> int | None:
+    for obj in (exc, getattr(exc, "response", None)):
+        code = getattr(obj, "status_code", None)
+        if isinstance(code, int) and not isinstance(code, bool):
+            return code
+    text = str(exc).lower()
+    if "requires more credits" in text or '"code":402' in text.replace(" ", ""):
+        return 402
+    return None
+
+
+def _provider(model: str) -> str:
+    return model.split("/", 1)[0] if "/" in model else model
 
 
 def resolve_default_config() -> Path:
@@ -53,6 +77,10 @@ class ModelRouter:
         self._validate_config()
         self._semaphores: dict[int, asyncio.Semaphore] = {}
         self.call_log: list[dict[str, Any]] = []
+        # Models or whole providers ("openrouter/*") that failed in a way retrying cannot fix.
+        self._unavailable: dict[str, str] = {}
+        self._active_api_keys: dict[str, str] = {}
+        self._used_fallback_keys: set[str] = set()
 
     def _get_semaphore(self) -> asyncio.Semaphore:
         loop_id = id(asyncio.get_running_loop())
@@ -194,6 +222,46 @@ class ModelRouter:
                 f"Cost budget exceeded (${summary.cost_usd:.6f} >= ${cost_cap:.6f})"
             )
 
+    def unavailable_reason(self, model: str) -> str | None:
+        """Why `model` is skipped for the rest of this run, or None if it can be used."""
+        blocked: dict[str, str] = getattr(self, "_unavailable", {})
+        return blocked.get(model) or blocked.get(f"{_provider(model)}/*")
+
+    def first_available(self, model: str, role: str | None = None) -> str:
+        """The model a call for `model` would actually reach right now (skips blocked ones)."""
+        for candidate in self.candidates_for(model, role=role):
+            if self.unavailable_reason(candidate) is None:
+                return candidate
+        return model
+
+    def _mark_unavailable(self, model: str, status: int, exc: BaseException) -> None:
+        blocked = self.__dict__.setdefault("_unavailable", {})
+        key = f"{_provider(model)}/*" if status in _PROVIDER_DOWN_STATUSES else model
+        if key not in blocked:
+            blocked[key] = f"HTTP {status}: {type(exc).__name__}: {str(exc)[:300]}"
+            what = "no credit or bad key" if status in _PROVIDER_DOWN_STATUSES else "not usable"
+            logger.warning("Skipping %s for the rest of this run (HTTP %s, %s).", key, status, what)
+
+    def _switch_to_fallback_key(self, model: str, status: int) -> bool:
+        prov = _provider(model)
+        used_fallback: set[str] = self.__dict__.setdefault("_used_fallback_keys", set())
+        if prov in used_fallback:
+            return False
+        env_name = f"{prov.upper()}_API_KEY_FALLBACK"
+        fallback_key = os.environ.get(env_name, "").strip()
+        primary_key = os.environ.get(f"{prov.upper()}_API_KEY", "").strip()
+        if fallback_key and fallback_key != primary_key:
+            used_fallback.add(prov)
+            self.__dict__.setdefault("_active_api_keys", {})[prov] = fallback_key
+            logger.warning(
+                "Provider '%s' returned HTTP %s; switching to %s for the rest of this run.",
+                prov,
+                status,
+                env_name,
+            )
+            return True
+        return False
+
     def candidates_for(self, model: str, role: str | None = None) -> list[str]:
         """Return deduplicated candidates: requested model -> role fallbacks -> global fallbacks."""
         role_fb = self.cfg.get("role_fallbacks", {}).get(role, []) if role else []
@@ -231,9 +299,19 @@ class ModelRouter:
             )
 
         for candidate in candidates:
-            for attempt in range(attempts):
+            skip_reason = self.unavailable_reason(candidate)
+            if skip_reason is not None:
+                last_err = last_err or RuntimeError(f"{candidate} skipped earlier: {skip_reason}")
+                continue
+            switched_for_candidate = False
+            attempt = 0
+            while attempt < attempts:
                 total_attempts += 1
                 response: Any = None
+                extra_kwargs: dict[str, Any] = {}
+                active_key = self.__dict__.get("_active_api_keys", {}).get(_provider(candidate))
+                if active_key:
+                    extra_kwargs["api_key"] = active_key
                 try:
                     async with sem:
                         response = await asyncio.wait_for(
@@ -245,6 +323,7 @@ class ModelRouter:
                                     {"role": "system", "content": system},
                                     {"role": "user", "content": user},
                                 ],
+                                **extra_kwargs,
                             ),
                             timeout=timeout + 5,
                         )
@@ -272,6 +351,16 @@ class ModelRouter:
                     last_err = exc
                     if response is not None:
                         record(response, candidate, error=f"{type(exc).__name__}: {exc}")
+                    status = _status_code(exc)
+                    if (
+                        status in _PROVIDER_DOWN_STATUSES
+                        and not switched_for_candidate
+                        and self._switch_to_fallback_key(candidate, status)
+                    ):
+                        switched_for_candidate = True
+                        continue
+                    if status in _PROVIDER_DOWN_STATUSES | _MODEL_DOWN_STATUSES:
+                        self._mark_unavailable(candidate, status, exc)
                     logger.warning(
                         "Model call failed (role=%s, candidate=%s, attempt=%d/%d): %s: %s",
                         role,
@@ -281,8 +370,11 @@ class ModelRouter:
                         type(exc).__name__,
                         exc,
                     )
-                    if attempt + 1 < attempts:
-                        await asyncio.sleep(min(2**attempt, 8))
+                    if status in _NO_RETRY_STATUSES:
+                        break  # the same request would fail the same way; try the next model
+                    attempt += 1
+                    if attempt < attempts:
+                        await asyncio.sleep(min(2 ** (attempt - 1), 8))
 
         raise RuntimeError(
             f"All configured models failed for role request '{model}'. "

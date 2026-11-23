@@ -68,6 +68,7 @@ def test_verification_environment_removes_credentials(monkeypatch):
     monkeypatch.setenv("PATH", "/tools/bin")
     monkeypatch.setenv("ANTHROPIC_API_KEY", "provider-secret")
     monkeypatch.setenv("OPENROUTER_API_KEY", "openrouter-secret")
+    monkeypatch.setenv("OPENROUTER_API_KEY_FALLBACK", "openrouter-backup-secret")
     monkeypatch.setenv("GEMINI_API_KEY", "gemini-secret")
     monkeypatch.setenv("GITHUB_TOKEN", "github-secret")
     monkeypatch.setenv("GITHUB_STEP_SUMMARY", "/tmp/summary")
@@ -82,6 +83,7 @@ def test_verification_environment_removes_credentials(monkeypatch):
     assert env["PATH"] == "/tools/bin"
     assert "ANTHROPIC_API_KEY" not in env
     assert "OPENROUTER_API_KEY" not in env
+    assert "OPENROUTER_API_KEY_FALLBACK" not in env
     assert "GEMINI_API_KEY" not in env
     assert "GITHUB_TOKEN" not in env
     assert "GITHUB_STEP_SUMMARY" not in env

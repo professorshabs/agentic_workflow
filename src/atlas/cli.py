@@ -121,6 +121,10 @@ def main() -> None:
         level=logging.DEBUG if getattr(args, "verbose", False) else logging.INFO,
         format="%(levelname)s %(name)s: %(message)s",
     )
+    if not getattr(args, "verbose", False):
+        # LiteLLM logs every request at INFO; keep the terminal to Atlas's own messages.
+        for name in ("LiteLLM", "LiteLLM Router", "LiteLLM Proxy", "litellm", "httpx"):
+            logging.getLogger(name).setLevel(logging.WARNING)
 
     try:
         if args.cmd == "plan":

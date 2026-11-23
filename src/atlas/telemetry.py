@@ -70,13 +70,17 @@ def extract_usage_metrics(response: Any) -> dict[str, Any]:
     reasoning_tokens = _as_int(reasoning_raw, 0)
 
     cost_usd: float | None = None
-    try:
-        computed = litellm.completion_cost(completion_response=response)
-        parsed_cost = _as_float(computed)
-        if parsed_cost is not None:
-            cost_usd = round(parsed_cost, 6)
-    except Exception:
-        cost_usd = None
+    direct_cost = _as_float(_get_field(usage, "cost"))
+    if direct_cost is not None and direct_cost >= 0:
+        cost_usd = round(direct_cost, 6)
+    else:
+        try:
+            computed = litellm.completion_cost(completion_response=response)
+            parsed_cost = _as_float(computed)
+            if parsed_cost is not None:
+                cost_usd = round(parsed_cost, 6)
+        except Exception:
+            cost_usd = None
 
     return {
         "prompt_tokens": prompt_tokens,

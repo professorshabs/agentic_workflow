@@ -41,10 +41,20 @@ async def research(router: ModelRouter, spec: ParsedSpec) -> ResearchReport:
         )
         return note
 
+    # When a provider is down (e.g. no credit), several researcher models can fall back to the
+    # same model. Asking one model the same question three times only triples the tokens.
+    configured = router.models_for("researcher")
+    models = list(dict.fromkeys(router.first_available(m, "researcher") for m in configured))
+    if len(models) < len(configured):
+        logger.warning(
+            "Research: %d configured researcher models resolve to %d available model(s) %s; "
+            "running each once per requirement.",
+            len(configured),
+            len(models),
+            models,
+        )
     targets: list[tuple[Requirement, str]] = [
-        (req, model)
-        for req in spec.requirements
-        for model in router.models_for("researcher")
+        (req, model) for req in spec.requirements for model in models
     ]
     results = await asyncio.gather(
         *(one(req, model) for req, model in targets),

@@ -9,7 +9,7 @@ Rules:
    - Every functional requirement needs at least one test that proves it. Put the requirement ID
      in that test's name or in a comment right next to it (for example `def test_r001_add():` or
      `# R001`). Verification fails if a requirement ID is missing from all test files.
-3. Include a concise `README.md` explaining how to install, test, and run the app.
+3. Include a concise `README.md` explaining how to install, test, and run the app, and (for runnable CLI/service apps) a minimal `Dockerfile` at the app root (`python:3.12-slim` or `node:20-slim`) so CD can containerize the app cleanly.
 4. Prefer standard library or minimal, well-known dependencies so verification runs fast and reliably in CI.
 5. File paths must be relative to the app root (never absolute, never `..`, never `.git` or `.github`).
 

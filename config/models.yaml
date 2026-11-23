@@ -34,11 +34,15 @@ limits:
   # Output limits per role (fall back to max_tokens). The builder returns the whole app,
   # tests and README in one reply, and the fixer returns full files, so they need more.
   max_tokens_by_role:
+    researcher: 12000
+    judge: 16000
     builder: 32000
     fixer: 16000
   timeout_seconds: 90
   # Long replies take minutes to generate; give those roles more time (fall back to above).
   timeout_seconds_by_role:
+    researcher: 180
+    judge: 300
     builder: 600
     fixer: 300
   attempts_per_model: 2

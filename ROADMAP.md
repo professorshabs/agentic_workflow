@@ -9,7 +9,9 @@ The template currently includes:
 - A reusable Markdown spec guide and a small Python CLI example.
 - A model-backed pipeline with optional research and planning stages.
 - Python and Node.js app generation, test execution, and a limited auto-fix loop.
-- Per-run token and estimated cost reports by stage, model, and call.
+- Per-run token and estimated cost reports by stage, model, and call, plus a committed project ledger (`usage/ledger.jsonl`, `atlas tokens --all`) across runs.
+- A `spec-coverage` check that every functional requirement has a test mentioning its ID.
+- Per-role output limits and timeouts, with a clear error when a model's reply is cut off.
 - Optional token, cost, timeout, and fix-round limits.
 - GitHub Actions for spec-triggered generation, verification, report artifacts, pull requests, and repository quality checks.
 - Credential filtering for subprocesses that install or execute generated application code.

@@ -1,0 +1,300 @@
+"""Per-role limits, billed-but-unusable responses, the project ledger, and requirement coverage."""
+
+import json
+import subprocess
+import sys
+from pathlib import Path
+from types import SimpleNamespace
+from unittest.mock import AsyncMock
+
+import pytest
+
+from atlas.pipeline.verify import check_requirement_coverage
+from atlas.router import ModelRouter
+from atlas.runner import run_build
+from atlas.telemetry import (
+    append_ledger,
+    ledger_entry,
+    ledger_totals,
+    read_ledger,
+    render_ledger_report_md,
+    render_token_report_md,
+    summarize_usage,
+)
+
+CFG = """
+roles:
+  builder: [m-1]
+  parser: [m-1]
+role_fallbacks:
+  builder: [m-2]
+limits:
+  max_parallel_calls: 2
+  max_tokens: 100
+  max_tokens_by_role:
+    builder: 32000
+  timeout_seconds: 10
+  timeout_seconds_by_role:
+    builder: 600
+  attempts_per_model: 2
+"""
+
+
+def _response(content, finish_reason="stop", prompt=10, completion=5):
+    return SimpleNamespace(
+        choices=[
+            SimpleNamespace(message=SimpleNamespace(content=content), finish_reason=finish_reason)
+        ],
+        usage=SimpleNamespace(prompt_tokens=prompt, completion_tokens=completion),
+    )
+
+
+@pytest.fixture
+def router(tmp_path):
+    cfg = tmp_path / "models.yaml"
+    cfg.write_text(CFG, encoding="utf-8")
+    return ModelRouter(cfg)
+
+
+async def test_role_limits_are_sent_to_the_provider(router, monkeypatch):
+    fake = AsyncMock(return_value=_response('{"ok": true}'))
+    monkeypatch.setattr("atlas.router.litellm.acompletion", fake)
+
+    await router.complete("m-1", "sys", "usr", role="builder")
+    assert fake.call_args.kwargs["max_tokens"] == 32000
+    assert fake.call_args.kwargs["timeout"] == 600
+
+    await router.complete("m-1", "sys", "usr", role="parser")
+    assert fake.call_args.kwargs["max_tokens"] == 100
+    assert fake.call_args.kwargs["timeout"] == 10
+
+
+async def test_truncated_output_is_counted_and_skips_to_next_model(router, monkeypatch):
+    calls = []
+
+    async def fake(*, model, **kwargs):
+        calls.append(model)
+        if model == "m-1":
+            return _response('{"files": [', finish_reason="length", prompt=50, completion=32000)
+        return _response('{"ok": true}', prompt=50, completion=40)
+
+    monkeypatch.setattr("atlas.router.litellm.acompletion", AsyncMock(side_effect=fake))
+    used, _ = await router.complete("m-1", "sys", "usr", role="builder")
+
+    assert used == "m-2"
+    assert calls == ["m-1", "m-2"]  # no second identical (and identically cut off) attempt
+    summary = summarize_usage(router.call_log)
+    assert summary.total_calls == 2
+    assert summary.failed_calls == 1
+    assert summary.completion_tokens == 32040  # the cut-off reply was billed, so it counts
+    assert "max_tokens_by_role.builder" in router.call_log[0]["error"]
+    assert "unusable response" in render_token_report_md(summary)
+
+
+async def test_all_models_truncated_gives_actionable_error(router, monkeypatch):
+    monkeypatch.setattr(
+        "atlas.router.litellm.acompletion",
+        AsyncMock(return_value=_response("{", finish_reason="length")),
+    )
+    with pytest.raises(RuntimeError, match="max_tokens_by_role.builder"):
+        await router.complete("m-1", "sys", "usr", role="builder")
+
+
+async def test_empty_reply_with_usage_is_still_counted(router, monkeypatch):
+    replies = [_response("   ", prompt=70, completion=3), _response('{"ok": 1}')]
+    monkeypatch.setattr("atlas.router.litellm.acompletion", AsyncMock(side_effect=replies))
+    await router.complete("m-1", "sys", "usr", role="parser")
+    summary = summarize_usage(router.call_log)
+    assert summary.total_calls == 2
+    assert summary.failed_calls == 1
+    assert summary.prompt_tokens == 80
+
+
+@pytest.mark.parametrize(
+    "extra, match",
+    [
+        ("  max_tokens_by_role: [1]\n", "max_tokens_by_role must be a mapping"),
+        ("  max_tokens_by_role:\n    builder: 0\n", r"max_tokens_by_role\['builder'\]"),
+        ("  timeout_seconds_by_role:\n    builder: 0\n", r"timeout_seconds_by_role\['builder'\]"),
+    ],
+)
+def test_role_limit_validation(tmp_path, extra, match):
+    cfg = tmp_path / "models.yaml"
+    cfg.write_text(
+        "roles:\n  p: [m]\nlimits:\n  max_parallel_calls: 1\n  max_tokens: 10\n"
+        "  timeout_seconds: 5\n" + extra,
+        encoding="utf-8",
+    )
+    with pytest.raises(ValueError, match=match):
+        ModelRouter(cfg)
+
+
+def test_shipped_config_enables_role_limits_and_coverage():
+    router = ModelRouter(Path(__file__).resolve().parents[1] / "config" / "models.yaml")
+    assert router.max_tokens_for("builder") > router.max_tokens_for("parser")
+    assert router.timeout_for("builder") > router.timeout_for("parser")
+    assert router.require_requirement_tests is True
+
+
+# ---------------------------------------------------------------- ledger
+
+
+def _summary(prompt, completion, cost, role="builder", model="m-1"):
+    return summarize_usage(
+        [
+            {
+                "role": role,
+                "used_model": model,
+                "prompt_tokens": prompt,
+                "completion_tokens": completion,
+                "cost_usd": cost,
+            }
+        ]
+    )
+
+
+def test_ledger_append_read_totals_and_report(tmp_path):
+    path = tmp_path / "usage" / "ledger.jsonl"
+    append_ledger(path, ledger_entry(run_id="r1", mode="build", spec_path="specs/a.md",
+                                     status="verified", summary=_summary(100, 50, 0.01)))
+    append_ledger(path, ledger_entry(run_id="r2", mode="plan", spec_path="specs/a.md",
+                                     status="plan_ready",
+                                     summary=_summary(10, 5, None, role="judge", model="m-9")))
+    with path.open("a", encoding="utf-8") as fh:
+        fh.write("{broken line from a bad merge\n\n")
+
+    entries = read_ledger(path)
+    assert [e["run_id"] for e in entries] == ["r1", "r2"]
+    totals = ledger_totals(entries)
+    assert totals["total_tokens"] == 165
+    assert totals["cost_usd"] == 0.01
+    assert totals["by_spec"]["specs/a.md"]["runs"] == 2
+    assert set(totals["by_model"]) == {"m-1", "m-9"}
+    report = render_ledger_report_md(entries)
+    assert "**165 tokens** across 2 run(s)" in report
+    assert "| `r2` | plan | `specs/a.md` | plan_ready | 15 |" in report
+    assert "No runs recorded" in render_ledger_report_md([])
+
+
+def test_cli_tokens_all_reads_the_ledger(tmp_path):
+    path = tmp_path / "ledger.jsonl"
+    append_ledger(path, ledger_entry(run_id="r1", mode="build", spec_path="specs/a.md",
+                                     status="verified", summary=_summary(1000, 234, 0.5)))
+    res = subprocess.run(
+        [sys.executable, "-m", "atlas.cli", "tokens", "--all", "--ledger", str(path), "--json"],
+        capture_output=True, text=True, check=False,
+    )
+    assert res.returncode == 0, res.stderr
+    assert json.loads(res.stdout)["total_tokens"] == 1234
+
+
+# ---------------------------------------------------------------- requirement coverage
+
+
+def _write(root: Path, rel: str, text: str) -> None:
+    p = root / rel
+    p.parent.mkdir(parents=True, exist_ok=True)
+    p.write_text(text, encoding="utf-8")
+
+
+def test_requirement_coverage_check(tmp_path):
+    _write(tmp_path, "tests/test_core.py", "def test_r001_add():\n    pass\n# R10\n")
+    _write(tmp_path, "app/latest.py", "# R002 is mentioned here, but this is not a test file\n")
+    _write(tmp_path, "web/sum.test.js", "test('R003 sums', () => {})\n")
+    _write(tmp_path, "node_modules/x/test_x.py", "# R002 inside a dependency\n")
+
+    ok = check_requirement_coverage(tmp_path, ["R001", "R003", "R10"])
+    assert ok.passed and ok.name == "spec-coverage"
+    assert "R003: web/sum.test.js" in ok.stdout
+
+    bad = check_requirement_coverage(tmp_path, ["R001", "R002", "R1"])
+    assert not bad.passed
+    assert "R002, R1" in bad.stderr  # R1 must not match R10 or R001
+
+    empty = tmp_path / "empty"
+    empty.mkdir()
+    assert "No test files" in check_requirement_coverage(empty, ["R001"]).stderr
+
+
+class ScriptedRouter(ModelRouter):
+    """Returns canned JSON per role and records token usage, without any network."""
+
+    def __init__(self, replies: dict[str, list[str]], coverage: bool = True):
+        self.path = Path("fake")
+        self.cfg = {
+            "roles": {"parser": ["m-p"], "builder": ["m-b"], "fixer": ["m-f"]},
+            "limits": {"max_parallel_calls": 1, "max_tokens": 100, "timeout_seconds": 5,
+                       "repair_attempts": 0, "max_fix_rounds": 2, "verify_timeout_seconds": 60},
+            "verification": {"require_requirement_tests": coverage},
+        }
+        self._semaphores = {}
+        self.call_log = []
+        self.replies = {k: list(v) for k, v in replies.items()}
+        self.prompts: dict[str, list[str]] = {}
+
+    async def complete(self, model, system, user, role=None):
+        self.prompts.setdefault(role, []).append(user)
+        self.call_log.append({"role": role, "used_model": model, "prompt_tokens": 10,
+                              "completion_tokens": 10, "cost_usd": 0.001})
+        return model, self.replies[role].pop(0)
+
+
+async def test_missing_requirement_test_goes_to_fixer_and_run_is_ledgered(tmp_path):
+    spec = tmp_path / "spec.md"
+    spec.write_text("# Adder\nadd(a, b) and sub(a, b) with tests.\n", encoding="utf-8")
+    parsed = {"summary": "Math", "requirements": [
+        {"id": "R001", "title": "add", "description": "add(a, b) returns a + b"},
+        {"id": "R002", "title": "sub", "description": "sub(a, b) returns a - b"},
+        {"id": "R003", "title": "fast", "description": "under 1s", "kind": "non_functional"},
+    ]}
+    code = "def add(a, b):\n    return a + b\n\n\ndef sub(a, b):\n    return a - b\n"
+    built = {"summary": "Math lib", "stack": "python", "files": [
+        {"path": "mathlib.py", "content": code},
+        {"path": "tests/test_mathlib.py",
+         "content": "from mathlib import add\n\n\n"
+                    "def test_r001_add():\n    assert add(2, 3) == 5\n"},
+    ]}
+    patch = {"diagnosis": "R002 had no test.", "files": [
+        {"path": "tests/test_sub.py",
+         "content": "from mathlib import sub\n\n\ndef test_sub():  # R002\n"
+                    "    assert sub(5, 3) == 2\n"},
+    ]}
+    router = ScriptedRouter({"parser": [json.dumps(parsed)], "builder": [json.dumps(built)],
+                             "fixer": [json.dumps(patch)]})
+    ledger = tmp_path / "usage" / "ledger.jsonl"
+
+    out = await run_build(spec, tmp_path / "runs", tmp_path / "app", router=router,
+                          skip_research=True, clean_app_dir=True, ledger_path=ledger)
+
+    manifest = json.loads((out / "manifest.json").read_text(encoding="utf-8"))
+    assert manifest["status"] == "verified"
+    verification = json.loads((out / "verification.json").read_text(encoding="utf-8"))
+    first = {c["name"]: c for c in verification["rounds"][0]["checks"]}
+    assert first["python-pytest"]["passed"] is True  # the tests themselves were fine ...
+    assert first["spec-coverage"]["passed"] is False  # ... but R002 had none
+    assert "R002" in first["spec-coverage"]["stderr"]
+    assert "R003" not in first["spec-coverage"]["command"]  # non-functional is not required
+    assert "spec-coverage" in router.prompts["fixer"][0]  # the fixer was told why
+
+    entries = read_ledger(ledger)
+    assert len(entries) == 1
+    assert entries[0]["status"] == "verified"
+    assert entries[0]["mode"] == "build"
+    assert entries[0]["total_tokens"] == 60  # parser + builder + fixer, 20 tokens each
+    assert entries[0]["by_stage"]["fixer"]["calls"] == 1
+
+
+async def test_coverage_check_is_off_unless_configured(tmp_path):
+    spec = tmp_path / "spec.md"
+    spec.write_text("# Adder\n", encoding="utf-8")
+    parsed = {"summary": "Add", "requirements": [{"id": "R001", "title": "add",
+                                                  "description": "add"}]}
+    built = {"summary": "Add", "stack": "python", "files": [
+        {"path": "tests/test_ok.py", "content": "def test_ok():\n    assert 1 + 1 == 2\n"}]}
+    router = ScriptedRouter({"parser": [json.dumps(parsed)], "builder": [json.dumps(built)]},
+                            coverage=False)
+    out = await run_build(spec, tmp_path / "runs", tmp_path / "app", router=router,
+                          skip_research=True)
+    manifest = json.loads((out / "manifest.json").read_text(encoding="utf-8"))
+    assert manifest["status"] == "verified"
+    assert not (tmp_path / "usage").exists()  # no ledger unless a path is given

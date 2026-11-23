@@ -40,10 +40,13 @@ concurrency:
 jobs:
   build-and-verify:
     runs-on: ubuntu-latest
+    outputs:
+      pr_branch: ${{ steps.pr.outputs.branch }}
     steps:
       - uses: actions/checkout@v4
         with:
-          fetch-depth: 2
+          # Full history so the whole push (before..after) can be compared, not just one commit.
+          fetch-depth: 0
 
       - uses: actions/setup-python@v5
         with:
@@ -62,14 +65,25 @@ jobs:
         env:
           EVENT_NAME: ${{ github.event_name }}
           SPEC_PATH_INPUT: ${{ inputs.spec_path }}
+          BEFORE_SHA: ${{ github.event.before }}
+          AFTER_SHA: ${{ github.sha }}
         run: |
           if [ "$EVENT_NAME" = "workflow_dispatch" ]; then
             SPEC_PATH="$SPEC_PATH_INPUT"
           else
-            SPEC_PATH=$(git diff --name-only --diff-filter=AM HEAD~1 HEAD -- 'specs/*.md' 'specs/**/*.md' ':!specs/TEMPLATE.md' | head -n 1 || true)
-            if [ -z "$SPEC_PATH" ]; then
-              SPEC_PATH="specs/example-app.md"
+            # Every spec added or changed anywhere in this push. Empty for the first commit of a
+            # repository created from the template, so creating a repo never starts a paid build.
+            CHANGED=$(atlas changed-specs --before "$BEFORE_SHA" --after "$AFTER_SHA")
+            COUNT=$(printf '%s\n' "$CHANGED" | grep -c . || true)
+            if [ "$COUNT" -eq 0 ]; then
+              echo "No spec was added or changed in this push. Nothing to build."
+              exit 0
             fi
+            if [ "$COUNT" -gt 1 ]; then
+              echo "::error::This push changed $COUNT specs: $(echo "$CHANGED" | paste -sd ' ' -). Push one spec at a time, or start each with Actions -> Spec to App -> Run workflow."
+              exit 1
+            fi
+            SPEC_PATH="$CHANGED"
           fi
 
           python - "$SPEC_PATH" <<'PY'
@@ -95,6 +109,7 @@ jobs:
 
       - name: Build, test, and verify application
         id: build
+        if: steps.spec.outputs.path != ''
         env:
           OPENROUTER_API_KEY: ${{ secrets.OPENROUTER_API_KEY }}
           ANTHROPIC_API_KEY: ${{ secrets.ANTHROPIC_API_KEY }}
@@ -149,9 +164,12 @@ jobs:
           path: |
             runs/
             run-report.md
+            usage/
+          if-no-files-found: ignore
 
       - name: Open Pull Request with generated app and token report
-        if: always()
+        id: pr
+        if: always() && steps.spec.outputs.path != ''
         env:
           GH_TOKEN: ${{ github.token }}
           SPEC_PATH: ${{ steps.spec.outputs.path }}
@@ -168,7 +186,9 @@ jobs:
 
           BRANCH="atlas/build-${RUN_ID}"
           git checkout -b "$BRANCH"
+          # usage/ledger.jsonl keeps a running total of every run's tokens in the repository.
           git add app/
+          if [ -d usage ]; then git add usage/; fi
 
           TOTAL_TOKENS=$(python - <<'PY'
           import json
@@ -187,6 +207,7 @@ jobs:
 
           git commit -m "feat(app): generate from ${SPEC_PATH} (tokens: ${TOTAL_TOKENS})"
           git push -u origin "$BRANCH"
+          echo "branch=$BRANCH" >> "$GITHUB_OUTPUT"
 
           STATUS_LABEL="verified"
           PR_FLAGS=()
@@ -208,5 +229,18 @@ jobs:
             "${PR_FLAGS[@]}"
 
       - name: Enforce build verification status
-        if: steps.build.outputs.exit_code != '0'
-        run: exit "${{ steps.build.outputs.exit_code }}"
+        if: steps.build.outputs.exit_code != '' && steps.build.outputs.exit_code != '0'
+        env:
+          BUILD_EXIT_CODE: ${{ steps.build.outputs.exit_code }}
+        run: |
+          echo "::error::atlas build exited with code ${BUILD_EXIT_CODE}. See the draft PR and the run artifacts."
+          exit 1
+
+  # A PR opened with the built-in GITHUB_TOKEN does not start other workflows, so ci.yml would
+  # never run on the generated PR. Run it here against the pushed branch instead.
+  ci:
+    needs: build-and-verify
+    if: needs.build-and-verify.outputs.pr_branch != ''
+    uses: ./.github/workflows/ci.yml
+    with:
+      ref: ${{ needs.build-and-verify.outputs.pr_branch }}

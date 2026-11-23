@@ -6,6 +6,7 @@ import asyncio
 import importlib.util
 import json
 import os
+import re
 import shlex
 import shutil
 import sys
@@ -61,6 +62,11 @@ _SENSITIVE_ENV_NAMES = {
     "SSH_AUTH_SOCK",
 }
 _SENSITIVE_ENV_PREFIXES = ("ACTIONS_", "GITHUB_", "RUNNER_")
+# tests/, __tests__/, test_x.py, x_test.go, x.test.ts, x.spec.js ... (but not "latest.py")
+_TEST_PATH_RE = re.compile(
+    r"(^|/)(tests?|__tests__|specs?)/|(^|/)test_[^/]+$|_test\.[^/]+$|\.(test|spec)\.[^/]+$",
+    flags=re.IGNORECASE,
+)
 
 
 def _tail(text: str, limit: int = _MAX_OUTPUT_CHARS) -> str:
@@ -432,6 +438,56 @@ async def _verify_node(app_dir: Path, timeout: float) -> list[CheckResult]:
                 )
 
     return checks
+
+
+def check_requirement_coverage(app_dir: Path, requirement_ids: list[str]) -> CheckResult:
+    """Pass only if every requirement ID is mentioned in at least one test file.
+
+    Plain text search, no model call. It catches generated suites that skip a requirement;
+    it cannot prove a test is meaningful, so reviewing the PR still matters.
+    """
+    started = time.monotonic()
+    root = app_dir.resolve() if app_dir.is_dir() else app_dir
+    test_texts: dict[str, str] = {}
+    for path in _iter_source_files(app_dir):
+        rel = path.relative_to(root).as_posix()
+        if _TEST_PATH_RE.search(rel):
+            try:
+                test_texts[rel] = path.read_text(encoding="utf-8", errors="ignore")
+            except OSError:
+                continue
+
+    found: dict[str, list[str]] = {}
+    missing: list[str] = []
+    for req_id in requirement_ids:
+        pattern = re.compile(
+            rf"(?<![A-Za-z0-9]){re.escape(req_id)}(?![0-9])", flags=re.IGNORECASE
+        )
+        files = sorted(rel for rel, text in test_texts.items() if pattern.search(text))
+        if files:
+            found[req_id] = files
+        else:
+            missing.append(req_id)
+
+    stdout = "\n".join(f"{rid}: {', '.join(files)}" for rid, files in found.items())
+    stderr = ""
+    if not test_texts:
+        stderr = "No test files found."
+    elif missing:
+        stderr = (
+            f"No test mentions requirement(s): {', '.join(missing)}. Add tests for them and put "
+            f"the requirement ID in the test name or a comment next to it (e.g. `# {missing[0]}`)."
+        )
+    passed = bool(test_texts) and not missing
+    return CheckResult(
+        name="spec-coverage",
+        command=f"every requirement has a test mentioning its ID ({', '.join(requirement_ids)})",
+        passed=passed,
+        exit_code=0 if passed else 1,
+        duration_ms=round((time.monotonic() - started) * 1000, 1),
+        stdout=stdout,
+        stderr=stderr,
+    )
 
 
 async def verify_app(

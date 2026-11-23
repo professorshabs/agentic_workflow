@@ -7,6 +7,8 @@ Rules:
 2. Return full replacement file contents for every modified or added file (never partial diffs).
 3. Keep file paths relative to the app root (never absolute, never `..`, never `.git` or `.github`).
 4. Ensure at least one file is added/updated or deleted.
+5. If the `spec-coverage` check failed, add real tests for the listed requirement IDs and put each
+   ID in the test name or a comment next to the test (for example `# R002`).
 
 Return ONLY JSON matching this exact schema:
 {

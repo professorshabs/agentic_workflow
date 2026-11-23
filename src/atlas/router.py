@@ -23,6 +23,13 @@ class TokenBudgetExceededError(RuntimeError):
     """Raised when a configured token or cost limit has been reached."""
 
 
+class OutputTruncatedError(RuntimeError):
+    """Raised when a model stops at the max_tokens limit, so its output is incomplete."""
+
+
+_TRUNCATED_FINISH_REASONS = {"length", "max_tokens"}
+
+
 def resolve_default_config() -> Path:
     """Resolve config path from ATLAS_CONFIG env var, CWD, or package-relative default."""
     env_path = os.environ.get("ATLAS_CONFIG")
@@ -105,6 +112,21 @@ class ModelRouter:
         max_cost_usd = limits.get("max_cost_usd")
         if max_cost_usd is not None and float(max_cost_usd) <= 0:
             raise ValueError("limits.max_cost_usd must be > 0")
+        by_role = limits.get("max_tokens_by_role") or {}
+        if not isinstance(by_role, dict):
+            raise ValueError("limits.max_tokens_by_role must be a mapping of role -> tokens")
+        for role, value in by_role.items():
+            if isinstance(value, bool) or int(value) < 1:
+                raise ValueError(f"limits.max_tokens_by_role['{role}'] must be >= 1")
+        timeouts_by_role = limits.get("timeout_seconds_by_role") or {}
+        if not isinstance(timeouts_by_role, dict):
+            raise ValueError("limits.timeout_seconds_by_role must be a mapping of role -> seconds")
+        for role, value in timeouts_by_role.items():
+            if isinstance(value, bool) or float(value) <= 0:
+                raise ValueError(f"limits.timeout_seconds_by_role['{role}'] must be > 0")
+        verification = self.cfg.get("verification", {})
+        if not isinstance(verification, dict):
+            raise ValueError("'verification' must be a mapping")
 
     @property
     def repair_attempts(self) -> int:
@@ -127,6 +149,25 @@ class ModelRouter:
     def max_cost_usd(self) -> float | None:
         val = self.cfg["limits"].get("max_cost_usd")
         return float(val) if val is not None else None
+
+    @property
+    def require_requirement_tests(self) -> bool:
+        """Fail verification when a functional requirement has no test mentioning its ID."""
+        return bool((self.cfg.get("verification") or {}).get("require_requirement_tests", False))
+
+    def max_tokens_for(self, role: str | None) -> int:
+        """Output token limit for a role: limits.max_tokens_by_role, else limits.max_tokens."""
+        by_role = self.cfg["limits"].get("max_tokens_by_role") or {}
+        if role is not None and role in by_role:
+            return int(by_role[role])
+        return int(self.cfg["limits"]["max_tokens"])
+
+    def timeout_for(self, role: str | None) -> float:
+        """Per-call timeout: limits.timeout_seconds_by_role, else limits.timeout_seconds."""
+        by_role = self.cfg["limits"].get("timeout_seconds_by_role") or {}
+        if role is not None and role in by_role:
+            return float(by_role[role])
+        return float(self.cfg["limits"].get("timeout_seconds", 90))
 
     def models_for(self, role: str, *, fallback_role: str | None = None) -> list[str]:
         if role in self.cfg["roles"]:
@@ -166,21 +207,39 @@ class ModelRouter:
         self._check_budget()
         last_err: Exception | None = None
         attempts = int(self.cfg["limits"].get("attempts_per_model", 1))
-        timeout = float(self.cfg["limits"].get("timeout_seconds", 90))
+        timeout = self.timeout_for(role)
         candidates = self.candidates_for(model, role=role)
+        max_tokens = self.max_tokens_for(role)
         sem = self._get_semaphore()
         total_attempts = 0
         started = time.monotonic()
 
+        def record(response: Any, candidate: str, error: str | None = None) -> None:
+            # Every response the provider returned is logged, including unusable ones:
+            # they are normally billed, so leaving them out would under-report spend.
+            self.call_log.append(
+                {
+                    "role": role,
+                    "requested_model": model,
+                    "used_model": candidate,
+                    "attempts": total_attempts,
+                    "elapsed_ms": round((time.monotonic() - started) * 1000, 1),
+                    "timestamp": datetime.now(UTC).isoformat(),
+                    **extract_usage_metrics(response),
+                    **({"error": error} if error else {}),
+                }
+            )
+
         for candidate in candidates:
             for attempt in range(attempts):
                 total_attempts += 1
+                response: Any = None
                 try:
                     async with sem:
                         response = await asyncio.wait_for(
                             litellm.acompletion(
                                 model=candidate,
-                                max_tokens=int(self.cfg["limits"]["max_tokens"]),
+                                max_tokens=max_tokens,
                                 timeout=timeout,
                                 messages=[
                                     {"role": "system", "content": system},
@@ -192,25 +251,27 @@ class ModelRouter:
                     choices = getattr(response, "choices", None)
                     if not choices:
                         raise ValueError(f"Model {candidate} returned no choices")
+                    if getattr(choices[0], "finish_reason", None) in _TRUNCATED_FINISH_REASONS:
+                        raise OutputTruncatedError(
+                            f"Model {candidate} stopped at the output limit of {max_tokens} "
+                            f"tokens for role '{role}', so its answer is incomplete. Raise "
+                            f"limits.max_tokens_by_role.{role} in the model config."
+                        )
                     content = getattr(choices[0].message, "content", None)
                     if not isinstance(content, str) or not content.strip():
                         raise ValueError(f"Model {candidate} returned empty content")
 
-                    metrics = extract_usage_metrics(response)
-                    self.call_log.append(
-                        {
-                            "role": role,
-                            "requested_model": model,
-                            "used_model": candidate,
-                            "attempts": total_attempts,
-                            "elapsed_ms": round((time.monotonic() - started) * 1000, 1),
-                            "timestamp": datetime.now(UTC).isoformat(),
-                            **metrics,
-                        }
-                    )
+                    record(response, candidate)
                     return candidate, content.strip()
+                except OutputTruncatedError as exc:
+                    last_err = exc
+                    record(response, candidate, error=str(exc))
+                    logger.warning("%s", exc)
+                    break  # the same prompt would be cut off again; try the next candidate
                 except Exception as exc:  # model/provider failures are isolated here
                     last_err = exc
+                    if response is not None:
+                        record(response, candidate, error=f"{type(exc).__name__}: {exc}")
                     logger.warning(
                         "Model call failed (role=%s, candidate=%s, attempt=%d/%d): %s: %s",
                         role,

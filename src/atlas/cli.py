@@ -8,11 +8,19 @@ from pathlib import Path
 from dotenv import load_dotenv
 
 from atlas import __version__
+from atlas.changes import changed_specs
 from atlas.pipeline.verify import verify_app
 from atlas.router import ModelRouter
 from atlas.runner import run_build, run_plan
 from atlas.schemas import TokenUsageSummary
-from atlas.telemetry import render_token_report_md, summarize_usage
+from atlas.telemetry import (
+    DEFAULT_LEDGER,
+    ledger_totals,
+    read_ledger,
+    render_ledger_report_md,
+    render_token_report_md,
+    summarize_usage,
+)
 
 logger = logging.getLogger("atlas")
 
@@ -45,6 +53,16 @@ def _load_token_summary(run_dir: Path) -> TokenUsageSummary:
     raise FileNotFoundError(f"Neither tokens.json nor manifest.json found in {run_dir}")
 
 
+def _add_ledger_args(p: argparse.ArgumentParser) -> None:
+    p.add_argument(
+        "--ledger",
+        type=Path,
+        default=Path(DEFAULT_LEDGER),
+        help=f"append this run's token totals to a project ledger (default: {DEFAULT_LEDGER})",
+    )
+    p.add_argument("--no-ledger", action="store_true", help="do not write to the ledger")
+
+
 def main() -> None:
     load_dotenv()
     parser = argparse.ArgumentParser(prog="atlas")
@@ -56,6 +74,7 @@ def main() -> None:
     plan_parser.add_argument("--out", type=Path, default=Path("runs"))
     plan_parser.add_argument("--config", type=Path, default=None)
     plan_parser.add_argument("--verbose", action="store_true")
+    _add_ledger_args(plan_parser)
 
     build_parser = sub.add_parser(
         "build", help="specification -> (plan) -> build app -> test/verify -> token report"
@@ -69,6 +88,7 @@ def main() -> None:
     build_parser.add_argument("--max-fix-rounds", type=int, default=None)
     build_parser.add_argument("--report-out", type=Path, default=None)
     build_parser.add_argument("--verbose", action="store_true")
+    _add_ledger_args(build_parser)
 
     verify_parser = sub.add_parser(
         "verify", help="detect stack and run test/lint/build verification checks"
@@ -81,6 +101,17 @@ def main() -> None:
     tokens_parser.add_argument("run_dir", type=Path, nargs="?", default=None)
     tokens_parser.add_argument("--runs-root", type=Path, default=Path("runs"))
     tokens_parser.add_argument("--json", action="store_true")
+    tokens_parser.add_argument(
+        "--all", action="store_true", help="every recorded run, from the project ledger"
+    )
+    tokens_parser.add_argument("--ledger", type=Path, default=Path(DEFAULT_LEDGER))
+
+    changes_parser = sub.add_parser(
+        "changed-specs", help="list specs added or changed between two commits (used by CI)"
+    )
+    changes_parser.add_argument("--before", required=True)
+    changes_parser.add_argument("--after", default="HEAD")
+    changes_parser.add_argument("--repo", type=Path, default=Path("."))
 
     val_parser = sub.add_parser("validate-config", help="validate config/models.yaml")
     val_parser.add_argument("--config", type=Path, default=None)
@@ -93,7 +124,14 @@ def main() -> None:
 
     try:
         if args.cmd == "plan":
-            out = asyncio.run(run_plan(args.spec, args.out, args.config))
+            out = asyncio.run(
+                run_plan(
+                    args.spec,
+                    args.out,
+                    args.config,
+                    ledger_path=None if args.no_ledger else args.ledger,
+                )
+            )
             summary = _load_token_summary(out)
             print(f"Plan written to {out / 'plan.md'}")
             print(
@@ -112,6 +150,7 @@ def main() -> None:
                     clean_app_dir=args.clean,
                     max_fix_rounds=args.max_fix_rounds,
                     report_out=args.report_out,
+                    ledger_path=None if args.no_ledger else args.ledger,
                 )
             )
             manifest = json.loads((out / "manifest.json").read_text(encoding="utf-8"))
@@ -150,6 +189,15 @@ def main() -> None:
                         print(chk.stderr or chk.stdout)
             if not passed:
                 sys.exit(1)
+        elif args.cmd == "tokens" and args.all:
+            entries = read_ledger(args.ledger)
+            if args.json:
+                print(json.dumps(ledger_totals(entries), indent=2))
+            else:
+                print(render_ledger_report_md(entries))
+        elif args.cmd == "changed-specs":
+            for path in changed_specs(args.repo, args.before, args.after):
+                print(path)
         elif args.cmd == "tokens":
             target_dir = (
                 args.run_dir if args.run_dir is not None else _find_latest_run(args.runs_root)

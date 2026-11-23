@@ -2,6 +2,9 @@
 
 from __future__ import annotations
 
+import json
+import os
+from pathlib import Path
 from typing import Any
 
 import litellm
@@ -233,4 +236,146 @@ def render_token_report_md(summary: TokenUsageSummary) -> str:
             "token usage metadata.",
         ])
 
+    return "\n".join(lines)
+
+
+# ---------------------------------------------------------------------------
+# Project token ledger: one JSON line per Atlas run, committed with the project, so the
+# total spend survives after run folders and CI artifacts are gone.
+
+DEFAULT_LEDGER = "usage/ledger.jsonl"
+
+
+def _bucket_map(buckets: list[UsageBucket]) -> dict[str, dict[str, Any]]:
+    return {
+        b.name: {"calls": b.calls, "total_tokens": b.total_tokens, "cost_usd": b.cost_usd}
+        for b in buckets
+    }
+
+
+def ledger_entry(
+    *,
+    run_id: str,
+    mode: str,
+    spec_path: str,
+    status: str,
+    summary: TokenUsageSummary,
+    created_at: str | None = None,
+    completed_at: str | None = None,
+) -> dict[str, Any]:
+    """Compact, append-only record of one run's token use."""
+    return {
+        "run_id": run_id,
+        "mode": mode,
+        "spec_path": spec_path,
+        "status": status,
+        "created_at": created_at,
+        "completed_at": completed_at,
+        "runner": "github-actions" if os.environ.get("GITHUB_ACTIONS") == "true" else "local",
+        "git_sha": os.environ.get("GITHUB_SHA", ""),
+        "calls": summary.total_calls,
+        "prompt_tokens": summary.prompt_tokens,
+        "completion_tokens": summary.completion_tokens,
+        "cached_tokens": summary.cached_tokens,
+        "reasoning_tokens": summary.reasoning_tokens,
+        "total_tokens": summary.total_tokens,
+        "cost_usd": summary.cost_usd,
+        "unreported_usage_calls": summary.unreported_usage_calls,
+        "failed_calls": summary.failed_calls,
+        "by_stage": _bucket_map(summary.by_stage),
+        "by_model": _bucket_map(summary.by_model),
+    }
+
+
+def append_ledger(path: Path, entry: dict[str, Any]) -> None:
+    path.parent.mkdir(parents=True, exist_ok=True)
+    with path.open("a", encoding="utf-8") as fh:
+        fh.write(json.dumps(entry, sort_keys=True) + "\n")
+
+
+def read_ledger(path: Path) -> list[dict[str, Any]]:
+    """Read ledger lines; skips blank or broken lines (for example after a bad merge)."""
+    if not path.is_file():
+        return []
+    entries: list[dict[str, Any]] = []
+    for line in path.read_text(encoding="utf-8").splitlines():
+        if not line.strip():
+            continue
+        try:
+            value = json.loads(line)
+        except json.JSONDecodeError:
+            continue
+        if isinstance(value, dict):
+            entries.append(value)
+    return entries
+
+
+def _sum_group(entries: list[dict[str, Any]], key: str) -> dict[str, dict[str, Any]]:
+    grouped: dict[str, dict[str, Any]] = {}
+    for e in entries:
+        g = grouped.setdefault(
+            str(e.get(key) or "-"), {"runs": 0, "calls": 0, "total_tokens": 0, "cost_usd": None}
+        )
+        g["runs"] += 1
+        g["calls"] += _as_int(e.get("calls"))
+        g["total_tokens"] += _as_int(e.get("total_tokens"))
+        cost = _as_float(e.get("cost_usd"))
+        if cost is not None:
+            g["cost_usd"] = (g["cost_usd"] or 0.0) + cost
+    return grouped
+
+
+def _sum_nested(entries: list[dict[str, Any]], key: str) -> dict[str, dict[str, Any]]:
+    grouped: dict[str, dict[str, Any]] = {}
+    for e in entries:
+        for name, b in (e.get(key) or {}).items():
+            g = grouped.setdefault(name, {"calls": 0, "total_tokens": 0, "cost_usd": None})
+            g["calls"] += _as_int(b.get("calls"))
+            g["total_tokens"] += _as_int(b.get("total_tokens"))
+            cost = _as_float(b.get("cost_usd"))
+            if cost is not None:
+                g["cost_usd"] = (g["cost_usd"] or 0.0) + cost
+    return grouped
+
+
+def ledger_totals(entries: list[dict[str, Any]]) -> dict[str, Any]:
+    costs = [c for c in (_as_float(e.get("cost_usd")) for e in entries) if c is not None]
+    return {
+        "runs": len(entries),
+        "calls": sum(_as_int(e.get("calls")) for e in entries),
+        "prompt_tokens": sum(_as_int(e.get("prompt_tokens")) for e in entries),
+        "completion_tokens": sum(_as_int(e.get("completion_tokens")) for e in entries),
+        "total_tokens": sum(_as_int(e.get("total_tokens")) for e in entries),
+        "cost_usd": round(sum(costs), 6) if costs else None,
+        "by_spec": _sum_group(entries, "spec_path"),
+        "by_stage": _sum_nested(entries, "by_stage"),
+        "by_model": _sum_nested(entries, "by_model"),
+    }
+
+
+def render_ledger_report_md(entries: list[dict[str, Any]]) -> str:
+    """Markdown report of every recorded run: totals, then by spec, model, stage, recent runs."""
+    if not entries:
+        return "## Project token usage\n\nNo runs recorded in the ledger yet."
+    t = ledger_totals(entries)
+    lines = [
+        "## Project token usage",
+        "",
+        f"**{t['total_tokens']:,} tokens** across {t['runs']} run(s) and {t['calls']} model "
+        f"call(s) · estimated cost {_fmt_cost(t['cost_usd'])}",
+    ]
+    for title, key, first in (("By spec", "by_spec", "Spec"), ("By model", "by_model", "Model"),
+                              ("By stage", "by_stage", "Stage")):
+        lines.extend(["", f"### {title}", "", f"| {first} | Calls | Total tokens | Est. Cost |",
+                      "| :--- | ---: | ---: | ---: |"])
+        for name, g in t[key].items():
+            lines.append(f"| `{name}` | {g['calls']} | {g['total_tokens']:,} | "
+                         f"{_fmt_cost(g['cost_usd'])} |")
+    lines.extend(["", "### Recent runs", "",
+                  "| Run | Mode | Spec | Status | Total tokens | Est. Cost |",
+                  "| :--- | :--- | :--- | :--- | ---: | ---: |"])
+    for e in entries[-10:]:
+        lines.append(f"| `{e.get('run_id')}` | {e.get('mode')} | `{e.get('spec_path')}` | "
+                     f"{e.get('status')} | {_as_int(e.get('total_tokens')):,} | "
+                     f"{_fmt_cost(_as_float(e.get('cost_usd')))} |")
     return "\n".join(lines)

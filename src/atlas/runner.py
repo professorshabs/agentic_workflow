@@ -1,6 +1,7 @@
 """Core pipeline orchestration and approval recording shared by CLI and API."""
 
 import json
+import logging
 import uuid
 from collections.abc import Awaitable, Callable
 from datetime import UTC, datetime
@@ -12,7 +13,7 @@ from atlas.pipeline.judge import judge
 from atlas.pipeline.parse import parse_spec
 from atlas.pipeline.render import render_plan, render_run_report
 from atlas.pipeline.research import research
-from atlas.pipeline.verify import verify_app
+from atlas.pipeline.verify import check_requirement_coverage, verify_app
 from atlas.router import ModelRouter
 from atlas.schemas import (
     ApprovalRecord,
@@ -23,7 +24,9 @@ from atlas.schemas import (
     VerificationReport,
     VerificationRound,
 )
-from atlas.telemetry import summarize_usage
+from atlas.telemetry import append_ledger, ledger_entry, summarize_usage
+
+logger = logging.getLogger("atlas.runner")
 
 VerifyFn = Callable[[Path], Awaitable[tuple[str, list[CheckResult]]]]
 
@@ -32,11 +35,33 @@ def _write_manifest(run_dir: Path, manifest: dict[str, Any]) -> None:
     (run_dir / "manifest.json").write_text(json.dumps(manifest, indent=2), encoding="utf-8")
 
 
+def _record_in_ledger(ledger_path: Path | None, manifest: dict[str, Any], summary: Any) -> None:
+    """Append this run to the project ledger. Never hides the run's own result or error."""
+    if ledger_path is None:
+        return
+    try:
+        append_ledger(
+            ledger_path,
+            ledger_entry(
+                run_id=str(manifest["run_id"]),
+                mode=str(manifest.get("mode", "plan")),
+                spec_path=str(manifest.get("spec_path", "")),
+                status=str(manifest.get("status", "unknown")),
+                summary=summary,
+                created_at=manifest.get("created_at"),
+                completed_at=manifest.get("completed_at") or datetime.now(UTC).isoformat(),
+            ),
+        )
+    except OSError as exc:
+        logger.warning("Could not append to token ledger %s: %s", ledger_path, exc)
+
+
 async def run_plan(
     spec_path: Path,
     out_root: Path,
     config_path: Path | None = None,
     router: ModelRouter | None = None,
+    ledger_path: Path | None = None,
 ) -> Path:
     if not spec_path.is_file():
         raise FileNotFoundError(f"Specification file not found: {spec_path}")
@@ -101,6 +126,7 @@ async def run_plan(
         manifest["token_usage"] = summary.model_dump(mode="json", exclude={"calls"})
         manifest["model_calls"] = active_router.call_log
         _write_manifest(out, manifest)
+        _record_in_ledger(ledger_path, manifest, summary)
 
     return out
 
@@ -117,6 +143,7 @@ async def run_build(
     max_fix_rounds: int | None = None,
     verify_fn: VerifyFn | None = None,
     report_out: Path | None = None,
+    ledger_path: Path | None = None,
 ) -> Path:
     """Run spec -> (optional research/plan) -> build -> verify/fix loop with token tracking."""
     if not spec_path.is_file():
@@ -194,13 +221,20 @@ async def run_build(
         )
         rounds: list[VerificationRound] = []
 
+        functional_ids = [r.id for r in spec.requirements if r.kind == "functional"]
+        check_coverage = active_router.require_requirement_tests and bool(functional_ids)
+
         async def _run_verify() -> tuple[str, list[CheckResult]]:
             if verify_fn is not None:
-                return await verify_fn(app_dir)
-            return await verify_app(
-                app_dir,
-                timeout_seconds=active_router.verify_timeout_seconds,
-            )
+                stack, found_checks = await verify_fn(app_dir)
+            else:
+                stack, found_checks = await verify_app(
+                    app_dir,
+                    timeout_seconds=active_router.verify_timeout_seconds,
+                )
+            if check_coverage:
+                found_checks = [*found_checks, check_requirement_coverage(app_dir, functional_ids)]
+            return stack, found_checks
 
         stack_detected, checks = await _run_verify()
         round_num = 1
@@ -283,6 +317,7 @@ async def run_build(
             report_out.parent.mkdir(parents=True, exist_ok=True)
             report_out.write_text(report_md, encoding="utf-8")
         _write_manifest(out, manifest)
+        _record_in_ledger(ledger_path, manifest, token_summary)
 
     return out
 

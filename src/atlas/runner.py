@@ -8,12 +8,18 @@ from datetime import UTC, datetime
 from pathlib import Path
 from typing import Any, Literal
 
-from atlas.pipeline.build import build_app, fix_app, materialize_files
+from atlas.pipeline.build import (
+    build_app,
+    build_app_workspace,
+    fix_app,
+    materialize_files,
+    supervise_app,
+)
 from atlas.pipeline.judge import judge
 from atlas.pipeline.parse import parse_spec
 from atlas.pipeline.render import render_plan, render_run_report
 from atlas.pipeline.research import research
-from atlas.pipeline.verify import check_requirement_coverage, verify_app
+from atlas.pipeline.verify import check_product_contract, check_requirement_coverage, verify_app
 from atlas.router import ModelRouter
 from atlas.schemas import (
     ApprovalRecord,
@@ -23,6 +29,7 @@ from atlas.schemas import (
     Plan,
     VerificationReport,
     VerificationRound,
+    WorkspaceBuildResult,
 )
 from atlas.telemetry import append_ledger, ledger_entry, summarize_usage
 
@@ -50,6 +57,9 @@ def _record_in_ledger(ledger_path: Path | None, manifest: dict[str, Any], summar
                 summary=summary,
                 created_at=manifest.get("created_at"),
                 completed_at=manifest.get("completed_at") or datetime.now(UTC).isoformat(),
+                local_model=manifest.get("local_model"),
+                builder_backend=manifest.get("builder_backend"),
+                fix_rounds=int(manifest.get("fix_rounds") or 0),
             ),
         )
     except OSError as exc:
@@ -144,6 +154,7 @@ async def run_build(
     verify_fn: VerifyFn | None = None,
     report_out: Path | None = None,
     ledger_path: Path | None = None,
+    local_model: str | None = None,
 ) -> Path:
     """Run spec -> (optional research/plan) -> build -> verify/fix loop with token tracking."""
     if not spec_path.is_file():
@@ -172,7 +183,7 @@ async def run_build(
 
     spec: ParsedSpec | None = None
     plan: Plan | None = None
-    generated_app: GeneratedApp | None = None
+    generated_app: GeneratedApp | WorkspaceBuildResult | None = None
     verification: VerificationReport | None = None
     written_files: list[str] = []
     tracked_files: set[str] = set()
@@ -209,10 +220,29 @@ async def run_build(
             (out / "plan.md").write_text(rendered_plan, encoding="utf-8")
             _write_manifest(out, manifest)
 
-        generated_app = await build_app(active_router, spec, plan, raw_spec=raw_spec)
+        builder_backend = active_router.backend_for("builder")
+        builder_type = str(builder_backend.get("type") or "openrouter")
+        manifest["build_mode"] = builder_type
+        manifest["builder_backend"] = builder_type
+        if builder_type in ("local_harness", "harness"):
+            generated_app = await build_app_workspace(
+                active_router,
+                spec,
+                app_dir,
+                plan,
+                raw_spec=raw_spec,
+                clean=clean_app_dir,
+                local_model_override=local_model,
+            )
+            written_files = list(generated_app.files_snapshot)
+            if builder_type == "local_harness":
+                manifest["local_model"] = generated_app.model
+        else:
+            generated_app = await build_app(active_router, spec, plan, raw_spec=raw_spec)
+            written_files = materialize_files(app_dir, generated_app.files, clean=clean_app_dir)
+
         manifest["stages"]["build"] = "completed"
         (out / "build.json").write_text(generated_app.model_dump_json(indent=2), encoding="utf-8")
-        written_files = materialize_files(app_dir, generated_app.files, clean=clean_app_dir)
         tracked_files.update(written_files)
         _write_manifest(out, manifest)
 
@@ -223,6 +253,7 @@ async def run_build(
 
         functional_ids = [r.id for r in spec.requirements if r.kind == "functional"]
         check_coverage = active_router.require_requirement_tests and bool(functional_ids)
+        check_contract = active_router.require_product_contract
 
         async def _run_verify() -> tuple[str, list[CheckResult]]:
             if verify_fn is not None:
@@ -234,6 +265,8 @@ async def run_build(
                 )
             if check_coverage:
                 found_checks = [*found_checks, check_requirement_coverage(app_dir, functional_ids)]
+            if check_contract:
+                found_checks = [*found_checks, check_product_contract(app_dir)]
             return stack, found_checks
 
         stack_detected, checks = await _run_verify()
@@ -247,10 +280,44 @@ async def run_build(
         rounds.append(current_round)
 
         fix_attempt = 0
-        while not current_round.passed and fix_attempt < rounds_limit:
+        previous_diagnoses: list[str] = []
+        supervisor_enabled = bool(active_router.backend_for("supervisor").get("enabled", False))
+        while fix_attempt <= rounds_limit:
+            if current_round.passed and supervisor_enabled:
+                review = await supervise_app(
+                    active_router, spec, app_dir, current_round, plan=plan
+                )
+                (out / "supervisor_review.json").write_text(
+                    review.model_dump_json(indent=2), encoding="utf-8"
+                )
+                if review.approved:
+                    break
+                sup_check = CheckResult(
+                    name="supervisor-review",
+                    command="claude supervisor acceptance review",
+                    passed=False,
+                    exit_code=1,
+                    stdout=review.summary,
+                    stderr="\n".join(review.issues) or review.summary,
+                )
+                current_round.checks = [*current_round.checks, sup_check]
+                current_round.passed = False
+
+            if current_round.passed or fix_attempt >= rounds_limit:
+                break
+
             fix_attempt += 1
-            patch = await fix_app(active_router, spec, app_dir, current_round, plan=plan)
+            patch = await fix_app(
+                active_router,
+                spec,
+                app_dir,
+                current_round,
+                plan=plan,
+                fix_round=fix_attempt,
+                previous_diagnoses=list(previous_diagnoses),
+            )
             current_round.diagnosis = patch.diagnosis
+            previous_diagnoses.append(patch.diagnosis)
             updated = materialize_files(
                 app_dir,
                 patch.files,
@@ -269,6 +336,8 @@ async def run_build(
                 checks=checks,
             )
             rounds.append(current_round)
+
+        manifest["fix_rounds"] = fix_attempt
 
         verification = VerificationReport(
             passed=current_round.passed,
@@ -310,6 +379,7 @@ async def run_build(
             verification=verification,
             token_summary=token_summary,
             written_files=sorted_files,
+            app_dir=str(app_dir),
             error=error_text,
         )
         (out / "report.md").write_text(report_md, encoding="utf-8")

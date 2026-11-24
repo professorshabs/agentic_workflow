@@ -69,35 +69,43 @@ async def test_role_limits_are_sent_to_the_provider(router, monkeypatch):
     assert fake.call_args.kwargs["timeout"] == 10
 
 
-async def test_truncated_output_is_counted_and_skips_to_next_model(router, monkeypatch):
+async def test_truncated_output_is_counted_and_fallbacks_are_not_paid_for(router, monkeypatch):
+    from atlas.router import OutputTruncatedError
+
     calls = []
 
     async def fake(*, model, **kwargs):
         calls.append(model)
-        if model == "m-1":
-            return _response('{"files": [', finish_reason="length", prompt=50, completion=32000)
-        return _response('{"ok": true}', prompt=50, completion=40)
+        return _response('{"files": [', finish_reason="length", prompt=50, completion=32000)
 
     monkeypatch.setattr("atlas.router.litellm.acompletion", AsyncMock(side_effect=fake))
-    used, _ = await router.complete("m-1", "sys", "usr", role="builder")
+    with pytest.raises(OutputTruncatedError, match="max_tokens_by_role.builder"):
+        await router.complete("m-1", "sys", "usr", role="builder")
 
-    assert used == "m-2"
-    assert calls == ["m-1", "m-2"]  # no second identical (and identically cut off) attempt
+    # The fallback m-2 has the same limit and gets the same prompt: in a real run three judge
+    # models were each cut off at 16,000 tokens and all three were billed. Stop at the first.
+    assert calls == ["m-1"]
     summary = summarize_usage(router.call_log)
-    assert summary.total_calls == 2
+    assert summary.total_calls == 1
     assert summary.failed_calls == 1
-    assert summary.completion_tokens == 32040  # the cut-off reply was billed, so it counts
-    assert "max_tokens_by_role.builder" in router.call_log[0]["error"]
+    assert summary.completion_tokens == 32000  # the cut-off reply was billed, so it counts
     assert "unusable response" in render_token_report_md(summary)
 
 
-async def test_all_models_truncated_gives_actionable_error(router, monkeypatch):
-    monkeypatch.setattr(
-        "atlas.router.litellm.acompletion",
-        AsyncMock(return_value=_response("{", finish_reason="length")),
-    )
-    with pytest.raises(RuntimeError, match="max_tokens_by_role.builder"):
-        await router.complete("m-1", "sys", "usr", role="builder")
+async def test_truncation_error_is_not_retried_as_invalid_json(tmp_path, monkeypatch):
+    from atlas.pipeline.util import complete_json_model
+    from atlas.router import OutputTruncatedError
+    from atlas.schemas import ParsedSpec
+
+    cfg = tmp_path / "models.yaml"
+    cfg.write_text(CFG + "  repair_attempts: 2\n", encoding="utf-8")
+    router = ModelRouter(cfg)
+    fake = AsyncMock(return_value=_response('{"summary": "cut', finish_reason="length"))
+    monkeypatch.setattr("atlas.router.litellm.acompletion", fake)
+    with pytest.raises(OutputTruncatedError):
+        await complete_json_model(router, model="m-1", role="parser", system="s", user="u",
+                                  schema=ParsedSpec)
+    assert fake.await_count == 1  # no "repair" call that would be cut off the same way
 
 
 async def test_empty_reply_with_usage_is_still_counted(router, monkeypatch):
@@ -108,6 +116,37 @@ async def test_empty_reply_with_usage_is_still_counted(router, monkeypatch):
     assert summary.total_calls == 2
     assert summary.failed_calls == 1
     assert summary.prompt_tokens == 80
+
+
+async def test_spending_cap_holds_for_parallel_calls(tmp_path, monkeypatch):
+    import asyncio
+
+    from atlas.router import TokenBudgetExceededError
+
+    cfg = tmp_path / "models.yaml"
+    cfg.write_text(
+        "roles:\n  researcher: [m-1]\nrole_fallbacks:\n  researcher: [m-2]\nlimits:\n"
+        "  max_parallel_calls: 1\n  max_tokens: 100\n  timeout_seconds: 10\n"
+        "  attempts_per_model: 1\n  max_total_tokens: 30\n",
+        encoding="utf-8",
+    )
+    router = ModelRouter(cfg)
+
+    async def slow_reply(**kwargs):
+        await asyncio.sleep(0.01)  # like a real network call, so the six calls overlap
+        return _response('{"ok": 1}', prompt=10, completion=5)
+
+    fake = AsyncMock(side_effect=slow_reply)
+    monkeypatch.setattr("atlas.router.litellm.acompletion", fake)
+
+    # Six calls queued at once, like the research fan-out. Each uses 15 tokens; the cap is 30.
+    results = await asyncio.gather(
+        *(router.complete("m-1", "s", "u", role="researcher") for _ in range(6)),
+        return_exceptions=True,
+    )
+    assert fake.await_count == 2  # before: all 6 passed the check while spend was still 0
+    assert sum(isinstance(r, TokenBudgetExceededError) for r in results) == 4
+    assert {c["used_model"] for c in router.call_log} == {"m-1"}  # cap did not try fallbacks
 
 
 @pytest.mark.parametrize(
@@ -441,3 +480,81 @@ async def test_provider_switches_to_fallback_api_key_before_disabling_provider(
     assert used3 == "gemini/g"
     assert seen_calls[-2:] == [("openrouter/a", "backup-key"), ("gemini/g", None)]
     assert down_router.unavailable_reason("openrouter/anything") is not None
+
+
+# ---------------------------------------------------------------- judge per requirement
+
+
+def _judge_spec_and_report():
+    from atlas.schemas import CandidateTool, ParsedSpec, ResearchNote, ResearchReport
+
+    spec = ParsedSpec.model_validate({"summary": "s", "requirements": [
+        {"id": "R001", "title": "a", "description": "a"},
+        {"id": "R002", "title": "b", "description": "b"},
+        {"id": "R003", "title": "c", "description": "c"},
+    ]})
+    notes = [
+        ResearchNote(requirement_id=rid, model="m", candidates=[
+            CandidateTool(name="x", pros=["fast"]), CandidateTool(name="y")])
+        for rid in ("R001", "R002", "R003")
+    ]
+    return spec, ResearchReport(notes=notes)
+
+
+class JudgeRouter(ModelRouter):
+    def __init__(self, reply_for):
+        self.path = Path("fake")
+        self.cfg = {"roles": {"judge": ["m-j"]},
+                    "limits": {"max_parallel_calls": 3, "max_tokens": 100,
+                               "timeout_seconds": 5, "repair_attempts": 1}}
+        self._semaphores = {}
+        self.call_log = []
+        self.reply_for = reply_for
+        self.users: list[str] = []
+
+    async def complete(self, model, system, user, role=None):
+        import asyncio
+
+        self.users.append(user)
+        req_id = next(r for r in ("R001", "R002", "R003") if f"RESEARCH FOR {r}" in user)
+        await asyncio.sleep(0.05 if req_id == "R003" else 0)  # R003 finishes last
+        reply = self.reply_for(req_id)
+        if isinstance(reply, Exception):
+            raise reply
+        self.call_log.append({"role": role, "used_model": model, "prompt_tokens": 10,
+                              "completion_tokens": 10})
+        return model, reply
+
+
+def _decision(req_id_as_written):
+    return json.dumps({"decisions": [{
+        "requirement_id": req_id_as_written,
+        "options": [{"name": "x"}, {"name": "y"}], "pick": "x", "rationale": "fits"}]})
+
+
+async def test_judge_fixes_a_mistyped_requirement_id_without_a_repair_call():
+    from atlas.pipeline.judge import judge
+
+    spec, report = _judge_spec_and_report()
+    written = {"R001": "r001", "R002": "R2", "R003": "R003"}
+    router = JudgeRouter(lambda rid: _decision(written[rid]))
+    plan = await judge(router, spec, report)
+    assert [d.requirement_id for d in plan.decisions] == ["R001", "R002", "R003"]
+    assert len(router.users) == 3  # no repair calls
+    assert '"pros":["fast"]' in router.users[0]  # compact JSON: indentation is billed
+    assert "\n  " not in router.users[0]
+
+
+async def test_judge_records_every_call_before_reporting_a_failure():
+    from atlas.pipeline.judge import judge
+
+    spec, report = _judge_spec_and_report()
+
+    def reply(rid):
+        return RuntimeError("provider down") if rid == "R001" else _decision(rid)
+
+    router = JudgeRouter(reply)
+    with pytest.raises(RuntimeError, match=r"Judge failed for 1 of 3 requirement\(s\): R001"):
+        await judge(router, spec, report)
+    # R003 was still running when R001 failed; its tokens must still be in the log.
+    assert len(router.call_log) == 2

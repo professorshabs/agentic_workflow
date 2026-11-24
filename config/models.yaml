@@ -4,14 +4,10 @@
 roles:
   parser: [openrouter/google/gemini-4-hydrogen]
   researcher:
-    - openrouter/anthropic/claude-opus-5.5
     - openrouter/google/gemini-4-neon
-    - openrouter/openai/gpt-6.2-sol
-  judge: [openrouter/anthropic/claude-opus-5]
+  judge: [openrouter/anthropic/claude-opus-5.5]
   # Default builder uses OpenRouter (OPENROUTER_API_KEY).
   # Alternatives for lower-cost or local builds:
-  #   - Gemma 4 via OpenRouter: [openrouter/google/gemma-4-31b-it] or [openrouter/google/gemma-4-26b-a4b-it]
-  #   - Gemma 4 via Gemini API: [gemini/gemma-4-31b-it]
   #   - Local Gemma 4 via Ollama (local CLI only; set OLLAMA_API_BASE): [ollama_chat/gemma4:26b]
   builder: [openrouter/google/gemini-4-hydrogen]
   fixer: [openrouter/anthropic/claude-sonnet-5.5]
@@ -21,7 +17,7 @@ roles:
 role_fallbacks:
   parser: [gemini/gemini-4-hydrogen, gemini/gemini-3.8-flash]
   researcher: [gemini/gemini-4-neon, gemini/gemini-4-hydrogen]
-  judge: [openrouter/anthropic/claude-opus-5.5, gemini/gemini-4-neon]
+  judge: [openrouter/anthropic/claude-opus-5, gemini/gemini-4-neon]
   builder: [gemini/gemini-4-hydrogen, gemini/gemma-4-31b-it]
   fixer: [openrouter/google/gemini-4-hydrogen, gemini/gemini-4-hydrogen]
 
@@ -51,7 +47,7 @@ limits:
   verify_timeout_seconds: 180
   # Optional hard caps to prevent runaway spend (null = unlimited):
   max_total_tokens: null
-  max_cost_usd: null
+  max_cost_usd: 2.0  # Per-run USD safety cap; set to null for unlimited
 
 verification:
   # Fail verification (and send it to the fixer) when a functional requirement from the

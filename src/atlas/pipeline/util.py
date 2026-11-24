@@ -79,7 +79,18 @@ async def complete_json_model(
     last_err: Exception | None = None
 
     for attempt in range(max_repairs + 1):
-        used_model, raw_output = await router.complete(model, system, current_user, role=role)
+        backend_fn = getattr(router, "backend_for", None)
+        complete_structured = getattr(router, "complete_structured", None)
+        if (
+            callable(backend_fn)
+            and backend_fn(role).get("type") == "harness"
+            and callable(complete_structured)
+        ):
+            used_model, raw_output = await complete_structured(
+                model, system, current_user, role=role, json_schema=schema.model_json_schema()
+            )
+        else:
+            used_model, raw_output = await router.complete(model, system, current_user, role=role)
         try:
             data = extract_json_object(raw_output)
             if postprocess is not None:

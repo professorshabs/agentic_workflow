@@ -70,15 +70,18 @@ def extract_usage_metrics(response: Any) -> dict[str, Any]:
     reasoning_tokens = _as_int(reasoning_raw, 0)
 
     cost_usd: float | None = None
+    cost_source = "unavailable"
     direct_cost = _as_float(_get_field(usage, "cost"))
     if direct_cost is not None and direct_cost >= 0:
         cost_usd = round(direct_cost, 6)
+        cost_source = "reported"
     else:
         try:
             computed = litellm.completion_cost(completion_response=response)
             parsed_cost = _as_float(computed)
             if parsed_cost is not None:
                 cost_usd = round(parsed_cost, 6)
+                cost_source = "estimated"
         except Exception:
             cost_usd = None
 
@@ -89,8 +92,13 @@ def extract_usage_metrics(response: Any) -> dict[str, Any]:
         "reasoning_tokens": reasoning_tokens,
         "total_tokens": total_tokens,
         "cost_usd": cost_usd,
+        "cost_source": cost_source,
         "usage_reported": usage_reported,
     }
+
+
+_VALID_COST_SOURCES = {"reported", "estimated", "subscription", "local_free", "unavailable"}
+_VALID_AUTH_MODES = {"subscription", "oauth_token", "api_key", "cached_login", "local", "unknown"}
 
 
 def _normalize_call(raw: dict[str, Any]) -> ModelCallRecord:
@@ -110,10 +118,22 @@ def _normalize_call(raw: dict[str, Any]) -> ModelCallRecord:
     if cost_usd is not None:
         cost_usd = round(cost_usd, 6)
 
+    raw_cost_source = str(raw.get("cost_source") or "").strip().lower()
+    if raw_cost_source in _VALID_COST_SOURCES:
+        cost_source = raw_cost_source
+    else:
+        cost_source = "reported" if cost_usd is not None else "unavailable"
+
+    raw_auth_mode = str(raw.get("auth_mode") or "").strip().lower()
+    auth_mode = raw_auth_mode if raw_auth_mode in _VALID_AUTH_MODES else None
+
     return ModelCallRecord(
         role=str(raw.get("role") or "unknown"),
         requested_model=str(raw.get("requested_model") or ""),
         used_model=str(raw.get("used_model") or raw.get("requested_model") or "unknown"),
+        harness=str(raw["harness"]) if raw.get("harness") else None,
+        harness_version=str(raw["harness_version"]) if raw.get("harness_version") else None,
+        auth_mode=auth_mode,  # type: ignore[arg-type]
         attempts=_as_int(raw.get("attempts"), 1),
         elapsed_ms=round(float(raw.get("elapsed_ms") or 0.0), 1),
         prompt_tokens=prompt_tokens,
@@ -122,6 +142,7 @@ def _normalize_call(raw: dict[str, Any]) -> ModelCallRecord:
         reasoning_tokens=_as_int(raw.get("reasoning_tokens"), 0),
         total_tokens=total_tokens,
         cost_usd=cost_usd,
+        cost_source=cost_source,  # type: ignore[arg-type]
         usage_reported=usage_reported,
         timestamp=raw.get("timestamp"),
         error=str(raw["error"]) if raw.get("error") else None,
@@ -168,6 +189,7 @@ def summarize_usage(call_log: list[dict[str, Any]]) -> TokenUsageSummary:
         cost_usd=round(sum(costs), 6) if costs else None,
         elapsed_ms=round(sum(r.elapsed_ms for r in records), 1),
         unreported_usage_calls=sum(1 for r in records if not r.usage_reported),
+        unpriced_calls=sum(1 for r in records if r.cost_usd is None),
         failed_calls=sum(1 for r in records if r.error),
         by_stage=_aggregate_buckets(records, lambda r: r.role),
         by_model=_aggregate_buckets(records, lambda r: r.used_model),
@@ -240,6 +262,13 @@ def render_token_report_md(summary: TokenUsageSummary) -> str:
             "token usage metadata.",
         ])
 
+    if summary.unpriced_calls > 0:
+        lines.extend([
+            "",
+            f"> Note: {summary.unpriced_calls} call(s) had unavailable or subscription-billed "
+            "USD cost, so reported USD totals are partial.",
+        ])
+
     return "\n".join(lines)
 
 
@@ -266,6 +295,9 @@ def ledger_entry(
     summary: TokenUsageSummary,
     created_at: str | None = None,
     completed_at: str | None = None,
+    local_model: str | None = None,
+    builder_backend: str | None = None,
+    fix_rounds: int = 0,
 ) -> dict[str, Any]:
     """Compact, append-only record of one run's token use."""
     return {
@@ -275,6 +307,9 @@ def ledger_entry(
         "status": status,
         "created_at": created_at,
         "completed_at": completed_at,
+        "local_model": local_model,
+        "builder_backend": builder_backend,
+        "fix_rounds": fix_rounds,
         "runner": "github-actions" if os.environ.get("GITHUB_ACTIONS") == "true" else "local",
         "git_sha": os.environ.get("GITHUB_SHA", ""),
         "calls": summary.total_calls,
@@ -285,6 +320,7 @@ def ledger_entry(
         "total_tokens": summary.total_tokens,
         "cost_usd": summary.cost_usd,
         "unreported_usage_calls": summary.unreported_usage_calls,
+        "unpriced_calls": summary.unpriced_calls,
         "failed_calls": summary.failed_calls,
         "by_stage": _bucket_map(summary.by_stage),
         "by_model": _bucket_map(summary.by_model),

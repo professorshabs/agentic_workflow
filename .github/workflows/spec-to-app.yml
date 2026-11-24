@@ -19,7 +19,7 @@ on:
         default: true
         type: boolean
       clean_app_dir:
-        description: "Clean app/ before writing newly generated files"
+        description: "Clean app/<spec-name>/ before writing newly generated files"
         required: false
         default: true
         type: boolean
@@ -28,10 +28,16 @@ on:
         required: false
         default: "3"
         type: string
+      publish_docker:
+        description: "Build and push Docker image to GHCR when verification passes"
+        required: false
+        default: true
+        type: boolean
 
 permissions:
   contents: write
   pull-requests: write
+  packages: write
 
 concurrency:
   group: spec-to-app-${{ github.ref }}
@@ -42,6 +48,9 @@ jobs:
     runs-on: ubuntu-latest
     outputs:
       pr_branch: ${{ steps.pr.outputs.branch }}
+      app_slug: ${{ steps.spec.outputs.app_slug }}
+      artifact_name: ${{ steps.product.outputs.name }}
+      verified: ${{ steps.build.outputs.verified }}
     steps:
       - uses: actions/checkout@v4
         with:
@@ -107,6 +116,14 @@ jobs:
           print(f"Resolved spec: {value}")
           PY
 
+          APP_DIR=$(atlas app-dir "$SPEC_PATH")
+          APP_SLUG=$(basename "$APP_DIR")
+          {
+            echo "app_dir=$APP_DIR"
+            echo "app_slug=$APP_SLUG"
+          } >> "$GITHUB_OUTPUT"
+          echo "Target product dir: $APP_DIR"
+
       - name: Build, test, and verify application
         id: build
         if: steps.spec.outputs.path != ''
@@ -118,11 +135,12 @@ jobs:
           GEMINI_API_KEY: ${{ secrets.GEMINI_API_KEY }}
           EVENT_NAME: ${{ github.event_name }}
           SPEC_PATH: ${{ steps.spec.outputs.path }}
+          APP_DIR: ${{ steps.spec.outputs.app_dir }}
           SKIP_RESEARCH: ${{ inputs.skip_research }}
           CLEAN_APP_DIR: ${{ inputs.clean_app_dir }}
           MAX_FIX_ROUNDS: ${{ inputs.max_fix_rounds }}
         run: |
-          FLAGS=(--app-dir app --out runs --report-out run-report.md)
+          FLAGS=(--app-dir "$APP_DIR" --out runs --report-out run-report.md)
           if [ "$EVENT_NAME" = "workflow_dispatch" ]; then
             if [ "$SKIP_RESEARCH" = "true" ]; then
               FLAGS+=(--skip-research)
@@ -152,10 +170,34 @@ jobs:
           EXIT_CODE=$?
           set -e
 
-          echo "exit_code=$EXIT_CODE" >> "$GITHUB_OUTPUT"
+          VERIFIED="false"
+          if [ "$EXIT_CODE" -eq 0 ]; then
+            VERIFIED="true"
+          fi
+          {
+            echo "exit_code=$EXIT_CODE"
+            echo "verified=$VERIFIED"
+          } >> "$GITHUB_OUTPUT"
           if [ -f run-report.md ]; then
             cat run-report.md >> "$GITHUB_STEP_SUMMARY"
           fi
+
+      - name: Prepare product artifact name
+        id: product
+        if: always() && steps.spec.outputs.app_slug != ''
+        env:
+          APP_SLUG: ${{ steps.spec.outputs.app_slug }}
+        run: echo "name=atlas-product-${APP_SLUG}" >> "$GITHUB_OUTPUT"
+
+      - name: Upload built product artifact
+        if: always() && steps.spec.outputs.app_dir != ''
+        uses: actions/upload-artifact@v4
+        with:
+          name: ${{ steps.product.outputs.name }}
+          path: |
+            ${{ steps.spec.outputs.app_dir }}/
+            run-report.md
+          if-no-files-found: ignore
 
       - name: Upload run artifacts (manifest, tokens.json, report.md)
         if: always()
@@ -168,7 +210,7 @@ jobs:
             usage/
           if-no-files-found: ignore
 
-      - name: Open Pull Request with generated app and token report
+      - name: Open Pull Request with usage ledger and token report
         id: pr
         if: always() && steps.spec.outputs.path != ''
         env:
@@ -177,19 +219,18 @@ jobs:
           RUN_ID: ${{ github.run_id }}
           BUILD_EXIT_CODE: ${{ steps.build.outputs.exit_code }}
         run: |
-          if [ -z "$(git status --porcelain app/)" ]; then
-            echo "No changes in app/ to open a PR for."
+          if [ -z "$(git status --porcelain usage/)" ]; then
+            echo "No changes in usage/ to open a PR for."
             exit 0
           fi
 
           git config user.name "atlas-bot"
           git config user.email "atlas-bot@users.noreply.github.com"
 
-          BRANCH="atlas/build-${RUN_ID}"
+          BRANCH="atlas/usage-${RUN_ID}"
           git checkout -b "$BRANCH"
-          # usage/ledger.jsonl keeps a running total of every run's tokens in the repository.
-          git add app/
-          if [ -d usage ]; then git add usage/; fi
+          # Built products under app/ are git-ignored; only usage/ledger.jsonl is tracked in Git.
+          git add usage/
 
           TOTAL_TOKENS=$(python - <<'PY'
           import json
@@ -206,7 +247,7 @@ jobs:
           PY
           )
 
-          git commit -m "feat(app): generate from ${SPEC_PATH} (tokens: ${TOTAL_TOKENS})"
+          git commit -m "chore(usage): record ${SPEC_PATH} build (tokens: ${TOTAL_TOKENS})"
           git push -u origin "$BRANCH"
           echo "branch=$BRANCH" >> "$GITHUB_OUTPUT"
 
@@ -225,7 +266,7 @@ jobs:
           gh pr create \
             --base main \
             --head "$BRANCH" \
-            --title "feat(app): build from ${SPEC_PATH} [${STATUS_LABEL}]" \
+            --title "chore(usage): ${SPEC_PATH} build [${STATUS_LABEL}]" \
             --body-file "$BODY_FILE" \
             "${PR_FLAGS[@]}"
 
@@ -234,8 +275,17 @@ jobs:
         env:
           BUILD_EXIT_CODE: ${{ steps.build.outputs.exit_code }}
         run: |
-          echo "::error::atlas build exited with code ${BUILD_EXIT_CODE}. See the draft PR and the run artifacts."
+          echo "::error::atlas build exited with code ${BUILD_EXIT_CODE}. See the product artifact and run artifacts."
           exit 1
+
+  cd:
+    needs: build-and-verify
+    if: needs.build-and-verify.outputs.verified == 'true' && (github.event_name != 'workflow_dispatch' || inputs.publish_docker)
+    uses: ./.github/workflows/cd.yml
+    with:
+      app_slug: ${{ needs.build-and-verify.outputs.app_slug }}
+      artifact_name: ${{ needs.build-and-verify.outputs.artifact_name }}
+      image_tag: latest
 
   # A PR opened with the built-in GITHUB_TOKEN does not start other workflows, so ci.yml would
   # never run on the generated PR. Run it here against the pushed branch instead.

@@ -184,6 +184,15 @@ class ApprovalRecord(StrictModel):
     notes: str | None = None
 
 
+class Review(StrictModel):
+    """Read-only Supervisor acceptance review across verification and requirements."""
+
+    approved: bool
+    summary: str = Field(min_length=1)
+    issues: list[str] = Field(default_factory=list)
+    requirement_notes: dict[str, str] = Field(default_factory=dict)
+
+
 class GeneratedFile(StrictModel):
     model_config = ConfigDict(extra="forbid", str_strip_whitespace=False)
 
@@ -238,6 +247,28 @@ class PatchResult(StrictModel):
         return self
 
 
+class WorkspaceBuildResult(StrictModel):
+    """Build contract for agentic workspace harnesses that edit files directly on disk."""
+
+    summary: str = Field(min_length=1)
+    harness: str = Field(min_length=1)
+    harness_version: str | None = None
+    model: str = Field(min_length=1)
+    app_dir: str = Field(min_length=1)
+    stack: Literal["python", "node", "mixed", "other"] = "other"
+    created_files: list[str] = Field(default_factory=list)
+    modified_files: list[str] = Field(default_factory=list)
+    deleted_files: list[str] = Field(default_factory=list)
+    files_snapshot: list[str] = Field(default_factory=list)
+    exit_code: int = 0
+    run_instructions: str = ""
+
+    @field_validator("created_files", "modified_files", "deleted_files", "files_snapshot")
+    @classmethod
+    def validate_relative_paths(cls, values: list[str]) -> list[str]:
+        return [_validate_relative_app_path(v) for v in values]
+
+
 class CheckResult(StrictModel):
     name: str = Field(min_length=1)
     command: str = Field(min_length=1)
@@ -263,10 +294,17 @@ class VerificationReport(StrictModel):
     final_checks: list[CheckResult] = Field(default_factory=list)
 
 
+CostSource = Literal["reported", "estimated", "subscription", "local_free", "unavailable"]
+AuthMode = Literal["subscription", "oauth_token", "api_key", "cached_login", "local", "unknown"]
+
+
 class ModelCallRecord(BaseModel):
     role: str = "unknown"
     requested_model: str = ""
     used_model: str = ""
+    harness: str | None = None
+    harness_version: str | None = None
+    auth_mode: AuthMode | None = None
     attempts: int = 1
     elapsed_ms: float = 0.0
     prompt_tokens: int = 0
@@ -275,6 +313,7 @@ class ModelCallRecord(BaseModel):
     reasoning_tokens: int = 0
     total_tokens: int = 0
     cost_usd: float | None = None
+    cost_source: CostSource = "unavailable"
     usage_reported: bool = False
     timestamp: str | None = None
     # Set when the provider returned a response Atlas could not use (empty, or cut off at
@@ -304,6 +343,7 @@ class TokenUsageSummary(StrictModel):
     cost_usd: float | None = None
     elapsed_ms: float = 0.0
     unreported_usage_calls: int = 0
+    unpriced_calls: int = 0
     failed_calls: int = 0
     by_stage: list[UsageBucket] = Field(default_factory=list)
     by_model: list[UsageBucket] = Field(default_factory=list)

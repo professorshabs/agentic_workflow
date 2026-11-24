@@ -1,13 +1,16 @@
 name: CD (Docker to GHCR)
 
 on:
-  push:
-    branches: [main]
-    paths:
-      - "app/**"
-      - "!app/.gitkeep"
-  workflow_dispatch:
+  workflow_call:
     inputs:
+      app_slug:
+        description: "Product folder slug (e.g. example-app)"
+        required: true
+        type: string
+      artifact_name:
+        description: "Workflow artifact name containing the verified product"
+        required: true
+        type: string
       image_tag:
         description: "Docker image tag (in addition to git short SHA)"
         required: false
@@ -15,7 +18,7 @@ on:
         type: string
 
 concurrency:
-  group: cd-ghcr-${{ github.ref }}
+  group: cd-ghcr-${{ inputs.app_slug }}-${{ github.ref }}
   cancel-in-progress: false
 
 permissions:
@@ -23,27 +26,27 @@ permissions:
   packages: write
 
 jobs:
-  verify:
-    uses: ./.github/workflows/ci.yml
-
   publish-docker:
-    needs: verify
     runs-on: ubuntu-latest
     environment: production
     steps:
-      - uses: actions/checkout@v4
+      - name: Download verified product artifact
+        uses: actions/download-artifact@v4
+        with:
+          name: ${{ inputs.artifact_name }}
+          path: product
 
-      - name: Detect app and prepare Dockerfile
+      - name: Detect product and prepare Dockerfile
         id: detect
         env:
+          APP_SLUG: ${{ inputs.app_slug }}
           IMAGE_TAG_INPUT: ${{ inputs.image_tag }}
           REPO_NAME: ${{ github.repository }}
           COMMIT_SHA: ${{ github.sha }}
         run: |
-          if [ ! -d app ] || ! find app -mindepth 1 ! -name '.gitkeep' | grep -q .; then
-            echo "has_app=false" >> "$GITHUB_OUTPUT"
-            echo "No generated application files in app/; skipping Docker publish."
-            exit 0
+          if [[ ! "$APP_SLUG" =~ ^[a-z0-9._-]{1,64}$ ]]; then
+            echo "Invalid app_slug: must match ^[a-z0-9._-]{1,64}$" >&2
+            exit 2
           fi
 
           TAG="${IMAGE_TAG_INPUT:-latest}"
@@ -52,12 +55,25 @@ jobs:
             exit 2
           fi
 
-          IMAGE="ghcr.io/$(echo "$REPO_NAME" | tr '[:upper:]' '[:lower:]')"
+          if [ -d "product/app/${APP_SLUG}" ]; then
+            PRODUCT_DIR="product/app/${APP_SLUG}"
+          elif [ -d "product/${APP_SLUG}" ]; then
+            PRODUCT_DIR="product/${APP_SLUG}"
+          else
+            PRODUCT_DIR="product"
+          fi
+
+          if [ ! -d "$PRODUCT_DIR" ] || ! find "$PRODUCT_DIR" -mindepth 1 ! -name 'run-report.md' | grep -q .; then
+            echo "No built product files found in artifact." >&2
+            exit 1
+          fi
+
+          IMAGE="ghcr.io/$(echo "$REPO_NAME" | tr '[:upper:]' '[:lower:]')/${APP_SLUG}"
           SHORT_SHA="${COMMIT_SHA:0:7}"
 
-          if [ -f app/Dockerfile ]; then
-            DOCKERFILE_PATH="app/Dockerfile"
-          elif [ -f app/pyproject.toml ] || [ -f app/requirements.txt ] || find app -maxdepth 3 -name '*.py' | grep -q .; then
+          if [ -f "${PRODUCT_DIR}/Dockerfile" ]; then
+            DOCKERFILE_PATH="${PRODUCT_DIR}/Dockerfile"
+          elif [ -f "${PRODUCT_DIR}/pyproject.toml" ] || [ -f "${PRODUCT_DIR}/requirements.txt" ] || find "$PRODUCT_DIR" -maxdepth 3 -name '*.py' | grep -q .; then
             DOCKERFILE_PATH="/tmp/atlas.Dockerfile"
             cat > "$DOCKERFILE_PATH" <<'EOF'
           FROM python:3.12-slim
@@ -67,7 +83,7 @@ jobs:
               if [ -f pyproject.toml ]; then pip install --no-cache-dir .; fi
           CMD ["python", "--version"]
           EOF
-          elif [ -f app/package.json ]; then
+          elif [ -f "${PRODUCT_DIR}/package.json" ]; then
             DOCKERFILE_PATH="/tmp/atlas.Dockerfile"
             cat > "$DOCKERFILE_PATH" <<'EOF'
           FROM node:20-slim
@@ -77,12 +93,12 @@ jobs:
           CMD ["npm", "start"]
           EOF
           else
-            echo "No app/Dockerfile or supported Python/Node files found to containerize." >&2
+            echo "No Dockerfile or supported Python/Node files found to containerize." >&2
             exit 1
           fi
 
           {
-            echo "has_app=true"
+            echo "product_dir=$PRODUCT_DIR"
             echo "image=$IMAGE"
             echo "tag=$TAG"
             echo "short_sha=$SHORT_SHA"
@@ -90,17 +106,17 @@ jobs:
           } >> "$GITHUB_OUTPUT"
 
       - name: Build and push Docker image to GHCR
-        if: steps.detect.outputs.has_app == 'true'
         env:
           GH_TOKEN: ${{ github.token }}
           GH_ACTOR: ${{ github.actor }}
+          PRODUCT_DIR: ${{ steps.detect.outputs.product_dir }}
           IMAGE: ${{ steps.detect.outputs.image }}
           TAG: ${{ steps.detect.outputs.tag }}
           SHORT_SHA: ${{ steps.detect.outputs.short_sha }}
           DOCKERFILE_PATH: ${{ steps.detect.outputs.dockerfile }}
         run: |
           echo "$GH_TOKEN" | docker login ghcr.io -u "$GH_ACTOR" --password-stdin
-          docker build -f "$DOCKERFILE_PATH" -t "${IMAGE}:${SHORT_SHA}" -t "${IMAGE}:${TAG}" app
+          docker build -f "$DOCKERFILE_PATH" -t "${IMAGE}:${SHORT_SHA}" -t "${IMAGE}:${TAG}" "$PRODUCT_DIR"
           docker push "${IMAGE}:${SHORT_SHA}"
           docker push "${IMAGE}:${TAG}"
 

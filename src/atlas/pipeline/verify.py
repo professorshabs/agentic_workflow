@@ -19,6 +19,7 @@ from typing import Literal
 from atlas.schemas import CheckResult
 
 _IGNORED_DIRS = {
+    ".agents",
     ".git",
     ".github",
     ".venv",
@@ -487,6 +488,69 @@ def check_requirement_coverage(app_dir: Path, requirement_ids: list[str]) -> Che
         duration_ms=round((time.monotonic() - started) * 1000, 1),
         stdout=stdout,
         stderr=stderr,
+    )
+
+
+_PRODUCT_ATLAS_IMPORT_RE = re.compile(
+    r"^\s*(?:from\s+atlas(?:\.|\b)|import\s+atlas(?:\.|\b))", re.M
+)
+_README_NAMES = {"readme.md", "readme.rst", "readme.txt", "readme"}
+_DEP_FILES = {"pyproject.toml", "requirements.txt", "package.json"}
+
+
+def check_product_contract(app_dir: Path) -> CheckResult:
+    """Verify the built product is self-contained (README, deps, tests, no `import atlas`)."""
+    started = time.monotonic()
+    root = app_dir.resolve() if app_dir.is_dir() else app_dir
+    top_names = {p.name.lower() for p in root.iterdir()} if root.is_dir() else set()
+
+    has_readme = bool(top_names & _README_NAMES)
+    has_deps = bool(top_names & _DEP_FILES)
+
+    has_tests = False
+    atlas_imports: list[str] = []
+    for path in _iter_source_files(app_dir):
+        rel = path.relative_to(root).as_posix()
+        if _TEST_PATH_RE.search(rel):
+            has_tests = True
+        if path.suffix == ".py":
+            try:
+                text = path.read_text(encoding="utf-8", errors="ignore")
+            except OSError:
+                continue
+            if _PRODUCT_ATLAS_IMPORT_RE.search(text):
+                atlas_imports.append(rel)
+
+    issues: list[str] = []
+    if not has_readme:
+        issues.append("Missing README file at product root.")
+    if not has_deps:
+        issues.append(
+            "Missing dependency file (pyproject.toml, requirements.txt, or package.json)."
+        )
+    if not has_tests:
+        issues.append("No test files found inside the product directory.")
+    if atlas_imports:
+        issues.append(
+            "Product must stand on its own without importing Atlas: "
+            + ", ".join(sorted(atlas_imports))
+        )
+
+    passed = not issues
+    stdout_parts = [
+        f"readme={has_readme}",
+        f"deps={has_deps}",
+        f"tests={has_tests}",
+        f"atlas_imports={len(atlas_imports)}",
+    ]
+    return CheckResult(
+        name="product-contract",
+        command="self-contained product check (README, deps, tests, no import atlas)",
+        passed=passed,
+        exit_code=0 if passed else 1,
+        duration_ms=round((time.monotonic() - started) * 1000, 1),
+        stdout=", ".join(stdout_parts),
+        stderr="\n".join(issues),
     )
 
 

@@ -72,7 +72,7 @@ atlas build specs/example-app.md --clean
 ### 3c. Re-run verification alone (0 LLM tokens)
 
 ```bash
-atlas verify --app-dir app
+atlas verify --app-dir app/example-app
 ```
 
 ### 3d. Inspect token usage and estimated cost
@@ -105,16 +105,13 @@ You can also inspect the full Markdown report and raw JSON telemetry for the new
 
 ---
 
-## Step 4 — Clean Local Test Output Before Pushing the Template
+## Step 4 — Clean Local Test Ledger Before Pushing the Template
 
-If Step 3 generated files inside `app/` or recorded test entries in `usage/ledger.jsonl`, reset them before pushing the clean template:
+Built products inside `app/<spec-name>/` and `runs/` are already git-ignored (keeping `.gitkeep`), so they are **never pushed to Git**. If Step 3 recorded local test entries in `usage/ledger.jsonl` that you don't want in the clean template, remove `usage/`:
 
 ```bash
-find app -mindepth 1 ! -name '.gitkeep' -delete
 rm -rf usage
 ```
-
-*(The `runs/` directory is already git-ignored, except `runs/.gitkeep`.)*
 
 ---
 
@@ -165,10 +162,10 @@ In `https://github.com/professorshabs/agentic_workflow/settings`:
 1. Open the **Actions** tab on GitHub → select **Spec to App** → click **Run workflow**.
 2. Leave `spec_path` as `specs/example-app.md` (leave **Skip research & judge** checked for a quick test, or uncheck it to test full multi-model research + judge) and click **Run workflow**.
 3. Once the run completes, confirm all four outcomes:
-   - **Job Summary**: displays the verification table and **Token Usage & Cost** table.
-   - **Artifacts**: `atlas-run-artifacts` zip contains `runs/`, `run-report.md`, and `usage/`.
-   - **Pull Requests**: a new PR was opened with the generated `app/` files, the updated `usage/ledger.jsonl`, and the full report as the PR description (marked **Draft** if verification failed).
-   - **PR CI Check**: `spec-to-app.yml` invokes the reusable **CI** workflow (`.github/workflows/ci.yml`) directly against the PR branch (`quality` + `verify-app` via `atlas verify --app-dir app`) with 0 LLM tokens.
+   - **Job Summary**: displays the verification table, **Token Usage & Cost** table, and published Docker image tags.
+   - **Artifacts**: `atlas-product-<spec-name>` contains the built product (`app/<spec-name>/`) and `run-report.md`; `atlas-run-artifacts` contains `runs/`, `run-report.md`, and `usage/`.
+   - **Pull Requests**: a new PR was opened for `usage/ledger.jsonl` with the full report as the PR description (marked **Draft** if verification failed) — `app/` itself is never committed to Git.
+   - **PR CI Check**: `spec-to-app.yml` invokes the reusable **CI** workflow (`.github/workflows/ci.yml`) directly against the PR branch (`quality` + `verify-app`) with 0 LLM tokens.
 
 ---
 
@@ -186,21 +183,21 @@ git commit -m "feat: add 001-my-app spec"
 git push origin main
 ```
 
-GitHub Actions uses `atlas changed-specs` across the full push to detect `specs/001-my-app.md`, builds and verifies the app in `app/` (including requirement-ID test checks), appends to `usage/ledger.jsonl`, and opens a PR for review.
+GitHub Actions uses `atlas changed-specs` across the full push to detect `specs/001-my-app.md`, builds and verifies the app into `app/001-my-app/` (including requirement-ID test checks), uploads the product artifact, publishes its Docker image, appends to `usage/ledger.jsonl`, and opens a usage PR for review.
 
 ---
 
 ## Step 9 — Continuous Delivery (Docker to GHCR, Free)
 
-Once you merge a generated app PR into `main`, [`.github/workflows/cd.yml`](../.github/workflows/cd.yml) runs automatically whenever `app/**` (excluding `app/.gitkeep`) changes:
+When verification passes, `spec-to-app.yml` automatically calls [`.github/workflows/cd.yml`](../.github/workflows/cd.yml) with the `atlas-product-<spec-name>` artifact:
 
-1. **Re-runs CI verification** (`ci.yml`) before building any container image.
-2. **Builds a Docker image** using `app/Dockerfile` (or a minimal Python `3.12-slim` / Node `20-slim` fallback Dockerfile if the generated app did not emit one).
-3. **Publishes to GitHub Container Registry (`ghcr.io`)** using the built-in `GITHUB_TOKEN` (no extra secrets or paid services required), tagging both `<short-sha>` and `latest` (or a custom `image_tag` via `workflow_dispatch`):
+1. **Downloads the verified product** from the workflow artifact (no built code needs to be committed to Git).
+2. **Builds a Docker image** using `Dockerfile` inside the built product (or a minimal Python `3.12-slim` / Node `20-slim` fallback Dockerfile if the generated app did not emit one).
+3. **Publishes to GitHub Container Registry (`ghcr.io`)** using the built-in `GITHUB_TOKEN` (no extra secrets or paid services required), tagging `ghcr.io/professorshabs/agentic_workflow/<spec-name>:<short-sha>` and `:latest`:
 
 ```bash
-docker pull ghcr.io/professorshabs/agentic_workflow:latest
-docker run --rm ghcr.io/professorshabs/agentic_workflow:latest
+docker pull ghcr.io/professorshabs/agentic_workflow/example-app:latest
+docker run --rm ghcr.io/professorshabs/agentic_workflow/example-app:latest
 ```
 
 4. **Optional manual approval gate**: in GitHub **Settings → Environments → `production`**, enable **Required reviewers** if you want every container release to wait for your approval before pushing to `ghcr.io`.

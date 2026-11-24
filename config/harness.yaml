@@ -1,0 +1,121 @@
+# Hybrid local-first harness profile for macOS builds:
+#   - Parser & Researcher: Google Antigravity CLI (`agy`, fallback to `ModelRouter`)
+#   - Judge (& optional Supervisor): Claude Code (`claude`, strictly read-only)
+#   - Builder: Local model only via Antigravity Python SDK (`LocalOpenAIAgentConfig.lightweight()`)
+#   - Fixer: Alternating OpenRouter models via `ModelRouter`
+#
+# Usage:
+#   atlas doctor --config config/harness.yaml
+#   atlas detect-local --config config/harness.yaml
+#   atlas run specs/example-app.md --config config/harness.yaml
+
+roles:
+  parser: [openrouter/google/gemini-4-hydrogen]
+  researcher: [openrouter/google/gemini-4-neon]
+  judge: [openrouter/anthropic/claude-opus-5.5]
+  builder: [openrouter/google/gemini-4-hydrogen]
+  fixer: [openrouter/anthropic/claude-sonnet-5.5]
+
+role_fallbacks:
+  parser: [gemini/gemini-4-hydrogen]
+  researcher: [gemini/gemini-4-neon]
+  judge: [openrouter/anthropic/claude-opus-5]
+  fixer: [openrouter/openai/gpt-6.2-sol, openrouter/google/gemini-4-hydrogen]
+
+fallbacks: []
+
+backends:
+  parser:
+    type: harness
+    provider: antigravity
+    model: gemini-4-hydrogen-high
+    timeout_seconds: 180
+    fallback: router
+
+  researcher:
+    type: harness
+    provider: antigravity
+    model: gemini-4-neon-high
+    timeout_seconds: 300
+    max_parallel: 3
+    fallback: router
+
+  judge:
+    type: harness
+    provider: claude_code
+    model: opus
+    read_only: true
+    auth: subscription
+    max_budget_usd: 1.50
+    timeout_seconds: 300
+
+  supervisor:
+    enabled: false
+    type: harness
+    provider: claude_code
+    model: opus
+    tools: [Read, Grep, Glob]
+    auth: subscription
+    max_budget_usd: 1.50
+    timeout_seconds: 300
+
+  builder:
+    type: local_harness
+    local_harness: antigravity_sdk
+    local_providers:
+      ollama: http://localhost:11434/v1
+      lm_studio: http://localhost:1234/v1
+    local_model: gpt-oss:20b
+    preferred: [gpt-oss:20b, gemma4:26b]
+    require_tools: true
+    min_context_tokens: 64000
+    memory_budget_fraction: 0.70
+    require_tool_smoke_check: true
+    timeout_seconds: 1800
+    sandbox: true
+
+  fixer:
+    type: openrouter
+    rotate:
+      - openrouter/anthropic/claude-sonnet-5.5
+      - openrouter/openai/gpt-6.2-sol
+
+skills:
+  sources:
+    - ~/Documents/skills
+    - .agents/skills
+  discovery_mode: progressive
+  allowlist:
+    - developing-fullstack-apps
+    - writing-clean-code
+    - writing-ee-blogin-posts
+  by_role:
+    builder: [developing-fullstack-apps, writing-clean-code]
+    fixer: [writing-clean-code]
+
+limits:
+  max_parallel_calls: 6
+  max_tokens: 6000
+  max_tokens_by_role:
+    researcher: 12000
+    judge: 16000
+    fixer: 16000
+  timeout_seconds: 90
+  timeout_seconds_by_role:
+    researcher: 180
+    judge: 300
+    builder: 1800
+    fixer: 300
+  attempts_per_model: 2
+  repair_attempts: 1
+  max_fix_rounds: 3
+  verify_timeout_seconds: 180
+  max_total_tokens: null
+  max_cost_usd: 2.0
+
+limits_extra:
+  max_total_tokens_per_run: null
+
+verification:
+  require_requirement_tests: true
+  require_product_contract: true

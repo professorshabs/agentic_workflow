@@ -174,7 +174,19 @@ def test_generated_pr_gets_ci_and_status_step_is_safe():
     assert ci_job["uses"] == "./.github/workflows/ci.yml"
     assert ci_job["needs"] == "build-and-verify"
     assert ci_job["with"]["ref"] == "${{ needs.build-and-verify.outputs.pr_branch }}"
-    assert "branch=" in _step("pr")["run"]
+
+    cd_job = wf["jobs"]["cd"]
+    assert cd_job["uses"] == "./.github/workflows/cd.yml"
+    assert cd_job["needs"] == "build-and-verify"
+    assert cd_job["with"]["app_slug"] == "${{ needs.build-and-verify.outputs.app_slug }}"
+    assert cd_job["with"]["artifact_name"] == "${{ needs.build-and-verify.outputs.artifact_name }}"
+
+    pr_run = _step("pr")["run"]
+    assert "branch=" in pr_run
+    assert "git add app/" not in pr_run
+    assert "git add usage/" in pr_run
+    assert "atlas app-dir" in _step("spec")["run"]
+    assert "atlas-product-" in _step("product")["run"]
 
     ci = yaml.safe_load((WORKFLOW_DIR / "ci.yml").read_text(encoding="utf-8"))
     triggers = ci.get("on") or ci.get(True)  # PyYAML reads the key `on` as True
@@ -189,17 +201,13 @@ def test_generated_pr_gets_ci_and_status_step_is_safe():
 def test_cd_workflow_structure_and_guards():
     cd = yaml.safe_load((WORKFLOW_DIR / "cd.yml").read_text(encoding="utf-8"))
     triggers = cd.get("on") or cd.get(True)
-    assert triggers["push"]["branches"] == ["main"]
-    assert triggers["push"]["paths"] == ["app/**", "!app/.gitkeep"]
-    assert "workflow_dispatch" in triggers
+    call_inputs = triggers["workflow_call"]["inputs"]
+    assert {"app_slug", "artifact_name", "image_tag"} <= set(call_inputs)
     assert cd["permissions"]["packages"] == "write"
 
-    verify_job = cd["jobs"]["verify"]
-    assert verify_job["uses"] == "./.github/workflows/ci.yml"
-
     publish = cd["jobs"]["publish-docker"]
-    assert publish["needs"] == "verify"
     assert publish["environment"] == "production"
+    assert publish["steps"][0]["uses"] == "actions/download-artifact@v4"
     for step in publish["steps"]:
         run_script = step.get("run")
         if run_script:

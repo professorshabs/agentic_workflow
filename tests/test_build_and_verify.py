@@ -6,8 +6,14 @@ from pathlib import Path
 import pytest
 from pydantic import ValidationError
 
-from atlas.pipeline.build import materialize_files, snapshot_app_files
-from atlas.pipeline.verify import _run_subprocess, _verification_env, detect_stack, verify_app
+from atlas.pipeline.build import default_app_dir, materialize_files, snapshot_app_files, spec_slug
+from atlas.pipeline.verify import (
+    _run_subprocess,
+    _verification_env,
+    check_product_contract,
+    detect_stack,
+    verify_app,
+)
 from atlas.router import ModelRouter
 from atlas.runner import run_build
 from atlas.schemas import GeneratedFile
@@ -694,3 +700,55 @@ def test_cli_error_codes_version_and_tokens_json(tmp_path):
     )
     assert tok_json.returncode == 0
     assert json.loads(tok_json.stdout)["total_tokens"] == 12
+
+
+def test_per_spec_app_dir_and_gitignore_rules(tmp_path):
+    assert spec_slug(Path("specs/example-app.md")) == "example-app"
+    assert spec_slug(Path("specs/My Cool App!.md")) == "my-cool-app"
+    assert default_app_dir(Path("specs/001-api.md")) == Path("app/001-api")
+
+    cli_proc = subprocess.run(
+        [sys.executable, "-m", "atlas.cli", "app-dir", "specs/example-app.md"],
+        capture_output=True,
+        text=True,
+        check=True,
+    )
+    assert cli_proc.stdout.strip() == "app/example-app"
+
+    repo_root = Path(__file__).resolve().parents[1]
+    ignored = subprocess.run(
+        ["git", "check-ignore", "-q", "app/example-app/main.py"],
+        cwd=repo_root,
+        check=False,
+    )
+    assert ignored.returncode == 0
+
+    kept = subprocess.run(
+        ["git", "check-ignore", "-q", "app/.gitkeep"],
+        cwd=repo_root,
+        check=False,
+    )
+    assert kept.returncode != 0
+
+
+def test_check_product_contract_enforces_standalone_app(tmp_path):
+    prod = tmp_path / "product"
+    prod.mkdir()
+    (prod / "main.py").write_text("from atlas.router import ModelRouter\n", encoding="utf-8")
+
+    bad = check_product_contract(prod)
+    assert bad.name == "product-contract"
+    assert bad.passed is False
+    assert "Missing README" in bad.stderr
+    assert "Missing dependency file" in bad.stderr
+    assert "No test files found" in bad.stderr
+    assert "main.py" in bad.stderr
+
+    (prod / "README.md").write_text("# Product\n", encoding="utf-8")
+    (prod / "requirements.txt").write_text("pytest\n", encoding="utf-8")
+    (prod / "main.py").write_text("def hello():\n    return 'hi'\n", encoding="utf-8")
+    (prod / "test_main.py").write_text("# R001\nfrom main import hello\n", encoding="utf-8")
+
+    good = check_product_contract(prod)
+    assert good.passed is True
+    assert good.exit_code == 0

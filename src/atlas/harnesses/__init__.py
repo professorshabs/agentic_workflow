@@ -1,0 +1,158 @@
+"""Agentic harness adapters and pre-flight doctor diagnostics."""
+
+from __future__ import annotations
+
+import os
+from typing import TYPE_CHECKING, Any
+
+from atlas.local_models import DEFAULT_LM_STUDIO_URL, DEFAULT_OLLAMA_URL, resolve_local_model
+from atlas.skills import discover_skills
+
+from .antigravity import AntigravityCLIAdapter, AntigravitySDKAdapter
+from .base import (
+    AuthStatus,
+    HarnessAdapter,
+    HarnessAuthError,
+    HarnessError,
+    HarnessInvocationResult,
+    HarnessUnavailableError,
+)
+from .claude_code import ClaudeCodeAdapter
+
+if TYPE_CHECKING:
+    from atlas.router import ModelRouter
+
+
+def get_harness_adapter(provider: str) -> HarnessAdapter:
+    """Return the configured CLI harness adapter by provider name."""
+    if provider == "antigravity":
+        return AntigravityCLIAdapter()
+    if provider == "claude_code":
+        return ClaudeCodeAdapter()
+    raise ValueError(f"Unsupported harness provider: {provider}")
+
+
+async def run_doctor(
+    router: ModelRouter,
+    *,
+    live: bool = False,
+) -> dict[str, Any]:
+    """Run live pre-flight checks for configured harnesses, local daemons, API keys, and skills."""
+    backends = router.cfg.get("backends") or {}
+    harness_configs: dict[str, str | None] = {}
+    needs_local_sdk = False
+    needs_openrouter = False
+
+    if not backends:
+        needs_openrouter = True
+    else:
+        for role_name, role_cfg in backends.items():
+            if not isinstance(role_cfg, dict):
+                continue
+            if role_name == "supervisor" and not role_cfg.get("enabled", False):
+                continue
+            btype = role_cfg.get("type", "openrouter")
+            if btype == "harness":
+                prov = str(role_cfg.get("provider") or "")
+                if prov:
+                    harness_configs.setdefault(prov, role_cfg.get("auth"))
+            elif btype == "local_harness":
+                needs_local_sdk = True
+            elif btype in ("openrouter", "litellm"):
+                needs_openrouter = True
+            if role_cfg.get("fallback") == "router":
+                needs_openrouter = True
+
+    checks: list[dict[str, Any]] = []
+    all_ok = True
+
+    for provider, auth_cfg in sorted(harness_configs.items()):
+        status = await get_harness_adapter(provider).check_auth(auth=auth_cfg)
+        checks.append(status.model_dump(mode="json"))
+        if not (status.available and status.authenticated):
+            all_ok = False
+
+    if needs_local_sdk:
+        sdk_status = await AntigravitySDKAdapter().check_auth()
+        checks.append(sdk_status.model_dump(mode="json"))
+        if not (sdk_status.available and sdk_status.authenticated):
+            all_ok = False
+
+        builder_cfg = backends.get("builder") or {}
+        providers = builder_cfg.get("local_providers") or {
+            "ollama": DEFAULT_OLLAMA_URL,
+            "lm_studio": DEFAULT_LM_STUDIO_URL,
+        }
+        local_res = await resolve_local_model(
+            explicit_model=builder_cfg.get("local_model"),
+            providers=providers,
+            preferred=list(builder_cfg["preferred"]) if builder_cfg.get("preferred") else None,
+            require_tools=bool(builder_cfg.get("require_tools", True)),
+            min_context_tokens=builder_cfg.get("min_context_tokens"),
+            max_model_size_gb=builder_cfg.get("max_model_size_gb"),
+            memory_budget_fraction=builder_cfg.get("memory_budget_fraction"),
+            require_tool_smoke_check=live,
+        )
+        local_ok = local_res.selected is not None
+        if not local_ok:
+            all_ok = False
+        checks.append(
+            {
+                "provider": "local_model_daemon",
+                "available": bool(local_res.candidates),
+                "authenticated": True,
+                "auth_mode": "local",
+                "ready": local_ok,
+                "selected_model": local_res.selected.name if local_res.selected else None,
+                "candidates_count": len(local_res.candidates),
+                "rejected": local_res.rejected,
+                "details": local_res.reason,
+            }
+        )
+
+    if needs_openrouter:
+        has_key = bool(os.environ.get("OPENROUTER_API_KEY", "").strip())
+        if not has_key:
+            all_ok = False
+        checks.append(
+            {
+                "provider": "openrouter",
+                "available": True,
+                "authenticated": has_key,
+                "auth_mode": "api_key",
+                "details": "OPENROUTER_API_KEY is set."
+                if has_key
+                else "OPENROUTER_API_KEY is missing from environment.",
+                "login_hint": "" if has_key else "Export OPENROUTER_API_KEY in `.env` or shell.",
+            }
+        )
+
+    skills_cfg = router.skills_config()
+    skills_summary: dict[str, Any] = {"configured": bool(skills_cfg), "resolved": []}
+    if skills_cfg:
+        discovered = discover_skills(
+            list(skills_cfg.get("sources") or []),
+            allowlist=list(skills_cfg["allowlist"]) if "allowlist" in skills_cfg else None,
+        )
+        skills_summary["resolved"] = sorted(discovered.keys())
+
+    return {
+        "healthy": all_ok,
+        "checks": checks,
+        "skills": skills_summary,
+    }
+
+
+__all__ = [
+    "AntigravityCLIAdapter",
+    "AntigravitySDKAdapter",
+    "AuthStatus",
+    "ClaudeCodeAdapter",
+    "HarnessAdapter",
+    "HarnessAuthError",
+    "HarnessError",
+    "HarnessInvocationResult",
+    "HarnessUnavailableError",
+    "get_harness_adapter",
+    "run_doctor",
+]

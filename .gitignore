@@ -11,12 +11,7 @@ __pycache__/
 run-report.md
 runs/*
 !runs/.gitkeep
-app/.venv/
-app/node_modules/
-app/__pycache__/
-app/.pytest_cache/
-app/dist/
-app/build/
+app/*
 !app/.gitkeep
 dist/
 build/

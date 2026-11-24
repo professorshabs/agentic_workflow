@@ -37,6 +37,12 @@ _PROVIDER_DOWN_STATUSES = {401, 402}
 _MODEL_DOWN_STATUSES = {403, 404}
 # Client errors that the same request will hit again: do not retry the same model.
 _NO_RETRY_STATUSES = {400, 401, 402, 403, 404, 422}
+_ALLOWED_BACKEND_TYPES = {"openrouter", "litellm", "harness", "local_harness"}
+_ALLOWED_HARNESS_PROVIDERS = {"antigravity", "claude_code"}
+_ALLOWED_LOCAL_HARNESSES = {"antigravity_sdk"}
+_ALLOWED_LOCAL_PROVIDERS = {"ollama", "lm_studio"}
+_ALLOWED_AUTH_MODES = {"subscription", "oauth_token", "api"}
+_ALLOWED_SUPERVISOR_TOOLS = {"Read", "Grep", "Glob"}
 
 
 def _status_code(exc: BaseException) -> int | None:
@@ -88,6 +94,21 @@ class ModelRouter:
         if sem is None:
             sem = asyncio.Semaphore(int(self.cfg["limits"]["max_parallel_calls"]))
             self._semaphores[loop_id] = sem
+        return sem
+
+    def _get_role_semaphore(self, role: str | None) -> asyncio.Semaphore:
+        backend = self.backend_for(role)
+        max_parallel = backend.get("max_parallel")
+        if max_parallel is None:
+            return self._get_semaphore()
+        limit = int(max_parallel)
+        loop_id = id(asyncio.get_running_loop())
+        role_map = self.__dict__.setdefault("_role_semaphores", {})
+        key = (loop_id, role or "")
+        sem = role_map.get(key)
+        if sem is None:
+            sem = asyncio.Semaphore(limit)
+            role_map[key] = sem
         return sem
 
     def _validate_config(self) -> None:
@@ -156,6 +177,131 @@ class ModelRouter:
         if not isinstance(verification, dict):
             raise ValueError("'verification' must be a mapping")
 
+        backends = self.cfg.get("backends")
+        if backends is not None:
+            if not isinstance(backends, dict):
+                raise ValueError("'backends' must be a mapping of role -> config")
+            for role, bcfg in backends.items():
+                if not isinstance(bcfg, dict):
+                    raise ValueError(f"backends['{role}'] must be a mapping")
+                btype = str(bcfg.get("type", "openrouter")).strip()
+                if btype not in _ALLOWED_BACKEND_TYPES:
+                    raise ValueError(
+                        f"backends['{role}'].type '{btype}' must be one of "
+                        f"{sorted(_ALLOWED_BACKEND_TYPES)}"
+                    )
+                if btype == "harness":
+                    prov = bcfg.get("provider")
+                    if prov not in _ALLOWED_HARNESS_PROVIDERS:
+                        raise ValueError(
+                            f"backends['{role}'].provider must be one of "
+                            f"{sorted(_ALLOWED_HARNESS_PROVIDERS)}"
+                        )
+                    if prov == "claude_code" and bcfg.get("read_only") is False:
+                        raise ValueError(
+                            f"backends['{role}']: claude_code backend is strictly read-only"
+                        )
+                    if prov == "claude_code" and bcfg.get("tools") is not None:
+                        tools = bcfg["tools"]
+                        if not isinstance(tools, list) or any(
+                            t not in _ALLOWED_SUPERVISOR_TOOLS for t in tools
+                        ):
+                            raise ValueError(
+                                f"backends['{role}'].tools must be a subset of "
+                                f"{sorted(_ALLOWED_SUPERVISOR_TOOLS)}"
+                            )
+                    auth_val = bcfg.get("auth")
+                    if auth_val is not None and auth_val not in _ALLOWED_AUTH_MODES:
+                        raise ValueError(
+                            f"backends['{role}'].auth must be one of {sorted(_ALLOWED_AUTH_MODES)}"
+                        )
+                    fb_mode = bcfg.get("fallback")
+                    if fb_mode is not None and fb_mode != "router":
+                        raise ValueError(
+                            f"backends['{role}'].fallback must be 'router' or null"
+                        )
+                    if bcfg.get("max_parallel") is not None and int(bcfg["max_parallel"]) < 1:
+                        raise ValueError(f"backends['{role}'].max_parallel must be >= 1")
+                    if (
+                        bcfg.get("max_budget_usd") is not None
+                        and float(bcfg["max_budget_usd"]) <= 0
+                    ):
+                        raise ValueError(f"backends['{role}'].max_budget_usd must be > 0")
+                elif btype == "local_harness":
+                    lh = bcfg.get("local_harness", "antigravity_sdk")
+                    if lh not in _ALLOWED_LOCAL_HARNESSES:
+                        raise ValueError(
+                            f"backends['{role}'].local_harness must be one of "
+                            f"{sorted(_ALLOWED_LOCAL_HARNESSES)}"
+                        )
+                    if bcfg.get("allow_cloud_fallback"):
+                        raise ValueError(
+                            f"backends['{role}'].allow_cloud_fallback is not supported; "
+                            "builder is local-only"
+                        )
+                    lp = bcfg.get("local_providers", ["ollama", "lm_studio"])
+                    if isinstance(lp, dict):
+                        if not lp or any(k not in _ALLOWED_LOCAL_PROVIDERS for k in lp):
+                            raise ValueError(
+                                f"backends['{role}'].local_providers keys must be in "
+                                f"{sorted(_ALLOWED_LOCAL_PROVIDERS)}"
+                            )
+                    elif not isinstance(lp, list) or not lp or any(
+                        p not in _ALLOWED_LOCAL_PROVIDERS for p in lp
+                    ):
+                        raise ValueError(
+                            f"backends['{role}'].local_providers must be a non-empty dict or "
+                            f"list of {sorted(_ALLOWED_LOCAL_PROVIDERS)}"
+                        )
+                elif role == "fixer" and bcfg.get("rotate") is not None:
+                    rot = bcfg["rotate"]
+                    if not isinstance(rot, list) or not rot or not all(
+                        isinstance(m, str) and m.strip() for m in rot
+                    ):
+                        raise ValueError("backends['fixer'].rotate must be a non-empty list")
+
+        limits_extra = self.cfg.get("limits_extra")
+        if limits_extra is not None:
+            if not isinstance(limits_extra, dict):
+                raise ValueError("'limits_extra' must be a mapping")
+            max_run_tok = limits_extra.get("max_total_tokens_per_run")
+            if max_run_tok is not None and (
+                isinstance(max_run_tok, bool) or int(max_run_tok) < 1
+            ):
+                raise ValueError("limits_extra.max_total_tokens_per_run must be >= 1")
+
+        skills = self.cfg.get("skills")
+        if skills is not None:
+            if not isinstance(skills, dict):
+                raise ValueError("'skills' must be a mapping")
+            sources = skills.get("sources", [])
+            if not isinstance(sources, list) or not all(
+                isinstance(s, str) and s.strip() for s in sources
+            ):
+                raise ValueError("skills.sources must be a list of directory strings")
+            allowlist = skills.get("allowlist")
+            if allowlist is not None:
+                if not isinstance(allowlist, list) or not all(
+                    isinstance(a, str) and a.strip() for a in allowlist
+                ):
+                    raise ValueError("skills.allowlist must be a list of skill names")
+            by_role = skills.get("by_role", {})
+            if not isinstance(by_role, dict):
+                raise ValueError("skills.by_role must be a mapping of role -> skill names")
+            allowed_set = set(allowlist) if allowlist is not None else None
+            for role, names in by_role.items():
+                if not isinstance(names, list) or not all(
+                    isinstance(n, str) and n.strip() for n in names
+                ):
+                    raise ValueError(f"skills.by_role['{role}'] must be a list of skill names")
+                if allowed_set is not None:
+                    disallowed = [n for n in names if n not in allowed_set]
+                    if disallowed:
+                        raise ValueError(
+                            f"skills.by_role['{role}'] references non-allowlisted skill(s): "
+                            f"{disallowed}"
+                        )
+
     @property
     def repair_attempts(self) -> int:
         return int(self.cfg["limits"].get("repair_attempts", 1))
@@ -170,6 +316,9 @@ class ModelRouter:
 
     @property
     def max_total_tokens(self) -> int | None:
+        extra = (self.cfg.get("limits_extra") or {}).get("max_total_tokens_per_run")
+        if extra is not None:
+            return int(extra)
         val = self.cfg["limits"].get("max_total_tokens")
         return int(val) if val is not None else None
 
@@ -182,6 +331,11 @@ class ModelRouter:
     def require_requirement_tests(self) -> bool:
         """Fail verification when a functional requirement has no test mentioning its ID."""
         return bool((self.cfg.get("verification") or {}).get("require_requirement_tests", False))
+
+    @property
+    def require_product_contract(self) -> bool:
+        """Fail verification when `app/<spec-name>/` is not self-contained."""
+        return bool((self.cfg.get("verification") or {}).get("require_product_contract", False))
 
     def max_tokens_for(self, role: str | None) -> int:
         """Output token limit for a role: limits.max_tokens_by_role, else limits.max_tokens."""
@@ -268,11 +422,169 @@ class ModelRouter:
         global_fb = self.cfg.get("fallbacks", [])
         return list(dict.fromkeys([model, *role_fb, *global_fb]))
 
+    def backend_for(self, role: str | None) -> dict[str, Any]:
+        """Return backend config for `role`, defaulting safely to OpenRouter/LiteLLM."""
+        backends = self.cfg.get("backends") or {}
+        if role is not None and isinstance(backends.get(role), dict):
+            return dict(backends[role])
+        return {"type": "openrouter"}
+
+    def skills_config(self) -> dict[str, Any]:
+        """Return parsed `skills` configuration mapping, or empty dict when omitted."""
+        skills = self.cfg.get("skills")
+        return dict(skills) if isinstance(skills, dict) else {}
+
+    def record_harness_call(
+        self,
+        *,
+        role: str,
+        requested_model: str,
+        used_model: str,
+        harness: str,
+        harness_version: str | None,
+        elapsed_ms: float,
+        auth_mode: str | None = None,
+        prompt_tokens: int = 0,
+        completion_tokens: int = 0,
+        cached_tokens: int = 0,
+        reasoning_tokens: int = 0,
+        total_tokens: int = 0,
+        cost_usd: float | None = None,
+        cost_source: str = "unavailable",
+        usage_reported: bool = False,
+        error: str | None = None,
+    ) -> None:
+        """Append one harness invocation's honest telemetry into `call_log`."""
+        self.call_log.append(
+            {
+                "role": role,
+                "requested_model": requested_model,
+                "used_model": used_model,
+                "harness": harness,
+                "harness_version": harness_version,
+                **({"auth_mode": auth_mode} if auth_mode else {}),
+                "attempts": 1,
+                "elapsed_ms": round(float(elapsed_ms), 1),
+                "prompt_tokens": int(prompt_tokens),
+                "completion_tokens": int(completion_tokens),
+                "cached_tokens": int(cached_tokens),
+                "reasoning_tokens": int(reasoning_tokens),
+                "total_tokens": int(total_tokens),
+                "cost_usd": cost_usd,
+                "cost_source": cost_source,
+                "usage_reported": usage_reported,
+                "timestamp": datetime.now(UTC).isoformat(),
+                **({"error": error} if error else {}),
+            }
+        )
+
+    async def _complete_with_harness(
+        self,
+        backend: dict[str, Any],
+        model: str,
+        system: str,
+        user: str,
+        *,
+        role: str | None,
+        json_schema: dict[str, Any] | None = None,
+    ) -> tuple[str, str]:
+        from atlas.harnesses import HarnessError, get_harness_adapter
+
+        provider = str(backend["provider"])
+        target_model = str(backend.get("model") or model)
+        timeout = float(backend.get("timeout_seconds") or self.timeout_for(role))
+        sem = self._get_role_semaphore(role)
+        started = time.monotonic()
+        adapter = get_harness_adapter(provider)
+        try:
+            async with sem:
+                self._check_budget()
+                result = await adapter.run_structured(
+                    role=role or "unknown",
+                    model=target_model,
+                    system=system,
+                    user=user,
+                    json_schema=json_schema,
+                    timeout_seconds=timeout,
+                    auth=backend.get("auth"),
+                    max_budget_usd=(
+                        float(backend["max_budget_usd"])
+                        if backend.get("max_budget_usd") is not None
+                        else None
+                    ),
+                    tools=list(backend["tools"]) if backend.get("tools") is not None else None,
+                )
+            self.record_harness_call(
+                role=role or "unknown",
+                requested_model=target_model,
+                used_model=result.used_model,
+                harness=result.harness,
+                harness_version=result.harness_version,
+                auth_mode=result.auth_mode,
+                elapsed_ms=result.elapsed_ms,
+                prompt_tokens=result.prompt_tokens,
+                completion_tokens=result.completion_tokens,
+                cached_tokens=result.cached_tokens,
+                reasoning_tokens=result.reasoning_tokens,
+                total_tokens=result.total_tokens,
+                cost_usd=result.cost_usd,
+                cost_source=result.cost_source,
+                usage_reported=result.usage_reported,
+            )
+            return result.used_model, result.text
+        except TokenBudgetExceededError:
+            raise
+        except Exception as exc:
+            self.record_harness_call(
+                role=role or "unknown",
+                requested_model=target_model,
+                used_model=target_model,
+                harness=provider,
+                harness_version=None,
+                elapsed_ms=round((time.monotonic() - started) * 1000, 1),
+                cost_usd=None,
+                cost_source="unavailable",
+                usage_reported=False,
+                error=f"{type(exc).__name__}: {exc}",
+            )
+            if isinstance(exc, HarnessError) and backend.get("fallback") == "router":
+                logger.warning(
+                    "Harness failed for role '%s' (%s); falling back to LiteLLM ModelRouter.",
+                    role,
+                    exc,
+                )
+                return await self._complete_litellm(model, system, user, role=role)
+            raise
+
+    async def complete_structured(
+        self,
+        model: str,
+        system: str,
+        user: str,
+        *,
+        role: str | None = None,
+        json_schema: dict[str, Any] | None = None,
+    ) -> tuple[str, str]:
+        """Dispatch structured JSON request with optional JSON Schema enforcement for harnesses."""
+        backend = self.backend_for(role)
+        if backend.get("type") == "harness":
+            return await self._complete_with_harness(
+                backend, model, system, user, role=role, json_schema=json_schema
+            )
+        return await self._complete_litellm(model, system, user, role=role)
+
     async def complete(
         self, model: str, system: str, user: str, role: str | None = None
     ) -> tuple[str, str]:
-        """Try the requested model followed by role-specific then global fallbacks."""
-        self._check_budget()
+        """Try the configured backend (harness or LiteLLM model + fallbacks)."""
+        backend = self.backend_for(role)
+        if backend.get("type") == "harness":
+            return await self._complete_with_harness(backend, model, system, user, role=role)
+        return await self._complete_litellm(model, system, user, role=role)
+
+    async def _complete_litellm(
+        self, model: str, system: str, user: str, role: str | None = None
+    ) -> tuple[str, str]:
         last_err: Exception | None = None
         attempts = int(self.cfg["limits"].get("attempts_per_model", 1))
         timeout = self.timeout_for(role)
@@ -314,6 +626,9 @@ class ModelRouter:
                     extra_kwargs["api_key"] = active_key
                 try:
                     async with sem:
+                        # Checked here, not when the call is queued: parallel calls (research,
+                        # judge) all queue at once, before any of them has spent anything.
+                        self._check_budget()
                         response = await asyncio.wait_for(
                             litellm.acompletion(
                                 model=candidate,
@@ -334,7 +649,9 @@ class ModelRouter:
                         raise OutputTruncatedError(
                             f"Model {candidate} stopped at the output limit of {max_tokens} "
                             f"tokens for role '{role}', so its answer is incomplete. Raise "
-                            f"limits.max_tokens_by_role.{role} in the model config."
+                            f"limits.max_tokens_by_role.{role} in the model config, or ask "
+                            "for less output. Fallback models were not tried: they share the "
+                            "same limit and prompt, so each would be cut off and billed too."
                         )
                     content = getattr(choices[0].message, "content", None)
                     if not isinstance(content, str) or not content.strip():
@@ -342,11 +659,11 @@ class ModelRouter:
 
                     record(response, candidate)
                     return candidate, content.strip()
+                except TokenBudgetExceededError:
+                    raise  # a spending cap is not a model failure: do not try fallbacks
                 except OutputTruncatedError as exc:
-                    last_err = exc
                     record(response, candidate, error=str(exc))
-                    logger.warning("%s", exc)
-                    break  # the same prompt would be cut off again; try the next candidate
+                    raise exc from None
                 except Exception as exc:  # model/provider failures are isolated here
                     last_err = exc
                     if response is not None:

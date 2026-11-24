@@ -7,6 +7,7 @@ from atlas.schemas import (
     ResearchFailure,
     TokenUsageSummary,
     VerificationReport,
+    WorkspaceBuildResult,
 )
 from atlas.telemetry import render_token_report_md
 
@@ -140,10 +141,11 @@ def render_run_report(
     spec_path: str,
     status: str,
     spec: ParsedSpec | None,
-    generated_app: GeneratedApp | None,
+    generated_app: GeneratedApp | WorkspaceBuildResult | None,
     verification: VerificationReport | None,
     token_summary: TokenUsageSummary,
     written_files: list[str],
+    app_dir: str | None = None,
     error: str | None = None,
 ) -> str:
     """Render a full Markdown build, verification, and token usage report."""
@@ -159,6 +161,11 @@ def render_run_report(
         "",
         f"- **Run ID:** `{run_id}`",
         f"- **Spec:** `{spec_path}`",
+        *(
+            [f"- **Output dir:** `{app_dir}`"]
+            if app_dir
+            else []
+        ),
         f"- **Status:** `{status}`",
         f"- **Stack detected:** `{stack_label}`",
         f"- **Verification rounds:** {rounds_count}",

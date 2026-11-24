@@ -8,7 +8,14 @@ from atlas.pipeline.parse import parse_spec
 from atlas.pipeline.research import research
 from atlas.router import ModelRouter
 from atlas.runner import record_approval, run_build, run_plan
-from atlas.schemas import CandidateTool, ParsedSpec, Requirement, ResearchNote
+from atlas.schemas import (
+    CandidateTool,
+    ParsedSpec,
+    Requirement,
+    ResearchFailure,
+    ResearchNote,
+    ResearchReport,
+)
 
 
 class FakeRouter(ModelRouter):
@@ -293,3 +300,116 @@ async def test_run_build_with_research_and_judge_end_to_end(tmp_path):
     tokens = json.loads((out_dir / "tokens.json").read_text(encoding="utf-8"))
     assert tokens["total_calls"] == 5
     assert [b["name"] for b in tokens["by_stage"]] == ["parser", "researcher", "judge", "builder"]
+
+
+async def test_judge_evaluates_multiple_requirements_in_parallel_with_scoped_research():
+    spec = ParsedSpec(
+        summary="Three-part app",
+        requirements=[
+            Requirement(id="R001", title="Slug", description="Slugify titles"),
+            Requirement(id="R002", title="Store", description="Persist JSON mappings"),
+            Requirement(id="R003", title="CLI", description="Parse CLI args"),
+        ],
+    )
+    report = ResearchReport(
+        notes=[
+            ResearchNote(
+                requirement_id="R001",
+                model="m-res-1",
+                candidates=[
+                    CandidateTool(name="unicodedata"),
+                    CandidateTool(name="python-slugify"),
+                ],
+            ),
+            ResearchNote(
+                requirement_id="R002",
+                model="m-res-1",
+                candidates=[CandidateTool(name="json"), CandidateTool(name="sqlite3")],
+            ),
+            ResearchNote(
+                requirement_id="R003",
+                model="m-res-1",
+                candidates=[CandidateTool(name="argparse"), CandidateTool(name="click")],
+            ),
+        ],
+        failures=[
+            ResearchFailure(
+                requirement_id="R002",
+                model="m-res-2",
+                error_type="TimeoutError",
+                error_message="timed out",
+            )
+        ],
+    )
+
+    seen_users: list[str] = []
+
+    class RecordingJudgeRouter(ModelRouter):
+        def __init__(self):
+            self.path = "fake"
+            self.cfg = {
+                "roles": {"judge": ["m-judge"]},
+                "limits": {
+                    "max_parallel_calls": 4,
+                    "max_tokens": 1000,
+                    "timeout_seconds": 10,
+                    "repair_attempts": 1,
+                },
+            }
+            self._semaphores = {}
+            self.call_log = []
+
+        async def complete(self, model: str, system: str, user: str, role: str | None = None):
+            seen_users.append(user)
+            if "RESEARCH FOR R001" in user:
+                req_id, a, b, extra_risk, extra_task = (
+                    "R001",
+                    "unicodedata",
+                    "python-slugify",
+                    "Unicode edge case",
+                    "Implement slugify",
+                )
+            elif "RESEARCH FOR R002" in user:
+                req_id, a, b, extra_risk, extra_task = (
+                    "R002",
+                    "json",
+                    "sqlite3",
+                    "Shared risk",
+                    "Implement store",
+                )
+            else:
+                req_id, a, b, extra_risk, extra_task = (
+                    "R003",
+                    "argparse",
+                    "click",
+                    "shared risk",
+                    "Implement CLI",
+                )
+            payload = {
+                "decisions": [
+                    {
+                        "requirement_id": req_id,
+                        "options": [{"name": a}, {"name": b}],
+                        "pick": a,
+                        "rationale": f"Fits {req_id}",
+                    }
+                ],
+                "risks": [extra_risk],
+                "tasks": [extra_task, "Write tests"],
+            }
+            return model, json.dumps(payload)
+
+    plan = await judge(RecordingJudgeRouter(), spec, report)
+    assert len(seen_users) == 3
+    assert [d.requirement_id for d in plan.decisions] == ["R001", "R002", "R003"]
+
+    r1_prompt = next(u for u in seen_users if "RESEARCH FOR R001" in u)
+    r2_prompt = next(u for u in seen_users if "RESEARCH FOR R002" in u)
+    assert "python-slugify" in r1_prompt
+    assert "sqlite3" not in r1_prompt
+    assert "1 failed calls" in r2_prompt
+    assert "0 failed calls" in r1_prompt
+
+    # Case-insensitive deduplication while preserving order
+    assert plan.risks == ["Unicode edge case", "Shared risk"]
+    assert plan.tasks == ["Implement slugify", "Write tests", "Implement store", "Implement CLI"]

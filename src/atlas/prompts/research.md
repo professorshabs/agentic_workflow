@@ -26,7 +26,8 @@ Return ONLY JSON:
   "uncertainties": ["string"]
 }
 
-Prefer official documentation and primary sources. Never fabricate URLs, pricing,
-licensing terms, version numbers, benchmarks or source checks. If browsing or source
-verification is unavailable, explicitly mark the claim as unverified/model knowledge.
-Return 2-3 candidates where possible. Challenge overengineering.
+Keep output concise and dense:
+- Return 2-3 candidates where possible. Challenge overengineering.
+- Keep each list item to 1 short sentence or phrase.
+- Limit to at most 3 pros, 3 cons, and 2 evidence items per candidate, plus at most 3 findings and 3 uncertainties.
+- Prefer official documentation and primary sources. Never fabricate URLs, pricing, licensing terms, version numbers, benchmarks or source checks. If browsing or source verification is unavailable, explicitly mark the claim as unverified/model knowledge.

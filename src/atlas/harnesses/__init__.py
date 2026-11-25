@@ -5,7 +5,12 @@ from __future__ import annotations
 import os
 from typing import TYPE_CHECKING, Any
 
-from atlas.local_models import DEFAULT_LM_STUDIO_URL, DEFAULT_OLLAMA_URL, resolve_local_model
+from atlas.local_models import (
+    DEFAULT_LM_STUDIO_URL,
+    DEFAULT_OLLAMA_URL,
+    local_resolution_kwargs,
+    resolve_local_model,
+)
 from atlas.skills import discover_skills
 
 from .antigravity import AntigravityCLIAdapter, AntigravitySDKAdapter
@@ -52,6 +57,9 @@ async def run_doctor(
                 harness_configs.setdefault(prov, cfg.get("auth"))
         elif btype == "local_harness":
             needs_local_sdk = True
+            for target in cfg.get("offload") or []:
+                if isinstance(target, dict):
+                    _collect_backend_deps({"type": "harness", **target})
         elif btype in ("openrouter", "litellm"):
             needs_openrouter = True
         if cfg.get("fallback") == "router":
@@ -95,12 +103,8 @@ async def run_doctor(
         local_res = await resolve_local_model(
             explicit_model=builder_cfg.get("local_model"),
             providers=providers,
-            preferred=list(builder_cfg["preferred"]) if builder_cfg.get("preferred") else None,
-            require_tools=bool(builder_cfg.get("require_tools", True)),
-            min_context_tokens=builder_cfg.get("min_context_tokens"),
-            max_model_size_gb=builder_cfg.get("max_model_size_gb"),
-            memory_budget_fraction=builder_cfg.get("memory_budget_fraction"),
             require_tool_smoke_check=live,
+            **local_resolution_kwargs(builder_cfg),
         )
         local_ok = local_res.selected is not None
         if not local_ok:

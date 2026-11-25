@@ -191,7 +191,8 @@ async def test_resolve_local_model_filters_tools_context_memory_preferred_and_sm
     monkeypatch.setattr("atlas.local_models.probe_ollama", empty_probe)
     offline_res = await resolve_local_model()
     assert offline_res.selected is None
-    assert "OLLAMA_CONTEXT_LENGTH=64000 ollama serve" in offline_res.reason
+    assert "OLLAMA_CONTEXT_LENGTH=32768 ollama serve" in offline_res.reason
+    assert "lms load google/gemma-4-12b-qat --context-length 32768" in offline_res.reason
 
 
 async def test_resolve_local_model_prefers_lm_studio_gemma4_26b_then_ollama_12b(monkeypatch):

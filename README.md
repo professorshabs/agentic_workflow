@@ -71,12 +71,13 @@ Instead of calling every stage via OpenRouter APIs, [`config/harness.yaml`](conf
 | :--- | :--- | :--- |
 | **`parser`, `researcher`, & `e2e`** | Antigravity CLI (`agy`) | Structured `--json-schema` + `--disable-slash-commands` single-turn calls (`gemini-4-hydrogen-high` / `gemini-4-neon-high`, `600s` timeout & `32K` fallback cap for `e2e`) with automatic fallback to `ModelRouter`. |
 | **`judge`** | Claude Code (`claude`, read-only) | Claude Opus 5.5 evaluates researched options per requirement with zero write tools (`--tools ""`, subscription billing guard). |
-| **`builder`** | Antigravity Python SDK (`antigravity_sdk`) | **Local only** via LM Studio (`google/gemma-4-26b-a4b-qat` / `gemma-4-26b-a4b-it-qat-mlx-4bit`) or Ollama (`gemma4:12b-mlx` / `gemma4:12b`, `>= 32K` context, 78% RAM budget on 24 GB Macs, tool-calling, and live `ping` tool smoke check). |
-| **`fixer`** | OpenRouter via `ModelRouter` | Sequential `PatchResult` repairs alternating between `claude-sonnet-5.5` and `gpt-6.2-sol`, receiving previous diagnoses + `writing-clean-code`. |
+| **`builder`** | Antigravity Python SDK (`antigravity_sdk`) → offload | **Gemma 4 12B on your Mac** via LM Studio (`google/gemma-4-12b-qat`) or Ollama (`gemma4:12b-mlx` / `gemma4:12b`); nothing else is picked (`only_preferred`, `max_parameter_size_b: 14`). Checks tool calling (`ping` smoke test) and the context window the server actually loaded (`>= 48K`). It reads a short `BUILD_BRIEF.md` instead of the full `PLAN.md`. If the 12B can't finish — no model ready, error, `900s` timeout, no file written for `stall_seconds: 300`, or nothing built — the build is **offloaded** to Gemini 4 Hydrogen (`agy` workspace build), then Claude Sonnet 5.5 (OpenRouter, one structured call). The run manifest records `build_offloaded_to`. |
+| **`fixer`** | OpenRouter via `ModelRouter` | Sequential `PatchResult` repairs alternating between `claude-sonnet-5.5` and `gemini-4-hydrogen` (each falls back to the other), receiving previous diagnoses + `writing-clean-code`. |
 | **`supervisor`** | Dual Post-Build Panel (parallel) | Read-only Claude Opus (`claude_code`) + Gemini 4 Neon (`agy`, fallback OpenRouter) inspect the verified app independently and merge issues + an improvement plan back into the Fixer loop. |
 
 ```bash
-ollama serve # Recommended: OLLAMA_CONTEXT_LENGTH=64000 ollama serve
+lms unload --all && lms load google/gemma-4-12b-qat --context-length 49152   # LM Studio
+# or: OLLAMA_CONTEXT_LENGTH=49152 ollama serve   (then: ollama pull gemma4:12b)
 atlas doctor --config config/harness.yaml
 atlas detect-local --config config/harness.yaml
 atlas run specs/example-app.md --config config/harness.yaml
@@ -86,7 +87,7 @@ atlas run specs/example-app.md --config config/harness.yaml
 
 - **Clarifying questions (`clarify.py`):** Research surfaces `clarifying_questions` alongside `spec.open_questions`. In a terminal (`--clarify` or TTY auto), Atlas prompts you cleanly and folds answers into `spec.assumptions` before planning and building; in non-TTY/CI runs, pass `--answers answers.json` (never blocks by default) and review `runs/<run-id>/clarifications.json`.
 - **Authoritative black-box E2E tests (`e2e.py`):** When `verification.require_e2e_tests: true` (default in `config/harness.yaml`) or `--e2e-tests` is set, Atlas generates an external `product_interface` contract and runnable E2E suite (or sets `verifiable: false` with `unverifiable_reason` when offline testing is infeasible).
-- **Workspace-first pre-seeding & lean context:** Before the local Builder starts, Atlas writes `PLAN.md` and the authoritative `tests/` E2E files into `app/<spec-name>/`, symlinks only allowlisted skills (`discovery_mode: progressive`) into `.agents/skills/`, and sends a compact prompt capped at 12K chars so smaller local context windows stay focused. After the Builder exits, Atlas removes temporary skill symlinks, restores the authoritative E2E files, and enforces `spec-coverage`, `product-contract`, and `e2e-product-tests` in [`verify.py`](src/atlas/pipeline/verify.py).
+- **Workspace-first pre-seeding & lean context:** Before the local Builder starts, Atlas writes `PLAN.md`, a short `BUILD_BRIEF.md` (chosen approach per requirement, clarification answers, tasks; about 6K tokens instead of PLAN.md's ~30K) and the authoritative `tests/` E2E files into `app/<spec-name>/`, symlinks only allowlisted skills (`discovery_mode: progressive`) into `.agents/skills/`, and sends a compact prompt capped at 12K chars so smaller local context windows stay focused. After the Builder exits, Atlas removes temporary skill symlinks, restores the authoritative E2E files, and enforces `spec-coverage`, `product-contract`, and `e2e-product-tests` in [`verify.py`](src/atlas/pipeline/verify.py).
 
 ## Token and cost reports
 

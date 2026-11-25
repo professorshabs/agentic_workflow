@@ -13,7 +13,7 @@
 | Parser & researcher | Antigravity CLI `agy` (Gemini 4 Hydrogen / Gemini 4 Neon), structured JSON. If `agy` fails the Phase 0 spike, these stay on today's `ModelRouter`. | Confirmed, spike-gated |
 | Judge | Claude Code `claude`, Opus 5.5, **strictly read-only** (pre-build planning). | Implemented |
 | Post-build Supervisor | **Dual parallel panel:** Claude Opus (`claude_code`, read-only) + Gemini 4 Neon (`agy` with OpenRouter fallback), merging findings into one unified review + improvement plan sent to Fixer. | Implemented |
-| Fixer | **OpenRouter through `ModelRouter`**, alternating Claude Sonnet 5.5 and OpenAI Sol 6.2 between rounds. **No Codex.** | Confirmed |
+| Fixer | **OpenRouter through `ModelRouter`**, alternating Claude Sonnet 5.5 and Gemini 4 Hydrogen between rounds (Hydrogen replaced OpenAI Sol 6.2 on 2026-11-25). **No Codex.** | Confirmed |
 | Verifier | Atlas `verify_app` + `spec-coverage`, credential-scrubbed, no model. Unchanged. | Confirmed |
 | Framework vs products | **Atlas is the framework; each product in `app/<spec-name>/` stands on its own.** Products are built and tested on your Mac, with **their own tests** that `verify_app` runs. GitHub CI, when you add it, tests only the Atlas framework. Deploying a product is a separate, later step (section 9). | Confirmed |
 | Interactive `atlas` chat | Deferred. `atlas run <spec.md>` alias kept as a small step. | Deferred |
@@ -47,7 +47,7 @@ Today every pipeline role is one API request through `ModelRouter` (LiteLLM), so
 | **E2E (`e2e`)** | Antigravity CLI `agy` (fallback OpenRouter) | `gemini-4-neon-high` | Pre-build `generate_e2e_tests` (`--e2e-tests` / `require_e2e_tests: true`); compact prompt (omits raw findings & rejected candidates when `Plan` exists), single-turn `--disable-slash-commands`, `600s` timeout / `32K` fallback cap; locks down black-box `tests/` files (`e2e-product-tests`). |
 | **Supervisor** *(post-build dual panel)* | Parallel `reviewers`: Claude Code (`claude`, read-only) + Antigravity CLI `agy` (fallback OpenRouter) | Claude Opus 5.5 + Gemini 4 Neon | After green checks, both inspect the built app against the spec independently (`unanimous` mode by default). Verdicts merge into one unified `Review` (`issues` + `improvement_plan` in `supervisor_review.json`); any flagged issues go sequentially to the Fixer. |
 | **Builder** | Antigravity Python SDK `LocalOpenAIAgentConfig(model, base_url).lightweight()` | Auto-discovered local Gemma 4 (`google/gemma-4-26b-a4b-qat` / `gemma-4-26b-a4b-it-qat-mlx-4bit` on LM Studio, else `gemma4:12b-mlx` / `gemma4:12b` on Ollama) passing section 5 checks | Edits files in an isolated workspace → `WorkspaceBuildResult` (diff + snapshot). **Local only; fails clearly if no model is ready.** |
-| **Fixer** | OpenRouter via `ModelRouter` | Round 1, 3, …: Claude Sonnet 5.5. Round 2, 4, …: OpenAI Sol 6.2 | Runs only when verification fails; returns `PatchResult` (full replacement files), applied through `materialize_files` path checks. Each round gets the previous round's diagnosis and the `writing-clean-code` skill. |
+| **Fixer** | OpenRouter via `ModelRouter` | Round 1, 3, …: Claude Sonnet 5.5. Round 2, 4, …: Gemini 4 Hydrogen | Runs only when verification fails; returns `PatchResult` (full replacement files), applied through `materialize_files` path checks. Each round gets the previous round's diagnosis and the `writing-clean-code` skill. |
 | **Verifier** | Atlas built-in `verify_app` | none | Runs the **product's own tests** (pytest / `npm test`) plus compile, lint and build checks, `spec-coverage` and the product contract (section 4.1); credential-scrubbed (`_verification_env`). |
 
 ### Verified local laptop audit (checked on the Mac, 2026-11-23)
@@ -78,7 +78,7 @@ flowchart TD
     Ready -- "yes" --> Builder["Builder: Antigravity SDK (pre-seeded PLAN.md + tests/ + progressive skill index + lean prompt)"]
     Builder --> Snapshot["WorkspaceBuildResult + authoritative E2E test check -> runs/run_id/build.json"]
     Snapshot --> Verify["Atlas verify_app + spec-coverage + product-contract + e2e-product-tests (credential-scrubbed)"]
-    Verify -- "fail, rounds left" --> Fixer["Fixer: OpenRouter, Sonnet 5.5 / Sol 6.2 alternating -> PatchResult"]
+    Verify -- "fail, rounds left" --> Fixer["Fixer: OpenRouter, Sonnet 5.5 / Hydrogen alternating -> PatchResult"]
     Fixer --> Verify
     Verify -- "pass" --> Review{"Supervisor enabled? (default: true)"}
     Review -- "yes" --> Supervisor["Parallel Dual Supervisor: Opus (claude_code) + Gemini 4 Neon (agy / OpenRouter)"]
@@ -195,7 +195,7 @@ config = LocalOpenAIAgentConfig(
 
 ## 7. Fixer: OpenRouter, alternating models
 
-- `ModelRouter` (OpenRouter) keeps the fixer. Round 1, 3, …: `openrouter/anthropic/claude-sonnet-5.5`; round 2, 4, …: `openrouter/openai/gpt-6.2-sol`.
+- `ModelRouter` (OpenRouter) keeps the fixer. Round 1, 3, …: `openrouter/anthropic/claude-sonnet-5.5`; round 2, 4, …: `openrouter/google/gemini-4-hydrogen`.
 - **Sequential only:** the fixer never runs while the builder, judge or supervisor is running.
 - **Input:** the spec's requirements, failing checks (stdout/stderr tails), a snapshot of current files, the previous round's diagnosis, and the `writing-clean-code` skill text.
 - **Output:** `PatchResult` (full replacement files or deletions), applied through `materialize_files` with the existing path checks.
@@ -390,7 +390,7 @@ backends:
     type: openrouter                  # sequential PatchResult via ModelRouter
     rotate:                           # round 1, 3, ...: first; round 2, 4, ...: second
       - openrouter/anthropic/claude-sonnet-5.5
-      - openrouter/openai/gpt-6.2-sol
+      - openrouter/google/gemini-4-hydrogen
 
 limits:
   max_tokens_by_role:

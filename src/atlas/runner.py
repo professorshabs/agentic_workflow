@@ -742,10 +742,16 @@ async def run_build(
                 local_model_override=local_model,
                 e2e_suite=e2e_suite,
                 plan_markdown=rendered_plan,
+                clarifications=clarifications,
             )
             written_files = list(generated_app.files_snapshot)
             if builder_type == "local_harness":
-                manifest["local_model"] = generated_app.model
+                if generated_app.harness == "antigravity_sdk":
+                    manifest["local_model"] = generated_app.model
+                else:
+                    # The local model could not finish; a cloud model built the product.
+                    manifest["build_offloaded_to"] = generated_app.model
+                    manifest["build_offload_harness"] = generated_app.harness
         else:
             generated_app = await build_app(
                 active_router,

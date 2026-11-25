@@ -32,6 +32,7 @@ from .base import (
     scoped_subprocess_env,
     snapshot_file_hashes,
     snapshot_git_status,
+    workspace_signature,
 )
 
 _AUTH_ERROR_MARKERS = (
@@ -526,6 +527,28 @@ class AntigravityCLIAdapter(HarnessAdapter):
         return build_result, invocation
 
 
+async def _wait_for_stall(app_dir: Path, stall_seconds: float, poll_seconds: float) -> float:
+    """Return (seconds idle) once no file in `app_dir` has changed for `stall_seconds`."""
+    last = workspace_signature(app_dir)
+    last_change = time.monotonic()
+    while True:
+        await asyncio.sleep(poll_seconds)
+        current = workspace_signature(app_dir)
+        now = time.monotonic()
+        if current != last:
+            last, last_change = current, now
+        elif now - last_change >= stall_seconds:
+            return now - last_change
+
+
+async def _cancel_quietly(task: asyncio.Future[Any], grace_seconds: float = 10.0) -> None:
+    if task.done():
+        return
+    task.cancel()
+    with contextlib.suppress(asyncio.CancelledError, Exception):
+        await asyncio.wait_for(task, timeout=grace_seconds)
+
+
 class AntigravitySDKAdapter:
     """Google Antigravity Python SDK adapter for local Ollama / LM Studio execution."""
 
@@ -572,7 +595,15 @@ class AntigravitySDKAdapter:
         app_dir: Path,
         timeout_seconds: float = 600.0,
         skill_dirs: list[Path] | None = None,
+        stall_seconds: float | None = None,
+        stall_poll_seconds: float = 10.0,
     ) -> tuple[WorkspaceBuildResult, HarnessInvocationResult]:
+        """Run the local agent in `app_dir`.
+
+        Gives up after `timeout_seconds` overall, or earlier when `stall_seconds` is set and
+        no file in the workspace changes for that long (a small model stuck in a loop), so
+        the caller can hand the build to a stronger model quickly.
+        """
         version = self.package_version()
         if version is None:
             raise HarnessUnavailableError(
@@ -611,13 +642,44 @@ class AntigravitySDKAdapter:
             os.chdir(resolved_app_dir)
             with _credentials_hidden_from_children():
                 async with Agent(cfg) as agent:
-                    response = await asyncio.wait_for(
-                        agent.chat(prompt_text), timeout=timeout_seconds
+
+                    async def _converse() -> tuple[str, Any]:
+                        response = await agent.chat(prompt_text)
+                        text = await response.text()
+                        return text, getattr(response, "usage_metadata", None)
+
+                    chat_task: asyncio.Future[tuple[str, Any]] = asyncio.ensure_future(
+                        _converse()
                     )
-                    response_text = await asyncio.wait_for(
-                        response.text(), timeout=timeout_seconds
-                    )
-                    usage_meta = getattr(response, "usage_metadata", None)
+                    watched: set[asyncio.Future[Any]] = {chat_task}
+                    stall_task: asyncio.Future[float] | None = None
+                    if stall_seconds is not None and stall_seconds > 0:
+                        stall_task = asyncio.ensure_future(
+                            _wait_for_stall(
+                                resolved_app_dir, float(stall_seconds), stall_poll_seconds
+                            )
+                        )
+                        watched.add(stall_task)
+                    try:
+                        done, _ = await asyncio.wait(
+                            watched,
+                            timeout=timeout_seconds,
+                            return_when=asyncio.FIRST_COMPLETED,
+                        )
+                    finally:
+                        if stall_task is not None:
+                            await _cancel_quietly(stall_task, grace_seconds=1.0)
+                        if not chat_task.done():
+                            await _cancel_quietly(chat_task)
+                    if chat_task in done:
+                        response_text, usage_meta = chat_task.result()
+                    else:
+                        if stall_task is not None and stall_task in done:
+                            raise HarnessError(
+                                f"Antigravity SDK local build stalled: no file changes for "
+                                f"{float(stall_seconds or 0):.0f}s (model={candidate.name})."
+                            )
+                        raise TimeoutError
         except TimeoutError:
             raise HarnessError(
                 f"Antigravity SDK local build timed out after {timeout_seconds:.0f}s "

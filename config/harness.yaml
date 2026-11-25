@@ -2,8 +2,12 @@
 #   - Parser & Researcher: Google Antigravity CLI (`agy`, fallback to `ModelRouter`)
 #   - Judge: Claude Code (`claude`, Opus 5.5, strictly read-only)
 #   - Dual Post-Build Supervisor: Claude Opus (`claude_code`) + Gemini 4 Neon (`agy`, fallback OpenRouter)
-#   - Builder: Local model only via Antigravity Python SDK (`LocalOpenAIAgentConfig.lightweight()`)
-#   - Fixer: Alternating OpenRouter models via `ModelRouter`
+#   - Builder: Gemma 4 12B on this Mac (LM Studio or Ollama) via the Antigravity Python SDK
+#     (`LocalOpenAIAgentConfig.lightweight()`). If the 12B can't finish (not loaded, error,
+#     timeout, no progress for `stall_seconds`, or no files written), the build is offloaded
+#     to Gemini 4 Hydrogen (`agy`), then Claude Sonnet 5.5 (OpenRouter).
+#   - Fixer: Claude Sonnet 5.5 and Gemini 4 Hydrogen alternating by round (OpenRouter), each
+#     falling back to the other, then to Hydrogen on the direct Gemini API
 #
 # Usage:
 #   atlas doctor --config config/harness.yaml
@@ -25,7 +29,7 @@ role_fallbacks:
   judge: [openrouter/anthropic/claude-opus-5]
   e2e: [openrouter/google/gemini-4-hydrogen, gemini/gemini-4-neon]
   supervisor: [gemini/gemini-4-neon]
-  fixer: [openrouter/openai/gpt-6.2-sol, openrouter/google/gemini-4-hydrogen]
+  fixer: [openrouter/google/gemini-4-hydrogen, openrouter/anthropic/claude-sonnet-5.5, gemini/gemini-4-hydrogen]
 
 fallbacks: []
 
@@ -88,22 +92,42 @@ backends:
     type: local_harness
     local_harness: antigravity_sdk
     local_providers:
-      ollama: http://localhost:11434/v1
       lm_studio: http://localhost:1234/v1
-    local_model: null
-    preferred: [google/gemma-4-26b-a4b-qat, gemma-4-26b-a4b-it-qat-mlx-4bit, gemma4:12b-mlx, gemma4:12b]
+      ollama: http://localhost:11434/v1
+    local_model: null                 # or pin one, e.g. google/gemma-4-12b-qat
+    # Gemma 4 12B only, first match wins: LM Studio, then Ollama. Nothing else is tried
+    # (only_preferred), and nothing over 14B parameters is ever picked, so the 26B can stay
+    # installed without being used.
+    preferred:
+      - google/gemma-4-12b-qat
+      - gemma4:12b-mlx
+      - gemma4:12b
+    only_preferred: true
+    max_parameter_size_b: 14
     require_tools: true
-    min_context_tokens: 32768
-    memory_budget_fraction: 0.78
+    min_context_tokens: 49152         # checked against what the server actually loaded
+    memory_budget_fraction: 0.70
     require_tool_smoke_check: true
-    timeout_seconds: 1800
+    smoke_timeout_seconds: 90         # includes loading the model
+    timeout_seconds: 900              # whole local build; then offload
+    stall_seconds: 300                # no file written for 5 min -> offload
+    brief_max_chars: 24000            # BUILD_BRIEF.md (~6K tokens) instead of the ~30K-token PLAN.md
     sandbox: true
+    offload:
+      - name: hydrogen
+        type: harness
+        provider: antigravity
+        model: gemini-4-hydrogen-high
+        timeout_seconds: 900
+      - name: sonnet
+        type: openrouter
+        model: openrouter/anthropic/claude-sonnet-5.5
 
   fixer:
     type: openrouter
-    rotate:
+    rotate:                           # round 1, 3, ...: Sonnet; round 2, 4, ...: Hydrogen
       - openrouter/anthropic/claude-sonnet-5.5
-      - openrouter/openai/gpt-6.2-sol
+      - openrouter/google/gemini-4-hydrogen
 
 skills:
   sources:
@@ -132,7 +156,7 @@ limits:
     researcher: 240
     judge: 300
     e2e: 300
-    builder: 1800
+    builder: 900                      # also the Sonnet offload's single API call
     fixer: 300
   attempts_per_model: 2
   repair_attempts: 1

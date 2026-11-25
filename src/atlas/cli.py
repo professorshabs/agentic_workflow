@@ -10,7 +10,12 @@ from dotenv import load_dotenv
 from atlas import __version__
 from atlas.changes import changed_specs
 from atlas.harnesses import run_doctor
-from atlas.local_models import DEFAULT_LM_STUDIO_URL, DEFAULT_OLLAMA_URL, resolve_local_model
+from atlas.local_models import (
+    DEFAULT_LM_STUDIO_URL,
+    DEFAULT_OLLAMA_URL,
+    local_resolution_kwargs,
+    resolve_local_model,
+)
 from atlas.pipeline.build import default_app_dir
 from atlas.pipeline.clarify import load_answers_file
 from atlas.pipeline.verify import verify_app
@@ -375,14 +380,8 @@ def main() -> None:
                 resolve_local_model(
                     explicit_model=str(explicit) if explicit else None,
                     providers=providers,
-                    preferred=(
-                        list(builder_cfg["preferred"]) if builder_cfg.get("preferred") else None
-                    ),
-                    require_tools=bool(builder_cfg.get("require_tools", True)),
-                    min_context_tokens=builder_cfg.get("min_context_tokens"),
-                    max_model_size_gb=builder_cfg.get("max_model_size_gb"),
-                    memory_budget_fraction=builder_cfg.get("memory_budget_fraction"),
                     require_tool_smoke_check=not args.no_smoke_check,
+                    **local_resolution_kwargs(builder_cfg),
                 )
             )
             if args.json:

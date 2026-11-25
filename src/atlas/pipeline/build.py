@@ -17,9 +17,16 @@ from atlas.harnesses import (
     HarnessUnavailableError,
     get_harness_adapter,
 )
-from atlas.local_models import DEFAULT_LM_STUDIO_URL, DEFAULT_OLLAMA_URL, resolve_local_model
+from atlas.harnesses.base import capture_workspace_build_result, snapshot_file_hashes
+from atlas.local_models import (
+    DEFAULT_LM_STUDIO_URL,
+    DEFAULT_OLLAMA_URL,
+    local_resolution_kwargs,
+    resolve_local_model,
+)
 from atlas.router import ModelRouter, TokenBudgetExceededError
 from atlas.schemas import (
+    ClarificationReport,
     E2ETestSuite,
     GeneratedApp,
     GeneratedFile,
@@ -34,6 +41,7 @@ from atlas.schemas import (
 )
 from atlas.skills import format_role_skill_index, load_role_skill_prompt, sync_workspace_skills
 
+from .render import render_build_brief
 from .util import complete_json_model, extract_json_object, prompt, role_target_label
 
 logger = logging.getLogger("atlas.pipeline.build")
@@ -72,9 +80,10 @@ def _resolve_inside(app_root: Path, rel_path: str) -> Path:
     return target
 
 
-def _clean_app_root(root: Path) -> None:
+def _clean_app_root(root: Path, keep: set[str] | None = None) -> None:
+    keep_names = {".gitkeep", *(keep or set())}
     for child in list(root.iterdir()):
-        if child.name == ".gitkeep":
+        if child.name in keep_names:
             continue
         if child.is_dir() and not child.is_symlink():
             shutil.rmtree(child)
@@ -209,9 +218,10 @@ async def build_app(
     *,
     raw_spec: str = "",
     e2e_suite: E2ETestSuite | None = None,
+    model: str | None = None,
 ) -> GeneratedApp:
     """Generate a complete, testable application from a parsed spec and optional plan."""
-    model = _resolve_model(router, "builder", ("judge", "parser"))
+    model = model or _resolve_model(router, "builder", ("judge", "parser"))
     parts = [f"PARSED SPECIFICATION:\n{spec.model_dump_json(indent=2)}"]
     if raw_spec.strip():
         parts.append(f"RAW SPECIFICATION:\n{raw_spec.strip()}")
@@ -606,6 +616,11 @@ async def supervise_app(
     return merge_supervisor_reviews(verdicts, mode=mode)
 
 
+_PLAN_FILE = "PLAN.md"
+_BRIEF_FILE = "BUILD_BRIEF.md"
+_OFFLOAD_PROMPT_CHARS = 40_000
+
+
 def _build_workspace_prompt(
     spec: ParsedSpec,
     plan: Plan | None,
@@ -614,10 +629,12 @@ def _build_workspace_prompt(
     e2e_suite: E2ETestSuite | None = None,
     *,
     plan_file: str | None = None,
+    brief_file: str | None = None,
     e2e_preseeded: bool = False,
+    previous_attempt: bool = False,
     max_prompt_chars: int = 12_000,
 ) -> str:
-    parts = [prompt("build").strip()]
+    parts = [prompt("build_workspace").strip()]
     if skill_prompt:
         parts.append(skill_prompt)
     workspace_notes = [
@@ -627,14 +644,29 @@ def _build_workspace_prompt(
         "- Include the requirement ID (for example `# R001` or `// R001`) in tests covering each "
         "functional requirement so `spec-coverage` verification passes.",
     ]
-    if plan_file:
+    if brief_file:
+        workspace_notes.append(
+            f"- Read `{brief_file}` first: it lists the chosen approach for each requirement, "
+            "answers to clarifying questions and the implementation tasks."
+        )
+        if plan_file:
+            workspace_notes.append(
+                f"- `{plan_file}` is the long research version of the plan; do not read it "
+                "whole (it does not fit your context)."
+            )
+    elif plan_file:
         workspace_notes.append(
             f"- Read `{plan_file}` on disk for the full architecture plan, clarified "
             "assumptions, chosen libraries, and implementation tasks before writing code."
         )
+    if previous_attempt:
+        workspace_notes.append(
+            "- A smaller local model attempted this build first and may have left partial "
+            "files here. Review them, keep what is correct, and fix or replace the rest."
+        )
     parts.append("\n".join(workspace_notes))
 
-    if plan_file:
+    if plan_file or brief_file:
         parts.append(_format_compact_spec(spec))
     else:
         parts.append(f"PARSED SPECIFICATION:\n{spec.model_dump_json(indent=2)}")
@@ -658,14 +690,245 @@ def _build_workspace_prompt(
 
     assembled = "\n\n".join(parts)
     if max_prompt_chars > 0 and len(assembled) > max_prompt_chars:
+        on_disk = brief_file or plan_file
         trailer = (
-            f"\n\n... [prompt trimmed to fit local context window; read `{plan_file}` on disk]"
-            if plan_file
+            f"\n\n... [prompt trimmed to fit local context window; read `{on_disk}` on disk]"
+            if on_disk
             else "\n\n... [prompt trimmed to fit local context window]"
         )
         keep = max(200, max_prompt_chars - len(trailer))
         assembled = assembled[:keep].rstrip() + trailer
     return assembled
+
+
+def _record_build_success(
+    router: ModelRouter, *, requested_model: str, invocation: Any
+) -> None:
+    router.record_harness_call(
+        role="builder",
+        requested_model=requested_model,
+        used_model=invocation.used_model,
+        harness=invocation.harness,
+        harness_version=invocation.harness_version,
+        auth_mode=invocation.auth_mode,
+        elapsed_ms=invocation.elapsed_ms,
+        prompt_tokens=invocation.prompt_tokens,
+        completion_tokens=invocation.completion_tokens,
+        cached_tokens=invocation.cached_tokens,
+        reasoning_tokens=invocation.reasoning_tokens,
+        total_tokens=invocation.total_tokens,
+        cost_usd=invocation.cost_usd,
+        cost_source=invocation.cost_source,
+        usage_reported=invocation.usage_reported,
+    )
+
+
+async def _run_local_build(
+    router: ModelRouter,
+    backend: dict[str, Any],
+    root: Path,
+    *,
+    prompt_text: str,
+    timeout_seconds: float,
+    skill_dirs: list[Path] | None,
+    local_model_override: str | None,
+) -> WorkspaceBuildResult:
+    """Resolve the configured local model and build in `root` with the Antigravity SDK."""
+    explicit_model = local_model_override or backend.get("local_model")
+    providers = backend.get("local_providers") or {
+        "ollama": DEFAULT_OLLAMA_URL,
+        "lm_studio": DEFAULT_LM_STUDIO_URL,
+    }
+    logger.info(
+        "[build] Resolving local model (explicit=%s)...",
+        explicit_model or "auto",
+    )
+    resolution = await resolve_local_model(
+        explicit_model=str(explicit_model) if explicit_model else None,
+        providers=providers,
+        require_tool_smoke_check=bool(backend.get("require_tool_smoke_check", True)),
+        **local_resolution_kwargs(backend),
+    )
+    if resolution.selected is None:
+        raise HarnessUnavailableError(resolution.reason)
+
+    candidate = resolution.selected
+    logger.info(
+        "[build] Selected local model %s/%s — starting Antigravity SDK agent...",
+        candidate.provider,
+        candidate.name,
+    )
+    sdk_adapter = AntigravitySDKAdapter()
+    run_kwargs: dict[str, Any] = {
+        "candidate": candidate,
+        "prompt_text": prompt_text,
+        "app_dir": root,
+        "timeout_seconds": timeout_seconds,
+        "skill_dirs": skill_dirs,
+    }
+    if backend.get("stall_seconds"):
+        run_kwargs["stall_seconds"] = float(backend["stall_seconds"])
+    try:
+        result, invocation = await sdk_adapter.run_workspace_task(**run_kwargs)
+    except Exception as exc:
+        router.record_harness_call(
+            role="builder",
+            requested_model=candidate.name,
+            used_model=f"{candidate.provider}/{candidate.name}",
+            harness=sdk_adapter.harness,
+            harness_version=sdk_adapter.package_version(),
+            auth_mode="local",
+            elapsed_ms=0.0,
+            cost_usd=0.0,
+            cost_source="local_free",
+            error=f"{type(exc).__name__}: {exc}",
+        )
+        raise
+    _record_build_success(router, requested_model=candidate.name, invocation=invocation)
+    return result
+
+
+async def _run_harness_build(
+    router: ModelRouter,
+    *,
+    provider: str,
+    model: str,
+    prompt_text: str,
+    root: Path,
+    timeout_seconds: float,
+    sandbox: bool,
+) -> WorkspaceBuildResult:
+    """Build in `root` with a CLI workspace harness (`agy`), recording billed usage."""
+    adapter = get_harness_adapter(provider)
+    logger.info("[build] Starting %s workspace harness (model=%s)...", provider, model)
+    try:
+        result, invocation = await adapter.run_workspace_task(
+            role="builder",
+            model=model,
+            prompt_text=prompt_text,
+            app_dir=root,
+            timeout_seconds=timeout_seconds,
+            sandbox=sandbox,
+        )
+    except Exception as exc:
+        failed_usage: dict[str, Any] = dict(getattr(exc, "usage", None) or {})
+        router.record_harness_call(
+            role="builder",
+            requested_model=model,
+            used_model=model,
+            harness=provider,
+            harness_version=None,
+            elapsed_ms=0.0,
+            prompt_tokens=int(failed_usage.get("prompt_tokens") or 0),
+            completion_tokens=int(failed_usage.get("completion_tokens") or 0),
+            cached_tokens=int(failed_usage.get("cached_tokens") or 0),
+            reasoning_tokens=int(failed_usage.get("reasoning_tokens") or 0),
+            total_tokens=int(failed_usage.get("total_tokens") or 0),
+            cost_usd=failed_usage.get("cost_usd"),
+            cost_source=str(failed_usage.get("cost_source") or "unavailable"),
+            usage_reported=bool(failed_usage.get("usage_reported")),
+            error=f"{type(exc).__name__}: {exc}",
+        )
+        raise
+    _record_build_success(router, requested_model=model, invocation=invocation)
+    return result
+
+
+async def _run_single_shot_build(
+    router: ModelRouter,
+    *,
+    model: str,
+    spec: ParsedSpec,
+    plan: Plan | None,
+    raw_spec: str,
+    e2e_suite: E2ETestSuite | None,
+    root: Path,
+) -> WorkspaceBuildResult:
+    """Build with one structured API call (the router records its usage) and write the files."""
+    before_hashes = snapshot_file_hashes(root)
+    generated = await build_app(
+        router, spec, plan, raw_spec=raw_spec, e2e_suite=e2e_suite, model=model
+    )
+    materialize_files(root, generated.files, clean=False)
+    if e2e_suite is not None and e2e_suite.files:
+        # The authoritative E2E tests win over any copy the model returned.
+        materialize_files(root, e2e_suite.files, clean=False)
+    result = capture_workspace_build_result(
+        root,
+        before_hashes,
+        summary=generated.summary,
+        harness=model.split("/", 1)[0] if "/" in model else "litellm",
+        harness_version=None,
+        model=model,
+    )
+    return result.model_copy(update={"run_instructions": generated.run_instructions})
+
+
+def _offload_label(target: dict[str, Any]) -> str:
+    return str(
+        target.get("name") or target.get("model") or target.get("provider") or "offload"
+    )
+
+
+async def _offload_build(
+    router: ModelRouter,
+    targets: list[dict[str, Any]],
+    *,
+    spec: ParsedSpec,
+    plan: Plan | None,
+    raw_spec: str,
+    e2e_suite: E2ETestSuite | None,
+    root: Path,
+    prompt_text: str,
+    sandbox: bool,
+    local_error: BaseException,
+) -> WorkspaceBuildResult:
+    """Hand the build to stronger models in order until one succeeds."""
+    failures = [f"local: {type(local_error).__name__}: {local_error}"]
+    for target in targets:
+        label = _offload_label(target)
+        target_type = str(target.get("type") or "harness")
+        try:
+            router._check_budget()
+            if target_type == "harness":
+                provider = str(target.get("provider") or "antigravity")
+                model = str(target.get("model") or "gemini-4-hydrogen-high")
+                logger.info(
+                    "[build] Offloading to '%s' (%s workspace harness, model=%s)...",
+                    label,
+                    provider,
+                    model,
+                )
+                return await _run_harness_build(
+                    router,
+                    provider=provider,
+                    model=model,
+                    prompt_text=prompt_text,
+                    root=root,
+                    timeout_seconds=float(
+                        target.get("timeout_seconds") or router.timeout_for("builder")
+                    ),
+                    sandbox=bool(target.get("sandbox", sandbox)),
+                )
+            model = str(target.get("model") or "")
+            logger.info("[build] Offloading to '%s' (%s, model=%s)...", label, target_type, model)
+            return await _run_single_shot_build(
+                router,
+                model=model,
+                spec=spec,
+                plan=plan,
+                raw_spec=raw_spec,
+                e2e_suite=e2e_suite,
+                root=root,
+            )
+        except TokenBudgetExceededError:
+            raise
+        except Exception as exc:
+            logger.warning(
+                "[build] Offload target '%s' failed: %s: %s", label, type(exc).__name__, exc
+            )
+            failures.append(f"{label}: {type(exc).__name__}: {exc}")
+    raise HarnessError("Local build and every offload target failed: " + " | ".join(failures))
 
 
 async def build_app_workspace(
@@ -679,25 +942,45 @@ async def build_app_workspace(
     local_model_override: str | None = None,
     e2e_suite: E2ETestSuite | None = None,
     plan_markdown: str | None = None,
+    clarifications: ClarificationReport | None = None,
 ) -> WorkspaceBuildResult:
-    """Build an application directly on disk using a local-first or configured CLI harness."""
+    """Build an application directly on disk using a local-first or configured CLI harness.
+
+    With a `local_harness` builder, anything the local model cannot finish (no model ready,
+    error, timeout, stall, or no files written) goes to the builder's `offload` targets in
+    order, when any are configured.
+    """
     app_dir.mkdir(parents=True, exist_ok=True)
     root = app_dir.resolve()
+    backend = router.backend_for("builder")
+    backend_type = str(backend.get("type") or "harness")
+    is_local = backend_type == "local_harness"
     if clean:
         _clean_app_root(root)
 
-    plan_file: str | None = None
-    if plan_markdown and plan_markdown.strip():
-        (root / "PLAN.md").write_text(plan_markdown.rstrip() + "\n", encoding="utf-8")
-        plan_file = "PLAN.md"
+    def _seed_workspace() -> tuple[str | None, str | None, bool]:
+        plan_file: str | None = None
+        brief_file: str | None = None
+        if plan_markdown and plan_markdown.strip():
+            (root / _PLAN_FILE).write_text(plan_markdown.rstrip() + "\n", encoding="utf-8")
+            plan_file = _PLAN_FILE
+            if is_local and plan is not None:
+                brief = render_build_brief(
+                    plan,
+                    clarifications=clarifications,
+                    e2e_suite=e2e_suite,
+                    max_chars=int(backend.get("brief_max_chars") or 24_000),
+                )
+                (root / _BRIEF_FILE).write_text(brief, encoding="utf-8")
+                brief_file = _BRIEF_FILE
+        preseeded = False
+        if e2e_suite is not None and e2e_suite.files:
+            materialize_files(root, e2e_suite.files, clean=False)
+            preseeded = True
+        return plan_file, brief_file, preseeded
 
-    e2e_preseeded = False
-    if e2e_suite is not None and e2e_suite.files:
-        materialize_files(root, e2e_suite.files, clean=False)
-        e2e_preseeded = True
+    plan_file, brief_file, e2e_preseeded = _seed_workspace()
 
-    backend = router.backend_for("builder")
-    backend_type = str(backend.get("type") or "harness")
     timeout_seconds = float(backend.get("timeout_seconds") or router.timeout_for("builder"))
     sandbox = bool(backend.get("sandbox", True))
     skills_cfg = router.skills_config()
@@ -715,87 +998,75 @@ async def build_app_workspace(
         skill_prompt,
         e2e_suite,
         plan_file=plan_file,
+        brief_file=brief_file,
         e2e_preseeded=e2e_preseeded,
     )
     skill_dirs = [root / ".agents" / "skills"] if created_links else None
     logger.info(
-        "[build] Prepared workspace %s (PLAN.md=%s, e2e_files=%d, skills=%d)",
+        "[build] Prepared workspace %s (PLAN.md=%s, brief=%s, e2e_files=%d, skills=%d)",
         root,
         bool(plan_file),
+        bool(brief_file),
         len(e2e_suite.files) if e2e_preseeded and e2e_suite else 0,
         len(created_links),
     )
     try:
-        if backend_type == "local_harness":
-            explicit_model = local_model_override or backend.get("local_model")
-            providers = backend.get("local_providers") or {
-                "ollama": DEFAULT_OLLAMA_URL,
-                "lm_studio": DEFAULT_LM_STUDIO_URL,
-            }
-            logger.info(
-                "[build] Resolving local model (explicit=%s)...",
-                explicit_model or "auto",
-            )
-            resolution = await resolve_local_model(
-                explicit_model=str(explicit_model) if explicit_model else None,
-                providers=providers,
-                preferred=list(backend["preferred"]) if backend.get("preferred") else None,
-                require_tools=bool(backend.get("require_tools", True)),
-                min_context_tokens=backend.get("min_context_tokens"),
-                max_model_size_gb=backend.get("max_model_size_gb"),
-                memory_budget_fraction=backend.get("memory_budget_fraction"),
-                require_tool_smoke_check=bool(backend.get("require_tool_smoke_check", True)),
-            )
-            if resolution.selected is None:
-                raise HarnessUnavailableError(resolution.reason)
-
-            candidate = resolution.selected
-            logger.info(
-                "[build] Selected local model %s/%s — starting Antigravity SDK agent...",
-                candidate.provider,
-                candidate.name,
-            )
-            sdk_adapter = AntigravitySDKAdapter()
+        if is_local:
+            offload = [dict(t) for t in (backend.get("offload") or []) if isinstance(t, dict)]
             try:
-                result, invocation = await sdk_adapter.run_workspace_task(
-                    candidate=candidate,
+                result = await _run_local_build(
+                    router,
+                    backend,
+                    root,
                     prompt_text=prompt_text,
-                    app_dir=root,
                     timeout_seconds=timeout_seconds,
                     skill_dirs=skill_dirs,
+                    local_model_override=local_model_override,
                 )
-            except Exception as exc:
-                router.record_harness_call(
-                    role="builder",
-                    requested_model=candidate.name,
-                    used_model=f"{candidate.provider}/{candidate.name}",
-                    harness=sdk_adapter.harness,
-                    harness_version=sdk_adapter.package_version(),
-                    auth_mode="local",
-                    elapsed_ms=0.0,
-                    cost_usd=0.0,
-                    cost_source="local_free",
-                    error=f"{type(exc).__name__}: {exc}",
-                )
+                if offload and not (result.created_files or result.modified_files):
+                    raise HarnessError(
+                        f"Local model {result.model} finished without writing any files."
+                    )
+                return result
+            except TokenBudgetExceededError:
                 raise
-            router.record_harness_call(
-                role="builder",
-                requested_model=candidate.name,
-                used_model=invocation.used_model,
-                harness=invocation.harness,
-                harness_version=invocation.harness_version,
-                auth_mode=invocation.auth_mode,
-                elapsed_ms=invocation.elapsed_ms,
-                prompt_tokens=invocation.prompt_tokens,
-                completion_tokens=invocation.completion_tokens,
-                cached_tokens=invocation.cached_tokens,
-                reasoning_tokens=invocation.reasoning_tokens,
-                total_tokens=invocation.total_tokens,
-                cost_usd=invocation.cost_usd,
-                cost_source=invocation.cost_source,
-                usage_reported=invocation.usage_reported,
+            except Exception as exc:
+                if not offload:
+                    raise
+                local_error: BaseException = exc
+
+            logger.warning(
+                "[build] Local model could not finish (%s: %s); offloading to %s.",
+                type(local_error).__name__,
+                local_error,
+                " -> ".join(_offload_label(t) for t in offload),
             )
-            return result
+            if clean:
+                _clean_app_root(root, keep={".agents"})
+                _seed_workspace()
+            offload_prompt = _build_workspace_prompt(
+                spec,
+                plan,
+                raw_spec,
+                skill_prompt,
+                e2e_suite,
+                plan_file=plan_file,
+                e2e_preseeded=e2e_preseeded,
+                previous_attempt=not clean,
+                max_prompt_chars=_OFFLOAD_PROMPT_CHARS,
+            )
+            return await _offload_build(
+                router,
+                offload,
+                spec=spec,
+                plan=plan,
+                raw_spec=raw_spec,
+                e2e_suite=e2e_suite,
+                root=root,
+                prompt_text=offload_prompt,
+                sandbox=sandbox,
+                local_error=local_error,
+            )
 
         if backend_type == "harness":
             provider = str(backend.get("provider") or "antigravity")
@@ -803,55 +1074,15 @@ async def build_app_workspace(
         else:
             raise HarnessError(f"Unsupported workspace builder backend type: {backend_type}")
 
-        adapter = get_harness_adapter(provider)
-        logger.info("[build] Starting %s workspace harness (model=%s)...", provider, model)
-        try:
-            result, invocation = await adapter.run_workspace_task(
-                role="builder",
-                model=model,
-                prompt_text=prompt_text,
-                app_dir=root,
-                timeout_seconds=timeout_seconds,
-                sandbox=sandbox,
-            )
-        except Exception as exc:
-            failed_usage: dict[str, Any] = dict(getattr(exc, "usage", None) or {})
-            router.record_harness_call(
-                role="builder",
-                requested_model=model,
-                used_model=model,
-                harness=provider,
-                harness_version=None,
-                elapsed_ms=0.0,
-                prompt_tokens=int(failed_usage.get("prompt_tokens") or 0),
-                completion_tokens=int(failed_usage.get("completion_tokens") or 0),
-                cached_tokens=int(failed_usage.get("cached_tokens") or 0),
-                reasoning_tokens=int(failed_usage.get("reasoning_tokens") or 0),
-                total_tokens=int(failed_usage.get("total_tokens") or 0),
-                cost_usd=failed_usage.get("cost_usd"),
-                cost_source=str(failed_usage.get("cost_source") or "unavailable"),
-                usage_reported=bool(failed_usage.get("usage_reported")),
-                error=f"{type(exc).__name__}: {exc}",
-            )
-            raise
-        router.record_harness_call(
-            role="builder",
-            requested_model=model,
-            used_model=invocation.used_model,
-            harness=invocation.harness,
-            harness_version=invocation.harness_version,
-            auth_mode=invocation.auth_mode,
-            elapsed_ms=invocation.elapsed_ms,
-            prompt_tokens=invocation.prompt_tokens,
-            completion_tokens=invocation.completion_tokens,
-            cached_tokens=invocation.cached_tokens,
-            reasoning_tokens=invocation.reasoning_tokens,
-            total_tokens=invocation.total_tokens,
-            cost_usd=invocation.cost_usd,
-            cost_source=invocation.cost_source,
-            usage_reported=invocation.usage_reported,
+        return await _run_harness_build(
+            router,
+            provider=provider,
+            model=model,
+            prompt_text=prompt_text,
+            root=root,
+            timeout_seconds=timeout_seconds,
+            sandbox=sandbox,
         )
-        return result
     finally:
         for link in created_links:
             if link.is_symlink():

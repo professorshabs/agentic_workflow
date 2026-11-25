@@ -51,7 +51,7 @@ ATLAS_CLAUDE_CONTRACT=1 pytest tests/test_harness_cli_contracts.py -k real_claud
 
 With `pip install -e ".[dev,harnesses]"`, `pytest` also checks that the installed `google-antigravity` SDK still has every API the local builder calls (it is alpha, so re-run this after upgrading it).
 
-*(If you are using the local-first hybrid profile in `config/harness.yaml`, start LM Studio with `google/gemma-4-26b-a4b-qat` loaded at `>= 32768` context length — or start Ollama (`OLLAMA_CONTEXT_LENGTH=64000 ollama serve`) with `gemma4:12b-mlx` / `gemma4:12b` — and run `atlas doctor --config config/harness.yaml` and `atlas detect-local --config config/harness.yaml` before building to verify `agy`, `claude`, `OPENROUTER_API_KEY`, local daemons, and allowlisted skills.)*
+*(If you are using the local-first hybrid profile in `config/harness.yaml`, load Gemma 4 12B in LM Studio with `lms unload --all && lms load google/gemma-4-12b-qat --context-length 49152` — or start Ollama (`OLLAMA_CONTEXT_LENGTH=49152 ollama serve`) with `gemma4:12b-mlx` / `gemma4:12b` — and run `atlas doctor --config config/harness.yaml` and `atlas detect-local --config config/harness.yaml` before building to verify `agy`, `claude`, `OPENROUTER_API_KEY`, local daemons, and allowlisted skills.)*
 
 ---
 

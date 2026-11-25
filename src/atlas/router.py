@@ -47,6 +47,34 @@ _ALLOWED_SUPERVISOR_MODES = {"unanimous", "any_approve"}
 _ALLOWED_SUPERVISOR_TYPES = {"harness", "openrouter", "litellm"}
 
 
+def _validate_offload_targets(label: str, targets: Any) -> None:
+    """`offload`: ordered cloud builders used when the local model cannot finish a build."""
+    if targets is None:
+        return
+    if not isinstance(targets, list):
+        raise ValueError(f"{label}.offload must be a list of targets")
+    for idx, target in enumerate(targets):
+        tlabel = f"{label}.offload[{idx}]"
+        if not isinstance(target, dict):
+            raise ValueError(f"{tlabel} must be a mapping")
+        ttype = str(target.get("type") or "harness").strip()
+        if ttype == "harness":
+            if target.get("provider", "antigravity") != "antigravity":
+                raise ValueError(
+                    f"{tlabel}.provider must be 'antigravity' (the only harness that can "
+                    "write a workspace; Claude Code runs read-only in Atlas)"
+                )
+        elif ttype in ("openrouter", "litellm"):
+            model = target.get("model")
+            if not isinstance(model, str) or not model.strip():
+                raise ValueError(f"{tlabel}.model must be a non-empty string")
+        else:
+            raise ValueError(f"{tlabel}.type must be 'harness', 'openrouter' or 'litellm'")
+        timeout = target.get("timeout_seconds")
+        if timeout is not None and (isinstance(timeout, bool) or float(timeout) <= 0):
+            raise ValueError(f"{tlabel}.timeout_seconds must be > 0")
+
+
 def _validate_harness_fields(label: str, cfg: dict[str, Any]) -> None:
     prov = cfg.get("provider")
     if prov not in _ALLOWED_HARNESS_PROVIDERS:
@@ -279,6 +307,10 @@ class ModelRouter:
                         f"backends['{role}'].type '{btype}' must be one of "
                         f"{sorted(_ALLOWED_BACKEND_TYPES)}"
                     )
+                if btype != "local_harness" and bcfg.get("offload") is not None:
+                    raise ValueError(
+                        f"backends['{role}'].offload is only supported with type local_harness"
+                    )
                 if btype == "harness":
                     _validate_harness_fields(f"backends['{role}']", bcfg)
                 elif btype == "local_harness":
@@ -291,8 +323,13 @@ class ModelRouter:
                     if bcfg.get("allow_cloud_fallback"):
                         raise ValueError(
                             f"backends['{role}'].allow_cloud_fallback is not supported; "
-                            "builder is local-only"
+                            "builder is local-only unless you list `offload` targets"
                         )
+                    _validate_offload_targets(f"backends['{role}']", bcfg.get("offload"))
+                    for key in ("stall_seconds", "smoke_timeout_seconds", "max_parameter_size_b"):
+                        val = bcfg.get(key)
+                        if val is not None and (isinstance(val, bool) or float(val) <= 0):
+                            raise ValueError(f"backends['{role}'].{key} must be > 0")
                     lp = bcfg.get("local_providers", ["ollama", "lm_studio"])
                     if isinstance(lp, dict):
                         if not lp or any(k not in _ALLOWED_LOCAL_PROVIDERS for k in lp):

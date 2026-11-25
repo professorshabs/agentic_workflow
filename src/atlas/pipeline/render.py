@@ -56,6 +56,70 @@ def _render_e2e_section(e2e_suite: E2ETestSuite | None) -> list[str]:
     return lines
 
 
+def _shorten(text: str, limit: int) -> str:
+    flat = " ".join(text.split())
+    return flat if len(flat) <= limit else flat[: limit - 1].rstrip() + "…"
+
+
+def render_build_brief(
+    plan: Plan,
+    *,
+    clarifications: ClarificationReport | None = None,
+    e2e_suite: E2ETestSuite | None = None,
+    max_chars: int = 24_000,
+    rationale_chars: int = 200,
+) -> str:
+    """Short build brief for small local models (a few thousand tokens instead of PLAN.md).
+
+    PLAN.md carries every option, pro/con and research note, which can be larger than a local
+    model's whole context window. The brief keeps only what the builder acts on: answered
+    clarifications, the chosen approach per requirement, the task list and the E2E contract
+    (the task list goes last, so trimming only shortens it). Requirements themselves are
+    already in the build prompt.
+    """
+    lines = [
+        "# Build brief",
+        "",
+        plan.spec.summary,
+        "",
+        "Short version of `PLAN.md` for the builder. Requirements and acceptance criteria are in "
+        "your instructions. `PLAN.md` holds the full research: do not read it whole; search it "
+        "for one requirement ID only if you are stuck.",
+    ]
+    if plan.spec.constraints:
+        lines.extend(["", "## Constraints"])
+        lines.extend(f"- {_shorten(c, 300)}" for c in plan.spec.constraints)
+    if e2e_suite is not None and e2e_suite.verifiable and e2e_suite.files:
+        lines.extend([
+            "",
+            "## End-to-end tests (already on disk; make them pass, never edit or weaken them)",
+            f"- Product interface: `{e2e_suite.product_interface}`",
+        ])
+        lines.extend(f"- `{f.path}`" for f in e2e_suite.files)
+    answered = [i for i in (clarifications.items if clarifications else []) if i.answer.strip()]
+    if answered:
+        lines.extend(["", "## Answers to clarifying questions"])
+        for item in answered:
+            tag = f" ({item.requirement_id})" if item.requirement_id else ""
+            lines.append(
+                f"- Q{tag}: {_shorten(item.question, 200)} — A: {_shorten(item.answer, 300)}"
+            )
+    lines.extend(["", "## Chosen approach per requirement"])
+    for decision in plan.decisions:
+        lines.append(
+            f"- **{decision.requirement_id}:** {decision.pick} — "
+            f"{_shorten(decision.rationale, rationale_chars)}"
+        )
+    if plan.tasks:
+        lines.extend(["", "## Implementation tasks"])
+        lines.extend(f"{i}. {_shorten(task, 400)}" for i, task in enumerate(plan.tasks, 1))
+    brief = "\n".join(lines) + "\n"
+    if max_chars > 0 and len(brief) > max_chars:
+        note = "\n... [brief trimmed; search PLAN.md for the rest]\n"
+        brief = brief[: max(200, max_chars - len(note))].rstrip() + note
+    return brief
+
+
 def render_plan(
     plan: Plan,
     *,

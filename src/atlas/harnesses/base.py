@@ -205,6 +205,28 @@ def snapshot_file_hashes(app_dir: Path) -> dict[str, str]:
     return hashes
 
 
+def workspace_signature(app_dir: Path) -> tuple[tuple[str, int, int], ...]:
+    """Cheap `(path, size, mtime_ns)` fingerprint of the workspace, used to spot a stalled agent.
+
+    Skips the same dependency/cache folders as the file hash snapshot, so installing packages
+    does not count as progress.
+    """
+    if not app_dir.is_dir():
+        return ()
+    root = app_dir.resolve()
+    entries: list[tuple[str, int, int]] = []
+    for dirpath, dirnames, filenames in os.walk(root):
+        dirnames[:] = [d for d in dirnames if d not in _WORKSPACE_IGNORED_DIRS]
+        for fname in filenames:
+            full = Path(dirpath) / fname
+            try:
+                st = full.stat()
+            except OSError:
+                continue
+            entries.append((full.relative_to(root).as_posix(), st.st_size, st.st_mtime_ns))
+    return tuple(sorted(entries))
+
+
 def capture_workspace_build_result(
     app_dir: Path,
     before_hashes: dict[str, str],

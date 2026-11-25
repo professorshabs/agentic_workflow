@@ -386,9 +386,19 @@ def _check_suitability(
     max_model_size_gb: float | None,
     memory_budget_fraction: float | None,
     total_memory_bytes: int | None,
+    max_parameter_size_b: float | None = None,
 ) -> str | None:
     if require_tools and candidate.supports_tools is False:
         return "capabilities do not include 'tools'"
+    if (
+        max_parameter_size_b is not None
+        and candidate.parameter_size_b is not None
+        and candidate.parameter_size_b > max_parameter_size_b
+    ):
+        return (
+            f"{candidate.parameter_size_b:g}B parameters > max_parameter_size_b "
+            f"{max_parameter_size_b:g}B"
+        )
     if (
         min_context_tokens is not None
         and candidate.context_length is not None
@@ -421,6 +431,29 @@ SmokeCheckFn = Callable[[LocalModelCandidate], Awaitable[tuple[bool, str]]]
 RuntimeContextFn = Callable[[LocalModelCandidate], Awaitable[int | None]]
 
 
+def local_resolution_kwargs(builder_cfg: dict[str, Any]) -> dict[str, Any]:
+    """`resolve_local_model` keyword arguments taken from a `local_harness` builder config.
+
+    Used by the build stage, `atlas doctor` and `atlas detect-local` so all three pick the
+    same model. Optional keys are passed only when set.
+    """
+    preferred = builder_cfg.get("preferred")
+    kwargs: dict[str, Any] = {
+        "preferred": list(preferred) if preferred else None,
+        "require_tools": bool(builder_cfg.get("require_tools", True)),
+        "min_context_tokens": builder_cfg.get("min_context_tokens"),
+        "max_model_size_gb": builder_cfg.get("max_model_size_gb"),
+        "memory_budget_fraction": builder_cfg.get("memory_budget_fraction"),
+    }
+    if builder_cfg.get("only_preferred"):
+        kwargs["only_preferred"] = True
+    if builder_cfg.get("max_parameter_size_b") is not None:
+        kwargs["max_parameter_size_b"] = float(builder_cfg["max_parameter_size_b"])
+    if builder_cfg.get("smoke_timeout_seconds") is not None:
+        kwargs["smoke_timeout_seconds"] = float(builder_cfg["smoke_timeout_seconds"])
+    return kwargs
+
+
 async def ollama_runtime_context(
     candidate: LocalModelCandidate, *, timeout: float = 1.5
 ) -> int | None:
@@ -450,6 +483,64 @@ async def ollama_runtime_context(
     return None
 
 
+async def lm_studio_runtime_context(
+    candidate: LocalModelCandidate, *, timeout: float = 1.5
+) -> int | None:
+    """Context window LM Studio actually loaded `candidate` with, if it is loaded.
+
+    LM Studio reports the model's trained maximum (256K for Gemma 4) as `max_context_length`,
+    but a just-in-time load uses the model's default load setting (often 4096), and prompts
+    longer than that get truncated, which makes an agent loop forever.
+    """
+    root = _strip_v1_root(candidate.base_url)
+    try:
+        async with httpx.AsyncClient(timeout=timeout) as client:
+            resp = await client.get(f"{root}/api/v0/models")
+        if resp.status_code != 200:
+            return None
+        data = resp.json()
+    except Exception:
+        return None
+    items = data.get("data") if isinstance(data, dict) else None
+    for item in items or []:
+        if not isinstance(item, dict) or str(item.get("id") or "") != candidate.name:
+            continue
+        if str(item.get("state") or "").strip().lower() != "loaded":
+            return None
+        ctx = item.get("loaded_context_length")
+        if isinstance(ctx, int) and not isinstance(ctx, bool):
+            return ctx
+    return None
+
+
+async def local_runtime_context(candidate: LocalModelCandidate) -> int | None:
+    """Loaded context window for an Ollama or LM Studio candidate (None when unknown)."""
+    if candidate.provider == "ollama":
+        return await ollama_runtime_context(candidate)
+    if candidate.provider == "lm_studio":
+        return await lm_studio_runtime_context(candidate)
+    return None
+
+
+def _context_fix_hint(candidate: LocalModelCandidate, min_context_tokens: int) -> str:
+    if candidate.provider == "lm_studio":
+        return (
+            f"reload it with `lms unload --all && lms load {candidate.name} "
+            f"--context-length {min_context_tokens}` (or set its default context length "
+            "in LM Studio > My Models)"
+        )
+    return f"restart with `OLLAMA_CONTEXT_LENGTH={min_context_tokens} ollama serve`"
+
+
+def _smoke_failure_hint(candidate: LocalModelCandidate, message: str) -> str:
+    low = message.lower()
+    if "insufficient system resources" in low or "out of memory" in low:
+        if candidate.provider == "lm_studio":
+            return f"{message} (free memory first: `lms unload --all`)"
+        return f"{message} (free memory first: `ollama stop <other-model>`)"
+    return message
+
+
 async def resolve_local_model(
     *,
     explicit_model: str | None = None,
@@ -466,6 +557,9 @@ async def resolve_local_model(
     probe_timeout: float = 1.5,
     smoke_check_fn: SmokeCheckFn | None = None,
     runtime_context_fn: RuntimeContextFn | None = None,
+    only_preferred: bool = False,
+    max_parameter_size_b: float | None = None,
+    smoke_timeout_seconds: float | None = None,
 ) -> LocalResolutionResult:
     """Resolve an explicit or discovered local model checked for tools, context, and memory."""
     provider_urls: dict[str, str] = {}
@@ -498,10 +592,11 @@ async def resolve_local_model(
 
     if not all_candidates:
         detail = "; ".join(f"{k}: {v}" for k, v in errors.items())
+        ctx = int(min_context_tokens or 32768)
         hint = (
-            "Start Ollama with `OLLAMA_CONTEXT_LENGTH=64000 ollama serve` "
-            "(and `ollama pull gemma4:12b-mlx` / `gemma4:12b`) or start LM Studio "
-            "with a 32K–64K context window."
+            "Start LM Studio and load Gemma 4 12B "
+            f"(`lms load google/gemma-4-12b-qat --context-length {ctx}`), or start Ollama "
+            f"with `OLLAMA_CONTEXT_LENGTH={ctx} ollama serve` and `ollama pull gemma4:12b`."
         )
         return LocalResolutionResult(
             candidates=[],
@@ -534,6 +629,7 @@ async def resolve_local_model(
                 max_model_size_gb=max_model_size_gb,
                 memory_budget_fraction=memory_budget_fraction,
                 total_memory_bytes=ram_bytes,
+                max_parameter_size_b=max_parameter_size_b,
             )
             if bad_reason:
                 rejected[cand.name] = bad_reason
@@ -548,8 +644,26 @@ async def resolve_local_model(
                 + "; ".join(f"{k}: {v}" for k, v in rejected.items()),
             )
     else:
+        pref_list = list(preferred or [])
+        pool = all_candidates
+        if only_preferred and pref_list:
+            pool = [c for c in all_candidates if any(_matches_model(c, p) for p in pref_list)]
+            for cand in all_candidates:
+                if cand not in pool:
+                    rejected[cand.name] = "not in the preferred list (only_preferred: true)"
+            if not pool:
+                available_names = ", ".join(c.name for c in all_candidates) or "none"
+                return LocalResolutionResult(
+                    candidates=all_candidates,
+                    rejected=rejected,
+                    errors=errors,
+                    reason=(
+                        "None of the preferred local models are installed or served "
+                        f"({', '.join(pref_list)}). Available: {available_names}"
+                    ),
+                )
         suitable: list[LocalModelCandidate] = []
-        for cand in all_candidates:
+        for cand in pool:
             bad_reason = _check_suitability(
                 cand,
                 require_tools=require_tools,
@@ -557,6 +671,7 @@ async def resolve_local_model(
                 max_model_size_gb=max_model_size_gb,
                 memory_budget_fraction=memory_budget_fraction,
                 total_memory_bytes=ram_bytes,
+                max_parameter_size_b=max_parameter_size_b,
             )
             if bad_reason:
                 rejected[cand.name] = bad_reason
@@ -572,8 +687,6 @@ async def resolve_local_model(
                 + "; ".join(f"{k} ({v})" for k, v in rejected.items()),
             )
 
-        pref_list = list(preferred or [])
-
         def _rank_key(c: LocalModelCandidate) -> tuple[int, bool, float, int]:
             pref_score = 0
             for idx, pref in enumerate(pref_list):
@@ -584,7 +697,16 @@ async def resolve_local_model(
 
         ordered = sorted(suitable, key=_rank_key, reverse=True)
 
-    smoke_fn = smoke_check_fn or run_tool_smoke_check
+    smoke_fn: SmokeCheckFn
+    if smoke_check_fn is not None:
+        smoke_fn = smoke_check_fn
+    elif smoke_timeout_seconds is not None:
+        smoke_timeout = float(smoke_timeout_seconds)
+
+        async def smoke_fn(cand: LocalModelCandidate) -> tuple[bool, str]:
+            return await run_tool_smoke_check(cand, timeout=smoke_timeout)
+    else:
+        smoke_fn = run_tool_smoke_check
     if not require_tool_smoke_check:
         chosen = ordered[0]
         return LocalResolutionResult(
@@ -595,21 +717,24 @@ async def resolve_local_model(
             reason=f"Selected local {chosen.provider} model '{chosen.name}' (smoke check skipped).",
         )
 
-    context_fn = runtime_context_fn or ollama_runtime_context
+    context_fn = runtime_context_fn or local_runtime_context
     smoke_failures: list[str] = []
     for candidate in ordered:
         passed, msg = await smoke_fn(candidate)
         candidate.tool_smoke_passed = passed
-        if passed and candidate.provider == "ollama" and min_context_tokens:
-            # The smoke call loaded the model, so `/api/ps` now shows the real window.
+        if not passed:
+            msg = _smoke_failure_hint(candidate, msg)
+        if passed and min_context_tokens:
+            # The smoke call loaded the model, so the server now reports the real window.
             runtime_ctx = await context_fn(candidate)
             if runtime_ctx is not None:
                 candidate.context_length = runtime_ctx
                 if runtime_ctx < min_context_tokens:
+                    server = "Ollama" if candidate.provider == "ollama" else "LM Studio"
                     problem = (
-                        f"Ollama serves it with a {runtime_ctx}-token context "
-                        f"(< required {min_context_tokens}); restart with "
-                        f"`OLLAMA_CONTEXT_LENGTH={min_context_tokens} ollama serve`"
+                        f"{server} serves it with a {runtime_ctx}-token context "
+                        f"(< required {min_context_tokens}); "
+                        + _context_fix_hint(candidate, min_context_tokens)
                     )
                     rejected[candidate.name] = problem
                     smoke_failures.append(f"{candidate.name}: {problem}")

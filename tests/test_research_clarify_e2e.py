@@ -702,7 +702,10 @@ async def test_harness_yaml_e2e_role_limits_and_compact_e2e_prompt():
 
     cfg_path = Path(__file__).resolve().parents[1] / "config" / "harness.yaml"
     router = ModelRouter(cfg_path)
-    assert router.models_for("e2e") == ["openrouter/google/gemini-4-neon"]
+    assert router.models_for("e2e") == ["openrouter/anthropic/claude-sonnet-5.5"]
+    assert router.backend_for("e2e")["provider"] == "claude_code"
+    assert router.backend_for("e2e")["model"] == "sonnet"
+    assert router.backend_for("e2e")["effort"] == "high"
     assert router.backend_for("e2e")["timeout_seconds"] == 600
     assert router.max_tokens_for("e2e") == 32000
     assert router.max_tokens_for("researcher") == 24000

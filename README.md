@@ -41,13 +41,14 @@ atlas build specs/example-app.md --skip-research --clean
 
 `atlas validate-config` checks configuration structure and limits. It does not check that a provider key is valid or that an account can use every configured model.
 
-The sample config routes primary roles through OpenRouter (`openrouter/...`) with direct Google Gemini API (`gemini/...`) fallbacks: `openrouter/google/gemini-4-hydrogen` for `parser` and `builder` (with a commented local `ollama_chat/gemma4:26b` option for `builder` — local Ollama models work only locally, not on GitHub-hosted runners), `openrouter/google/gemini-4-neon` for `researcher`, `openrouter/anthropic/claude-opus-5.5` for `judge`, and `openrouter/anthropic/claude-sonnet-5.5` for `fixer`.
+The sample config routes primary roles through OpenRouter (`openrouter/...`) with direct Google Gemini API (`gemini/...`) fallbacks: `openrouter/google/gemini-4-hydrogen` for `parser` and `builder` (with a commented local `ollama_chat/gemma4:26b` option for `builder` — local Ollama models work only locally, not on GitHub-hosted runners), `openrouter/google/gemini-4-neon` for `researcher`, `openrouter/anthropic/claude-opus-5.5` for `judge`, and `openrouter/anthropic/claude-sonnet-5.5` for `e2e` and `fixer`.
 
 | Command | What it does |
 | :--- | :--- |
 | `atlas build <spec.md>` (or `atlas run <spec.md>`) | Parse the spec, research options + clarify ambiguities (`--clarify` / `--answers`), plan, generate authoritative E2E product tests (`--e2e-tests`), build the app under `app/<spec-name>/`, verify & fix, run optional Supervisor review, and write run artifacts. Pass `--from-run <run-dir>` to resume straight from build/verify using a prior run's plan and E2E tests. Streams live `[HH:MM:SS]` stage, `k/N` requirement, and check progress to `stderr` (`-q` / `--quiet` to suppress, `--verbose` for debug logs). |
 | `atlas build <spec.md> --skip-research --clean` | Skip research and planning stages (still clarifying `spec.open_questions` and optional E2E tests) and replace the contents of `app/<spec-name>/` with the generated app. |
-| `atlas plan <spec.md>` | Create a planning report (including clarifying questions & optional E2E test plan) without generating an app, streaming live stage progress (`-q` / `--quiet` to suppress). |
+| `atlas plan <spec.md>` | Create a planning report (including clarifying questions & optional E2E test plan) without generating an app, streaming live stage progress (`-q` / `--quiet` to suppress, `--ui` to view in browser). |
+| `atlas ui [runs/<run-id>]` | Open or replay the workflow UI for a past or in-progress run (`Ctrl+C` to stop; defaults to newest run under `runs/`). |
 | `atlas verify --app-dir app/<spec-name>` | Run verification on an existing built app without making model calls. |
 | `atlas app-dir <spec.md>` | Print the default product output folder (`app/<spec-name>`) for a spec. |
 | `atlas tokens [runs/<run-id>]` | Show usage for a run; without a run path, show the newest run under `runs/`. |
@@ -69,11 +70,14 @@ Instead of calling every stage via OpenRouter APIs, [`config/harness.yaml`](conf
 
 | Role | Backend / Harness | Behavior |
 | :--- | :--- | :--- |
-| **`parser`, `researcher`, & `e2e`** | Antigravity CLI (`agy`) | Structured `--json-schema` + `--disable-slash-commands` single-turn calls (`gemini-4-hydrogen-high` / `gemini-4-neon-high`, `600s` timeout & `32K` fallback cap for `e2e`) with automatic fallback to `ModelRouter`. |
-| **`judge`** | Claude Code (`claude`, read-only) | Claude Opus 5.5 evaluates researched options per requirement with zero write tools (`--tools ""`, subscription billing guard). |
-| **`builder`** | Antigravity Python SDK (`antigravity_sdk`) → offload | **Gemma 4 12B on your Mac** via LM Studio (`google/gemma-4-12b-qat`) or Ollama (`gemma4:12b-mlx` / `gemma4:12b`); nothing else is picked (`only_preferred`, `max_parameter_size_b: 14`). Checks tool calling (`ping` smoke test) and the context window the server actually loaded (`>= 48K`). It reads a short `BUILD_BRIEF.md` instead of the full `PLAN.md`. If the 12B can't finish — no model ready, error, `900s` timeout, no file written for `stall_seconds: 300`, or nothing built — the build is **offloaded** to Gemini 4 Hydrogen (`agy` workspace build), then Claude Sonnet 5.5 (OpenRouter, one structured call). The run manifest records `build_offloaded_to`. |
-| **`fixer`** | OpenRouter via `ModelRouter` | Sequential `PatchResult` repairs alternating between `claude-sonnet-5.5` and `gemini-4-hydrogen` (each falls back to the other), receiving previous diagnoses + `writing-clean-code`. |
-| **`supervisor`** | Dual Post-Build Panel (parallel) | Read-only Claude Opus (`claude_code`) + Gemini 4 Neon (`agy`, fallback OpenRouter) inspect the verified app independently and merge issues + an improvement plan back into the Fixer loop. |
+| **`parser` & `researcher`** | Antigravity CLI (`agy`) | Structured `--json-schema` + `--disable-slash-commands` single-turn calls (`gemini-4-hydrogen-high` / `gemini-4-neon-high`, `420s` timeout & `24K` fallback cap) with automatic fallback to `ModelRouter`. |
+| **`e2e`** | Claude Code (`claude`, read-only) | Claude Sonnet (`sonnet`, `--effort high`, zero write tools `--tools ""`, subscription login, `600s` timeout) generates black-box E2E tests and falls back to OpenRouter (`openrouter/anthropic/claude-sonnet-5.5`) only if `claude` errors. |
+| **`judge`** | Claude Code (`claude`, read-only) | Claude Opus 5.5 evaluates researched options per requirement with zero write tools (`--tools ""`, subscription billing guard), falling back to OpenRouter only if `claude` errors. |
+| **`builder`** | Antigravity Python SDK (`antigravity_sdk`) → offload | **Gemma 4 12B on your Mac** via LM Studio (`google/gemma-4-12b-qat`) or Ollama (`gemma4:12b-mlx` / `gemma4:12b`); nothing else is picked (`only_preferred`, `max_parameter_size_b: 14`). Checks tool calling (`ping` smoke test) and the context window the server actually loaded (`>= 48K`). It reads a short `BUILD_BRIEF.md` instead of the full `PLAN.md`. If the 12B can't finish — no model ready, error, `900s` timeout, no file written for `stall_seconds: 300`, or nothing built — the build is **offloaded** to Claude Sonnet (`claude_code` workspace harness using your subscription login, file-only tools `Read,Grep,Glob,Edit,Write`), then Gemini 4 Hydrogen (`agy` workspace harness), and finally OpenRouter only if those harnesses error. The run manifest records `build_offloaded_to` and `build_offload_harness`. |
+| **`fixer`** | Claude Code (`claude`, read-only) ↔ Antigravity CLI (`agy`) | Sequential `PatchResult` repairs alternating between `claude_code` (`sonnet`, subscription, `--tools ""`) and `agy` (`gemini-4-hydrogen-high`), falling back to OpenRouter only if the active harness errors, receiving previous diagnoses + `writing-clean-code`. |
+| **`supervisor`** | Dual Post-Build Panel (parallel) | Read-only Claude Opus (`claude_code`, fallback OpenRouter) + Gemini 4 Neon (`agy`, fallback OpenRouter) inspect the verified app independently and merge issues + an improvement plan back into the Fixer loop. |
+
+*(Pass `--config config/harness.yaml` or export `ATLAS_CONFIG=config/harness.yaml` so Atlas does not default to [`config/models.yaml`](config/models.yaml).)*
 
 ```bash
 lms unload --all && lms load google/gemma-4-12b-qat --context-length 49152   # LM Studio
@@ -82,6 +86,22 @@ atlas doctor --config config/harness.yaml
 atlas detect-local --config config/harness.yaml
 atlas run specs/example-app.md --config config/harness.yaml
 ```
+
+## Live workflow UI
+
+`atlas run` / `atlas build` in an interactive terminal opens a live view of the run in your browser (served from `127.0.0.1` only, read-only, no extra dependencies). The pipeline is drawn as a horizontal left-to-right transit strip map: each stage is a station with its own symbol and a status marker, research and judge show `k of N` progress per requirement (highlighting any gaps), E2E contract shows the configured target (such as `sonnet (high)` via `claude_code`) and test files, Build shows the local 12B and its offload stops (`sonnet` via `claude_code`, `hydrogen` via `agy`) with a live stall-guard bar and updated workspace files, Verify shows each check per round, the fix loop branches below Verify, Review shows each reviewer's verdict, and Report summarizes token/cost usage by stage. Click any station for details, artifact previews (`spec.md`, `plan.md`, `e2e_tests.json`, `verification.json`, `supervisor_review.json`, `report.md`), and filtered logs.
+
+```bash
+atlas run specs/example-app.md --config config/harness.yaml            # opens the UI
+atlas run specs/example-app.md --no-ui                                  # terminal only
+atlas run specs/example-app.md --ui --no-open --ui-port 8765            # print the URL only
+atlas run specs/example-app.md --ui-keep-open                           # stay alive until Ctrl+C
+atlas plan specs/example-app.md --ui                                    # opt-in UI for plan
+atlas ui                                       # replay the newest run (Ctrl+C to stop)
+atlas ui runs/<run-id>                         # replay a specific run
+```
+
+The UI stays off in CI (`CI` / `GITHUB_ACTIONS`) and when stderr isn't a terminal (`atlas plan` stays off by default unless `--ui` is passed). Clarifying questions are still answered in Terminal; the browser shows that Atlas is waiting. Every run writes `runs/<run-id>/events.jsonl`, which `atlas ui` replays (and older runs are rebuilt from their saved JSON artifacts). See [docs/VISUAL_WORKFLOW_UI_PLAN.md](docs/VISUAL_WORKFLOW_UI_PLAN.md).
 
 ## Research clarifications, pre-seeded E2E tests & lean local prompts
 
@@ -113,7 +133,7 @@ Use `atlas tokens runs/<run-id> --json` for the complete machine-readable breakd
 - `app/` — built products (`app/<spec-name>/`); git-ignored (`app/*`, keeping `!app/.gitkeep`) so generated apps are never pushed to Git, and instead uploaded as `atlas-product-<spec-name>` artifacts and published as Docker images.
 - `src/atlas/` — CLI, pipeline stages (`parse`, `research`, `clarify`, `judge`, `e2e`, `build`/`fix`/`supervise`, `verify`), harness adapters (`agy`, `antigravity_sdk`, `claude_code`), skills loader, local model discovery, and token telemetry.
 - `config/models.yaml` — pure cloud OpenRouter model routing, fallbacks, per-role output limits and timeouts, optional budgets, and verification switches.
-- `config/harness.yaml` — local-first harness profile (`agy` `parser`/`researcher`/`e2e` with OpenRouter fallback and raised reasoning-token limits, read-only `claude` judge, Dual Post-Build Supervisor panel pairing Claude Opus + Gemini 4 Neon, Antigravity SDK local builder via Ollama/LM Studio, alternating OpenRouter fixer, allowlisted skills, and pre-seeded E2E tests).
+- `config/harness.yaml` — local-first harness profile (`agy` `parser`/`researcher` with OpenRouter fallback, read-only `claude` `judge` Opus & `e2e` Sonnet `--effort high`, Dual Post-Build Supervisor panel pairing Claude Opus + Gemini 4 Neon, Antigravity SDK local builder with ordered `sonnet -> hydrogen` offload, alternating `claude_code`/`agy` fixer, allowlisted skills, and pre-seeded E2E tests).
 - `usage/ledger.jsonl` — one line per run with its token totals; created by the first run and updated via PRs.
 - `.github/workflows/spec-to-app.yml` — spec-triggered build into `app/<spec-name>/`, verification, product/run artifact upload, `cd.yml` Docker publish, `usage/ledger.jsonl` PR, then `ci.yml` on that PR branch.
 - `.github/workflows/ci.yml` — Atlas quality checks and verification for generated app changes on pull requests (also called by `spec-to-app.yml`).

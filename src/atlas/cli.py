@@ -1,5 +1,6 @@
 import argparse
 import asyncio
+import contextlib
 import json
 import logging
 import sys
@@ -32,6 +33,19 @@ from atlas.telemetry import (
 )
 
 logger = logging.getLogger("atlas")
+
+
+def _live_ui(args: argparse.Namespace, enabled: bool) -> contextlib.AbstractContextManager[object]:
+    """The live workflow UI around a run, or a no-op context when it is off."""
+    if not enabled:
+        return contextlib.nullcontext()
+    from atlas.ui import LiveWorkflowUI
+
+    return LiveWorkflowUI(
+        port=args.ui_port,
+        open_browser=not args.no_open,
+        keep_open=bool(getattr(args, "ui_keep_open", False)),
+    )
 
 
 def _find_latest_run(runs_root: Path) -> Path:
@@ -109,6 +123,24 @@ def main() -> None:
     )
     _add_ledger_args(plan_parser)
     _add_clarify_and_e2e_args(plan_parser)
+    plan_parser.add_argument(
+        "--ui",
+        action="store_true",
+        help="open the live workflow UI in your browser during planning",
+    )
+    plan_parser.add_argument(
+        "--ui-port", type=int, default=0, help="port for the workflow UI (default: any free)"
+    )
+    plan_parser.add_argument(
+        "--no-open",
+        action="store_true",
+        help="start the workflow UI but only print its URL instead of opening a browser",
+    )
+    plan_parser.add_argument(
+        "--ui-keep-open",
+        action="store_true",
+        help="keep the workflow UI server open after completion until Ctrl+C",
+    )
 
     build_parser = sub.add_parser(
         "build",
@@ -146,6 +178,36 @@ def main() -> None:
     )
     _add_ledger_args(build_parser)
     _add_clarify_and_e2e_args(build_parser)
+    build_parser.add_argument(
+        "--ui",
+        action=argparse.BooleanOptionalAction,
+        default=None,
+        help="live workflow UI in your browser (default: on in an interactive terminal, "
+        "off in CI and pipes)",
+    )
+    build_parser.add_argument(
+        "--ui-port", type=int, default=0, help="port for the workflow UI (default: any free)"
+    )
+    build_parser.add_argument(
+        "--no-open",
+        action="store_true",
+        help="start the workflow UI but only print its URL instead of opening a browser",
+    )
+    build_parser.add_argument(
+        "--ui-keep-open",
+        action="store_true",
+        help="keep the workflow UI server open after completion until Ctrl+C",
+    )
+
+    ui_parser = sub.add_parser(
+        "ui", help="open the workflow UI for a past or running run (replay from runs/<run-id>)"
+    )
+    ui_parser.add_argument(
+        "run_dir", type=Path, nargs="?", default=None, help="run folder (default: newest)"
+    )
+    ui_parser.add_argument("--runs-root", type=Path, default=Path("runs"))
+    ui_parser.add_argument("--port", type=int, default=0)
+    ui_parser.add_argument("--no-open", action="store_true", help="only print the URL")
 
     verify_parser = sub.add_parser(
         "verify", help="detect stack and run test/lint/build verification checks"
@@ -234,30 +296,44 @@ def main() -> None:
             third_party.propagate = True
         third_party.setLevel(logging.DEBUG if verbose else logging.WARNING)
 
+    show_ui = False
+    if args.cmd in ("build", "run"):
+        from atlas.ui import ui_enabled
+
+        show_ui = ui_enabled(args.ui)
+    elif args.cmd == "plan":
+        show_ui = bool(args.ui)
+    if show_ui and quiet:
+        # The terminal stays quiet (its handler is at WARNING); the browser log still
+        # needs the INFO progress lines.
+        logging.getLogger("atlas").setLevel(logging.INFO)
+
     try:
         if args.cmd == "plan":
             interactive_clarify = (
                 sys.stdin.isatty() if args.clarify is None else bool(args.clarify)
             )
             clarification_answers = load_answers_file(args.answers) if args.answers else None
-            out = asyncio.run(
-                run_plan(
-                    args.spec,
-                    args.out,
-                    args.config,
-                    ledger_path=None if args.no_ledger else args.ledger,
-                    interactive_clarify=interactive_clarify,
-                    clarification_answers=clarification_answers,
-                    generate_e2e=args.e2e_tests,
+            # The summary prints inside the block so `--ui-keep-open` shows it before waiting.
+            with _live_ui(args, show_ui):
+                out = asyncio.run(
+                    run_plan(
+                        args.spec,
+                        args.out,
+                        args.config,
+                        ledger_path=None if args.no_ledger else args.ledger,
+                        interactive_clarify=interactive_clarify,
+                        clarification_answers=clarification_answers,
+                        generate_e2e=args.e2e_tests,
+                    )
                 )
-            )
-            summary = _load_token_summary(out)
-            print(f"Plan written to {out / 'plan.md'}")
-            print(
-                f"Tokens: {summary.total_tokens} total "
-                f"(prompt={summary.prompt_tokens}, completion={summary.completion_tokens}, "
-                f"calls={summary.total_calls})"
-            )
+                summary = _load_token_summary(out)
+                print(f"Plan written to {out / 'plan.md'}")
+                print(
+                    f"Tokens: {summary.total_tokens} total "
+                    f"(prompt={summary.prompt_tokens}, completion={summary.completion_tokens}, "
+                    f"calls={summary.total_calls})"
+                )
         elif args.cmd in ("build", "run"):
             app_dir = (
                 args.app_dir if args.app_dir is not None else default_app_dir(args.spec)
@@ -266,36 +342,45 @@ def main() -> None:
                 sys.stdin.isatty() if args.clarify is None else bool(args.clarify)
             )
             clarification_answers = load_answers_file(args.answers) if args.answers else None
-            out = asyncio.run(
-                run_build(
-                    args.spec,
-                    args.out,
-                    app_dir,
-                    config_path=args.config,
-                    skip_research=args.skip_research,
-                    clean_app_dir=args.clean,
-                    max_fix_rounds=args.max_fix_rounds,
-                    report_out=args.report_out,
-                    ledger_path=None if args.no_ledger else args.ledger,
-                    local_model=args.local_model,
-                    interactive_clarify=interactive_clarify,
-                    clarification_answers=clarification_answers,
-                    generate_e2e=args.e2e_tests,
-                    from_run=args.from_run,
+            with _live_ui(args, show_ui):
+                out = asyncio.run(
+                    run_build(
+                        args.spec,
+                        args.out,
+                        app_dir,
+                        config_path=args.config,
+                        skip_research=args.skip_research,
+                        clean_app_dir=args.clean,
+                        max_fix_rounds=args.max_fix_rounds,
+                        report_out=args.report_out,
+                        ledger_path=None if args.no_ledger else args.ledger,
+                        local_model=args.local_model,
+                        interactive_clarify=interactive_clarify,
+                        clarification_answers=clarification_answers,
+                        generate_e2e=args.e2e_tests,
+                        from_run=args.from_run,
+                    )
                 )
-            )
-            manifest = json.loads((out / "manifest.json").read_text(encoding="utf-8"))
-            summary = _load_token_summary(out)
-            print(f"Build status: {manifest['status']}")
-            print(f"Product written to {app_dir}")
-            print(f"Report written to {out / 'report.md'}")
-            print(
-                f"Tokens: {summary.total_tokens} total "
-                f"(prompt={summary.prompt_tokens}, completion={summary.completion_tokens}, "
-                f"calls={summary.total_calls})"
-            )
+                manifest = json.loads((out / "manifest.json").read_text(encoding="utf-8"))
+                summary = _load_token_summary(out)
+                print(f"Build status: {manifest['status']}")
+                print(f"Product written to {app_dir}")
+                print(f"Report written to {out / 'report.md'}")
+                print(
+                    f"Tokens: {summary.total_tokens} total "
+                    f"(prompt={summary.prompt_tokens}, completion={summary.completion_tokens}, "
+                    f"calls={summary.total_calls})"
+                )
             if manifest.get("status") != "verified":
                 sys.exit(1)
+        elif args.cmd == "ui":
+            from atlas.ui import serve_replay
+            from atlas.ui.server import latest_run_dir
+
+            run_dir = args.run_dir if args.run_dir is not None else latest_run_dir(args.runs_root)
+            if not run_dir.is_dir():
+                raise FileNotFoundError(f"Run folder not found: {run_dir}")
+            serve_replay(run_dir, port=args.port, open_browser=not args.no_open)
         elif args.cmd == "verify":
             stack, checks = asyncio.run(
                 verify_app(args.app_dir, timeout_seconds=args.timeout)

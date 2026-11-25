@@ -378,8 +378,9 @@ class AntigravityCLIAdapter(HarnessAdapter):
         max_budget_usd: float | None = None,
         tools: list[str] | None = None,
         cwd: Path | None = None,
+        effort: str | None = None,
     ) -> HarnessInvocationResult:
-        del max_budget_usd, tools
+        del max_budget_usd, tools, effort
         binary = self._find_binary()
         if not binary:
             raise HarnessUnavailableError("Antigravity CLI (`agy`) is not installed on PATH.")
@@ -460,14 +461,17 @@ class AntigravityCLIAdapter(HarnessAdapter):
         timeout_seconds: float = 600.0,
         sandbox: bool = True,
         skill_dirs: list[Path] | None = None,
+        auth: str | None = None,
+        max_budget_usd: float | None = None,
+        effort: str | None = None,
     ) -> tuple[WorkspaceBuildResult, HarnessInvocationResult]:
-        del skill_dirs
+        del skill_dirs, max_budget_usd, effort
         binary = self._find_binary()
         if not binary:
             raise HarnessUnavailableError("Antigravity CLI (`agy`) is not installed on PATH.")
 
         version = await self._version(binary)
-        env = _antigravity_env()
+        env = _antigravity_env(auth)
         app_dir.mkdir(parents=True, exist_ok=True)
         resolved_app_dir = app_dir.resolve()
         before_hashes = snapshot_file_hashes(resolved_app_dir)

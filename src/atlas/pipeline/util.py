@@ -29,7 +29,8 @@ def role_target_label(
     if btype == "harness":
         provider = backend.get("provider", "harness")
         target = backend.get("model") or fallback_model or role
-        return f"{provider}/{target}"
+        effort = backend.get("effort")
+        return f"{provider}/{target} ({effort})" if effort else f"{provider}/{target}"
     if btype == "local_harness":
         local_model = backend.get("local_model")
         return f"local/{local_model}" if local_model else "local/auto-detect"
@@ -95,6 +96,7 @@ async def complete_json_model(
     schema: type[T],
     postprocess: Callable[[dict[str, Any], str], dict[str, Any]] | None = None,
     use_harness: bool = True,
+    backend_override: dict[str, Any] | None = None,
 ) -> tuple[str, T]:
     """Call a model, extract a JSON object, validate against Pydantic, with repair retry."""
     max_repairs = router.repair_attempts
@@ -103,15 +105,22 @@ async def complete_json_model(
 
     for attempt in range(max_repairs + 1):
         backend_fn = getattr(router, "backend_for", None)
+        active_backend = (
+            backend_override
+            if backend_override is not None
+            else (backend_fn(role) if callable(backend_fn) else {})
+        )
         complete_structured = getattr(router, "complete_structured", None)
         if (
             use_harness
-            and callable(backend_fn)
-            and backend_fn(role).get("type") == "harness"
+            and active_backend.get("type") == "harness"
             and callable(complete_structured)
         ):
+            kwargs: dict[str, Any] = {"role": role, "json_schema": schema.model_json_schema()}
+            if backend_override is not None:
+                kwargs["backend_override"] = backend_override
             used_model, raw_output = await complete_structured(
-                model, system, current_user, role=role, json_schema=schema.model_json_schema()
+                model, system, current_user, **kwargs
             )
         elif not use_harness and callable(complete_structured):
             used_model, raw_output = await complete_structured(

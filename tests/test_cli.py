@@ -268,3 +268,131 @@ def test_runtime_errors_exit_one(run_cli, monkeypatch):
     monkeypatch.setattr(cli, "run_plan", boom)
     code, _, err = run_cli("plan", "specs/x.md", "--no-clarify")
     assert code == 1 and "token budget exceeded" in err
+
+
+def test_build_starts_the_live_ui_only_when_asked_or_interactive(run_cli, monkeypatch, tmp_path):
+    import contextlib
+
+    import atlas.ui
+
+    started: list[dict[str, Any]] = []
+
+    @contextlib.contextmanager
+    def fake_ui(**kwargs):
+        started.append(kwargs)
+        yield None
+
+    async def fake_run_build(spec, out, app_dir, **kwargs):
+        return _write_run(tmp_path / "runs" / "r3")
+
+    monkeypatch.setattr(atlas.ui, "LiveWorkflowUI", fake_ui)
+    monkeypatch.setattr(cli, "run_build", fake_run_build)
+
+    code, _, _ = run_cli("build", "specs/example-app.md")  # not a terminal under pytest
+    assert code == 0 and started == []
+
+    code, _, _ = run_cli(
+        "build", "specs/example-app.md", "--ui", "--no-open", "--ui-port", "8765", "--ui-keep-open"
+    )
+    assert code == 0 and started == [
+        {"port": 8765, "open_browser": False, "keep_open": True}
+    ]
+
+    monkeypatch.setenv("CI", "")
+    tty = type("Tty", (), {"isatty": lambda self: True})()
+    monkeypatch.setattr("atlas.ui.server.sys.stderr", tty)
+    code, _, _ = run_cli("build", "specs/example-app.md", "--no-ui")
+    assert code == 0 and len(started) == 1
+
+
+def test_plan_ui_is_opt_in_only(run_cli, monkeypatch, tmp_path):
+    import contextlib
+
+    import atlas.ui
+
+    started: list[dict[str, Any]] = []
+
+    @contextlib.contextmanager
+    def fake_ui(**kwargs):
+        started.append(kwargs)
+        yield None
+
+    async def fake_run_plan(spec, out, config, **kwargs):
+        return _write_run(tmp_path / "runs" / "p1")
+
+    monkeypatch.setattr(atlas.ui, "LiveWorkflowUI", fake_ui)
+    monkeypatch.setattr(cli, "run_plan", fake_run_plan)
+    monkeypatch.setenv("CI", "")
+    tty = type("Tty", (), {"isatty": lambda self: True})()
+    monkeypatch.setattr("atlas.ui.server.sys.stderr", tty)
+
+    code, _, _ = run_cli("plan", "specs/example-app.md", "--no-clarify")
+    assert code == 0 and started == []
+
+    code, _, _ = run_cli("plan", "specs/example-app.md", "--no-clarify", "--ui", "--no-open")
+    assert code == 0 and started == [{"port": 0, "open_browser": False, "keep_open": False}]
+
+
+def test_quiet_build_with_ui_keeps_info_logs_for_the_browser(run_cli, monkeypatch, tmp_path):
+    import contextlib
+    import logging
+
+    import atlas.ui
+
+    levels: list[int] = []
+
+    @contextlib.contextmanager
+    def fake_ui(**kwargs):
+        levels.append(logging.getLogger("atlas").getEffectiveLevel())
+        yield None
+
+    async def fake_run_build(spec, out, app_dir, **kwargs):
+        return _write_run(tmp_path / "runs" / "r4")
+
+    monkeypatch.setattr(atlas.ui, "LiveWorkflowUI", fake_ui)
+    monkeypatch.setattr(cli, "run_build", fake_run_build)
+    code, _, _ = run_cli("build", "specs/example-app.md", "--ui", "-q")
+    assert code == 0 and levels == [logging.INFO]
+
+
+def test_ui_command_replays_newest_or_given_run(run_cli, monkeypatch, tmp_path):
+    import atlas.ui
+
+    seen: list[tuple[Path, int, bool]] = []
+    monkeypatch.setattr(
+        atlas.ui,
+        "serve_replay",
+        lambda run_dir, port=0, open_browser=True: seen.append((run_dir, port, open_browser)),
+    )
+    _write_run(tmp_path / "runs" / "20261101T000000Z-a")
+    _write_run(tmp_path / "runs" / "20261102T000000Z-b")
+
+    code, _, _ = run_cli("ui", "--runs-root", str(tmp_path / "runs"), "--no-open")
+    assert code == 0 and seen[-1] == (tmp_path / "runs" / "20261102T000000Z-b", 0, False)
+
+    code, _, _ = run_cli("ui", str(tmp_path / "runs" / "20261101T000000Z-a"), "--port", "9000")
+    assert code == 0 and seen[-1] == (tmp_path / "runs" / "20261101T000000Z-a", 9000, True)
+
+    code, _, err = run_cli("ui", str(tmp_path / "missing"))
+    assert code == 2 and "Run folder not found" in err
+
+
+def test_build_summary_prints_before_the_ui_is_kept_open(run_cli, monkeypatch, tmp_path, capsys):
+    import contextlib
+
+    import atlas.ui
+
+    printed_before_exit: list[bool] = []
+
+    @contextlib.contextmanager
+    def fake_ui(**kwargs):
+        yield None
+        printed_before_exit.append("Build status: verified" in capsys.readouterr().out)
+
+    async def fake_run_build(spec, out, app_dir, **kwargs):
+        return _write_run(tmp_path / "runs" / "r5")
+
+    monkeypatch.setattr(atlas.ui, "LiveWorkflowUI", fake_ui)
+    monkeypatch.setattr(cli, "run_build", fake_run_build)
+    code, _, _ = run_cli("build", "specs/example-app.md", "--ui", "--no-open", "--ui-keep-open")
+    assert code == 0 and printed_before_exit == [True]

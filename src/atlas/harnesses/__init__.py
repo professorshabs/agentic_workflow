@@ -64,6 +64,9 @@ async def run_doctor(
             needs_openrouter = True
         if cfg.get("fallback") == "router":
             needs_openrouter = True
+        for entry in cfg.get("rotate") or []:
+            if isinstance(entry, dict):
+                _collect_backend_deps(entry)
 
     if not backends:
         needs_openrouter = True

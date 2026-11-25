@@ -9,11 +9,12 @@
 
 | Topic | Decision | Status |
 | :--- | :--- | :--- |
-| Builder | **Local model only**, via Ollama or LM Studio, running inside the Antigravity Python SDK harness. No cloud builder: if no local model is ready, Atlas stops with setup instructions. | Confirmed |
-| Parser & researcher | Antigravity CLI `agy` (Gemini 4 Hydrogen / Gemini 4 Neon), structured JSON. If `agy` fails the Phase 0 spike, these stay on today's `ModelRouter`. | Confirmed, spike-gated |
-| Judge | Claude Code `claude`, Opus 5.5, **strictly read-only** (pre-build planning). | Implemented |
-| Post-build Supervisor | **Dual parallel panel:** Claude Opus (`claude_code`, read-only) + Gemini 4 Neon (`agy` with OpenRouter fallback), merging findings into one unified review + improvement plan sent to Fixer. | Implemented |
-| Fixer | **OpenRouter through `ModelRouter`**, alternating Claude Sonnet 5.5 and Gemini 4 Hydrogen between rounds (Hydrogen replaced OpenAI Sol 6.2 on 2026-11-25). **No Codex.** | Confirmed |
+| Builder | **Local-first 12B (`google/gemma-4-12b-qat` / `gemma4:12b`)** via Ollama or LM Studio inside the Antigravity Python SDK harness, with ordered **offload** to Claude Sonnet (`claude_code`, subscription, file-only `acceptEdits`), Gemini 4 Hydrogen (`agy`), and OpenRouter only on error. | Implemented |
+| Parser & researcher | Antigravity CLI `agy` (Gemini 4 Hydrogen / Gemini 4 Neon, fallback OpenRouter), structured JSON. If `agy` fails, falls back to `ModelRouter`. | Confirmed |
+| Judge | Claude Code `claude`, Opus 5.5, **strictly read-only** (pre-build planning, fallback OpenRouter). | Implemented |
+| E2E contract | Claude Code `claude`, Sonnet (`--effort high`), **strictly read-only** (pre-build black-box E2E tests, fallback OpenRouter). | Implemented |
+| Post-build Supervisor | **Dual parallel panel:** Claude Opus (`claude_code`, read-only, fallback OpenRouter) + Gemini 4 Neon (`agy`, fallback OpenRouter), merging findings into one unified review + improvement plan sent to Fixer. | Implemented |
+| Fixer | **Read-only Claude Code (`sonnet`, `--tools ""`, subscription) ↔ Antigravity CLI (`agy`, `gemini-4-hydrogen-high`)**, alternating between rounds, falling back to OpenRouter only on harness error. **No Codex.** | Implemented |
 | Verifier | Atlas `verify_app` + `spec-coverage`, credential-scrubbed, no model. Unchanged. | Confirmed |
 | Framework vs products | **Atlas is the framework; each product in `app/<spec-name>/` stands on its own.** Products are built and tested on your Mac, with **their own tests** that `verify_app` runs. GitHub CI, when you add it, tests only the Atlas framework. Deploying a product is a separate, later step (section 9). | Confirmed |
 | Interactive `atlas` chat | Deferred. `atlas run <spec.md>` alias kept as a small step. | Deferred |
@@ -27,7 +28,7 @@
 Today every pipeline role is one API request through `ModelRouter` (LiteLLM), so the builder has to return the whole codebase in a single JSON reply (`GeneratedApp`). This plan turns Atlas into a **hybrid harness orchestrator**:
 
 1. **Local-first builder:** a local model edits files directly in an isolated workspace, through the Antigravity SDK (`LocalOpenAIAgentConfig(...).lightweight()`), with Ollama (`localhost:11434`) or LM Studio (`localhost:1234`) serving the model.
-2. **Structured stages in harnesses:** parse and research through `agy`; judge through read-only Claude Code. They still return validated Pydantic objects.
+2. **Structured stages in harnesses:** parse and research through `agy`; judge, E2E contract, and fixer (alternating with `agy`) through read-only Claude Code. They still return validated Pydantic objects.
 3. **Independent, sequential fixing:** OpenRouter fixes failed checks, a different model each round, never at the same time as another stage.
 4. **Atlas stays the gatekeeper:** `verify_app` + `spec-coverage` decide pass or fail. No harness can mark its own work as done.
 5. **Honest accounting:** every call is recorded with where its cost came from (reported, estimated, subscription, local, unavailable). Unknown cost is never shown as $0.
@@ -43,11 +44,11 @@ Today every pipeline role is one API request through `ModelRouter` (LiteLLM), so
 | :--- | :--- | :--- | :--- |
 | **Parser** | Antigravity CLI `agy` | `gemini-4-hydrogen-high` | `agy -p … --output-format json --json-schema <ParsedSpec>`; validated by Pydantic. |
 | **Researcher** | Antigravity CLI `agy` | `gemini-4-neon-high` | Per requirement, `--json-schema <ResearchNote>` + `--disable-slash-commands`; emits `Evidence`, `clarifying_questions` (interactive/prefilled before Judge & Build), and `e2e_scenarios`. Parallel harness processes limited to 2–3 (`420s` timeout, `24K` fallback cap). |
-| **Judge** | Claude Code `claude` (read-only) | Claude Opus 5.5 | Per requirement: `ResearchReport` → decision; `--json-schema`, no tools, `--max-budget-usd`. Interim option before `claude` is on `PATH`: `agy` with `claude-opus-5-5-high`. |
-| **E2E (`e2e`)** | Antigravity CLI `agy` (fallback OpenRouter) | `gemini-4-neon-high` | Pre-build `generate_e2e_tests` (`--e2e-tests` / `require_e2e_tests: true`); compact prompt (omits raw findings & rejected candidates when `Plan` exists), single-turn `--disable-slash-commands`, `600s` timeout / `32K` fallback cap; locks down black-box `tests/` files (`e2e-product-tests`). |
-| **Supervisor** *(post-build dual panel)* | Parallel `reviewers`: Claude Code (`claude`, read-only) + Antigravity CLI `agy` (fallback OpenRouter) | Claude Opus 5.5 + Gemini 4 Neon | After green checks, both inspect the built app against the spec independently (`unanimous` mode by default). Verdicts merge into one unified `Review` (`issues` + `improvement_plan` in `supervisor_review.json`); any flagged issues go sequentially to the Fixer. |
-| **Builder** | Antigravity Python SDK `LocalOpenAIAgentConfig(model, base_url).lightweight()` | Auto-discovered local Gemma 4 (`google/gemma-4-26b-a4b-qat` / `gemma-4-26b-a4b-it-qat-mlx-4bit` on LM Studio, else `gemma4:12b-mlx` / `gemma4:12b` on Ollama) passing section 5 checks | Edits files in an isolated workspace → `WorkspaceBuildResult` (diff + snapshot). **Local only; fails clearly if no model is ready.** |
-| **Fixer** | OpenRouter via `ModelRouter` | Round 1, 3, …: Claude Sonnet 5.5. Round 2, 4, …: Gemini 4 Hydrogen | Runs only when verification fails; returns `PatchResult` (full replacement files), applied through `materialize_files` path checks. Each round gets the previous round's diagnosis and the `writing-clean-code` skill. |
+| **Judge** | Claude Code `claude` (read-only, fallback OpenRouter) | Claude Opus 5.5 | Per requirement: `ResearchReport` → decision; `--json-schema`, no tools, `--max-budget-usd`; falls back to OpenRouter (`openrouter/anthropic/claude-opus-5.5`) only if `claude` errors. |
+| **E2E (`e2e`)** | Claude Code `claude` (read-only, fallback OpenRouter) | `sonnet` (`--effort high`) | Pre-build `generate_e2e_tests` (`--e2e-tests` / `require_e2e_tests: true`); compact prompt (omits raw findings & rejected candidates when `Plan` exists), `--tools ""`, `--max-budget-usd 2.00`, `600s` timeout, fallback to OpenRouter (`openrouter/anthropic/claude-sonnet-5.5`) only on error; locks down black-box `tests/` files (`e2e-product-tests`). |
+| **Supervisor** *(post-build dual panel)* | Parallel `reviewers`: Claude Code (`claude`, read-only, fallback OpenRouter) + Antigravity CLI `agy` (fallback OpenRouter) | Claude Opus 5.5 + Gemini 4 Neon | After green checks, both inspect the built app against the spec independently (`unanimous` mode by default). Verdicts merge into one unified `Review` (`issues` + `improvement_plan` in `supervisor_review.json`); any flagged issues go sequentially to the Fixer. |
+| **Builder** | Antigravity Python SDK (`lightweight()`) → ordered `offload` (`claude_code` → `agy` → `openrouter`) | Auto-discovered local Gemma 4 12B (`google/gemma-4-12b-qat` on LM Studio, `gemma4:12b-mlx` / `gemma4:12b` on Ollama; `only_preferred`, `max_parameter_size_b: 14`, `min_context_tokens: 49152`), handing off on stall/error/empty build to Claude Sonnet (`claude_code`, subscription, `acceptEdits`, file-only tools), then Gemini 4 Hydrogen (`agy`), then OpenRouter only on harness error | Edits files in an isolated workspace → `WorkspaceBuildResult` (diff + snapshot); reads short `BUILD_BRIEF.md` first, records `local_model` or `build_offloaded_to` / `build_offload_harness`. |
+| **Fixer** | Claude Code (`claude`, read-only) ↔ Antigravity CLI (`agy`) (fallback OpenRouter) | Round 1, 3, …: `claude_code` (`sonnet`, `--tools ""`). Round 2, 4, …: `agy` (`gemini-4-hydrogen-high`). OpenRouter (`claude-sonnet-5.5` / `gemini-4-hydrogen`) only on error | Runs only when verification fails; returns `PatchResult` (full replacement files), applied through `materialize_files` path checks. Each round gets the previous round's diagnosis and the `writing-clean-code` skill. |
 | **Verifier** | Atlas built-in `verify_app` | none | Runs the **product's own tests** (pytest / `npm test`) plus compile, lint and build checks, `spec-coverage` and the product contract (section 4.1); credential-scrubbed (`_verification_env`). |
 
 ### Verified local laptop audit (checked on the Mac, 2026-11-23)
@@ -57,7 +58,7 @@ Today every pipeline role is one API request through `ModelRouter` (LiteLLM), so
 - **Ollama:** installed at `/opt/homebrew/bin/ollama`; a `gemma4` model is downloaded; daemon was stopped (`ollama serve` needed).
 - **LM Studio:** not installed (`lms` not on `PATH`, no `~/.lmstudio`). Discovery still probes `http://localhost:1234/v1/models` if you start it later.
 - **Claude Code:** `Claude.app` installed with an embedded binary (`~/Library/Application Support/Claude/claude-code-vm/2.1.330/claude`); standalone `claude` not on `PATH` yet → `npm install -g @anthropic-ai/claude-code`.
-- **Codex:** not installed and **not needed** (fixer is OpenRouter). `ChatGPT.app` and `~/.codex/auth.json` exist, but ChatGPT Free only includes limited trial access to Codex.
+- **Codex:** not installed and **not needed** (fixer rotates `claude_code` and `agy`, with OpenRouter only on error). `ChatGPT.app` and `~/.codex/auth.json` exist, but ChatGPT Free only includes limited trial access to Codex.
 - **`.env`:** `ANTHROPIC_API_KEY` is empty, so Claude Code will use your subscription login (see section 8).
 
 ---
@@ -72,13 +73,13 @@ flowchart TD
     Parse --> Research["Research per requirement: agy Gemini 4 Neon (findings, clarifying_questions, e2e_scenarios)"]
     Research --> Clarify["Clarifying Questions (TTY / --answers -> clarifications.json + spec.assumptions)"]
     Clarify --> Judge["Judge per requirement: Claude Code Opus 5.5, read-only -> Plan"]
-    Judge --> E2E["Pre-build E2E Tests: black-box contract / verifiable flag -> e2e_tests.json"]
+    Judge --> E2E["Pre-build E2E Tests: Claude Code Sonnet (--effort high, read-only) -> e2e_tests.json"]
     E2E --> Ready{"Local model ready? explicit model or discovery + memory, context, tool smoke check"}
     Ready -- "no" --> Stop["Stop with setup instructions (no cloud builder)"]
     Ready -- "yes" --> Builder["Builder: Antigravity SDK (pre-seeded PLAN.md + tests/ + progressive skill index + lean prompt)"]
     Builder --> Snapshot["WorkspaceBuildResult + authoritative E2E test check -> runs/run_id/build.json"]
     Snapshot --> Verify["Atlas verify_app + spec-coverage + product-contract + e2e-product-tests (credential-scrubbed)"]
-    Verify -- "fail, rounds left" --> Fixer["Fixer: OpenRouter, Sonnet 5.5 / Hydrogen alternating -> PatchResult"]
+    Verify -- "fail, rounds left" --> Fixer["Fixer: claude_code Sonnet / agy Hydrogen (fallback OpenRouter) -> PatchResult"]
     Fixer --> Verify
     Verify -- "pass" --> Review{"Supervisor enabled? (default: true)"}
     Review -- "yes" --> Supervisor["Parallel Dual Supervisor: Opus (claude_code) + Gemini 4 Neon (agy / OpenRouter)"]
@@ -101,7 +102,7 @@ Today `build_app` ([`src/atlas/pipeline/build.py`](../src/atlas/pipeline/build.p
   2. Pre-seed `PLAN.md`, authoritative `tests/` E2E test files, and allowlisted `.agents/skills/` symlinks **before** launching the local Builder so the local model reads them from disk and can test against the E2E suite as it builds.
   3. Pass a lean local prompt (`max_prompt_chars`, compact spec requirements, `PLAN.md` / `tests/` paths, and progressive skill index via `format_role_skill_index` when `discovery_mode: progressive`) to protect smaller local context windows.
   4. After the harness exits, re-materialize authoritative E2E test files (`verifiable: true` only; explicit `unverifiable_reason` otherwise), capture `WorkspaceBuildResult`, reject escaping paths or git changes outside `app/<spec-name>/`, and save `runs/<run-id>/build.json`.
-  5. Run `verify_app` + `spec-coverage` + `product-contract` + `e2e-product-tests` -> sequential OpenRouter `fix_app` (`PatchResult`) -> Dual Post-Build Supervisor (`opus` + `neon`).
+  5. Run `verify_app` + `spec-coverage` + `product-contract` + `e2e-product-tests` -> sequential harness `fix_app` (`claude_code` ↔ `agy`, fallback OpenRouter, `PatchResult`) -> Dual Post-Build Supervisor (`opus` + `neon`).
 - **Dependency installs stay in Atlas:** `verify_app` already installs dependencies (temporary venv / `npm install`), so the builder does not need network access.
 - `GeneratedApp` stays for any `ModelRouter`-based build (tests, future cloud mode).
 
@@ -170,32 +171,34 @@ config = LocalOpenAIAgentConfig(
 
 ## 6. Structured stages through harnesses
 
-### 6.1 Antigravity CLI (`agy`): parser, researcher, and E2E tests
+### 6.1 Antigravity CLI (`agy`): parser and researcher
 
 - **Call:** `agy -p "<prompt>" --model <id> --sandbox --disable-slash-commands --output-format json --json-schema <schema> --print-timeout <Ns>`.
-- **Single-turn / read-only guard:** Structured calls with `cwd is None` (`parser`, `researcher`, `e2e`) prepend a strict single-turn no-tool constraint so `agy` answers with the JSON object directly instead of starting multi-turn tool loops inside an empty temp dir and hitting `--print-timeout`. Supervisor review (`cwd` set) switches to a strictly read-only inspection constraint.
+- **Single-turn / read-only guard:** Structured calls with `cwd is None` (`parser`, `researcher`, `fixer`) prepend a strict single-turn no-tool constraint so `agy` answers with the JSON object directly instead of starting multi-turn tool loops inside an empty temp dir and hitting `--print-timeout`. Supervisor review (`cwd` set) switches to a strictly read-only inspection constraint.
 - **Read the JSON envelope & deduplicated errors:** `status`, `response`, `structured_output`, `error`, `duration_seconds`, `num_turns`, `usage` (input, output, thinking, cache-read, total tokens). Non-zero exits parse `AGY_ERROR:` JSON (`short_error` + `status`) and deduplicate repeated timeout lines before surfacing `HarnessError`. It reports **no cost and no model field**, so record the requested model.
 - **Check `status == "SUCCESS"`, not only the exit code:** `agy` exits `0` even when permission requests were soft-denied.
 - **Always pass `--print-timeout`:** without it a run has no time limit.
 - **Known risk:** `agy -p` has had a bug where it prints nothing when stdout is not a terminal, which is exactly how Atlas calls it. Phase 0 tests this. If it fails: run `agy` under a pseudo-terminal, or keep parse and research on `ModelRouter` (works today). Gemini CLI also has a documented headless JSON mode, if it is available on your account.
 
-### 6.2 Claude Code (`claude`) & Dual Post-Build Supervisor (Opus + Gemini 4 Neon)
+### 6.2 Claude Code (`claude`): Read-Only Judge/E2E/Fixer/Supervisor & File-Only Builder Offload
 
-- **Judge (`claude`):** `claude -p "<prompt>" --model opus --output-format json --json-schema <schema> --tools "" --max-budget-usd 1.50`.
+- **Judge (`claude`):** `claude -p --model opus --output-format json --json-schema <schema> --tools "" --max-budget-usd 1.50` (strictly zero tools).
+- **E2E contract (`claude`):** `claude -p --model sonnet --effort high --output-format json --json-schema <E2ETestSuite> --tools "" --max-budget-usd 2.00` (`read_only: true`, `auth: subscription`, `timeout_seconds: 600`), falling back to `openrouter/anthropic/claude-sonnet-5.5` only if `claude` errors.
 - **Dual Post-Build Supervisor (`supervise_app`):** runs `backends.supervisor.reviewers` in parallel (`asyncio.gather`) after deterministic checks pass:
-  - **`opus` reviewer:** `claude -p "<prompt>" --model opus --output-format json --json-schema <SupervisorOutput> --tools Read,Grep,Glob --max-budget-usd 1.50` with working directory `app/<spec-name>/` (inspects files read-only; no write/shell tools).
+  - **`opus` reviewer:** `claude -p --model opus --output-format json --json-schema <SupervisorOutput> --tools Read,Grep,Glob --max-budget-usd 1.50` with working directory `app/<spec-name>/` (inspects files read-only; no write/shell tools).
   - **`neon` reviewer:** `agy -p "<prompt>" --model gemini-4-neon-high --output-format json --json-schema <SupervisorOutput> --sandbox --print-timeout 300s` (with `fallback: router` to `openrouter/google/gemini-4-neon`), receiving the spec, checks, and `current_files` snapshot.
   - **Unified merge (`merge_supervisor_reviews`):** combines both `ReviewerVerdict` records into one `Review` saved to `runs/<run-id>/supervisor_review.json` (with `unanimous` approval required by default), deduplicating tagged `issues` and building a single ordered `improvement_plan` (`src/atlas/prompts/supervisor.md`) that feeds straight into `fix_app` if either reviewer requests changes.
-- **Never use `--dangerously-skip-permissions`.** No write or shell tools.
+- **Builder Offload (`claude_code`):** when local 12B cannot finish a build (before handing off to Hydrogen via `agy`), `ClaudeCodeAdapter.run_workspace_task` runs `claude -p --model sonnet --output-format json --permission-mode acceptEdits --restricted --tools Read,Grep,Glob,Edit,Write --no-session-persistence --max-budget-usd 5` with `cwd=app/<spec-name>/` and prompt on `stdin` (`--restricted` confines file tools to `app/<spec-name>/`; subscription billing guard strips `ANTHROPIC_API_KEY`; `Bash` and web tools are omitted). Restricted strictly to `role == "builder"`.
+- **Never use `--dangerously-skip-permissions`.**
 - **Reads `structured_output`** (schema-checked) plus `total_cost_usd`, `usage` and `modelUsage` (per model, includes subagents).
 - **Pass tool rules on the command line:** Claude Code ignores a project's `.claude/settings.json` allow rules until the workspace trust prompt is accepted, so never rely on that file.
-- Use `--max-budget-usd` as the spending cap; `--max-turns` is not listed in Claude Code 2.1.330's `--help`.
+- Use `--max-budget-usd` as the spending cap; `--max-turns` is not listed in Claude Code `--help`.
 
 ---
 
-## 7. Fixer: OpenRouter, alternating models
+## 7. Fixer: alternating `claude_code` and `agy` (OpenRouter on error)
 
-- `ModelRouter` (OpenRouter) keeps the fixer. Round 1, 3, …: `openrouter/anthropic/claude-sonnet-5.5`; round 2, 4, …: `openrouter/google/gemini-4-hydrogen`.
+- **Harness-first rotation:** Round 1, 3, …: read-only `claude_code` (`sonnet`, `--tools ""`, subscription, fallback `openrouter/anthropic/claude-sonnet-5.5`). Round 2, 4, …: `agy` (`gemini-4-hydrogen-high`, fallback `openrouter/google/gemini-4-hydrogen`). OpenRouter runs only if the active harness errors.
 - **Sequential only:** the fixer never runs while the builder, judge or supervisor is running.
 - **Input:** the spec's requirements, failing checks (stdout/stderr tails), a snapshot of current files, the previous round's diagnosis, and the `writing-clean-code` skill text.
 - **Output:** `PatchResult` (full replacement files or deletions), applied through `materialize_files` with the existing path checks.
@@ -346,8 +349,12 @@ backends:
 
   e2e:
     type: harness
-    provider: antigravity
-    model: gemini-4-neon-high
+    provider: claude_code
+    model: sonnet
+    effort: high
+    read_only: true
+    auth: subscription
+    max_budget_usd: 2.00
     timeout_seconds: 600
     fallback: router
 
@@ -497,10 +504,12 @@ These are **framework** tests in `tests/`: offline, mocked models, never a real 
 - `tests/test_telemetry.py`: provider usage/cost extraction, cached/missing values, summaries, ledger totals and token-budget enforcement.
 - `tests/test_render.py`: report tables and verified, failed and error status rendering.
 - `tests/test_skills.py`: only the 3 allowlisted skills load (12 dbt skills and `structuring-project-folders` excluded); role scoping; `.agents/skills/` symlinks.
+- `tests/test_local_12b_offload.py`: Gemma 4 12B selection (`<= 14B`, runtime loaded-context check, OOM/JIT context diagnostics), SDK stall guard, `BUILD_BRIEF.md` generation, and ordered offload (`claude_code` Sonnet with file-only `acceptEdits` → `antigravity` Hydrogen + `attempt` UI events, plus explicit `openrouter` fallback).
+- `tests/test_ui_events.py` & `tests/test_ui_server.py`: `RunEventBus`, `events.jsonl` persistence/replay, legacy artifact synthesis, `UILogHandler`, SSE streaming + `Last-Event-ID`, Host/Origin CSRF guards, artifact redaction, workspace change events, and `LiveWorkflowUI` lifecycle.
 - `tests/test_workflows.py`: workflow YAML/shell syntax and static workflow guards/structure. These are Atlas framework workflow tests; they do not run generated product builds on GitHub.
 - Later: `tests/test_chat_cli.py` with the chat feature.
 
-**Current run (2026-11-25):** 242 passed, 1 skipped (offline suite); `ruff check` and `mypy src` are clean. Live `atlas doctor` and `atlas detect-local` verified on the M5 MacBook (`agy` 1.5.15 cached login, `claude` 2.1.325 subscription, `google-antigravity` 0.1.24, LM Studio `google/gemma-4-26b-a4b-qat`). Full live end-to-end build through local Gemma 4 + Dual Supervisor remains to be run.
+**Updated 2026-11-25:** shipped Gemma 4 12B local-first offload (`claude_code` Sonnet, subscription → `agy` Hydrogen → OpenRouter last resort) and the live/replay Workflow UI (`atlas ui`, `atlas run/build`, `atlas plan --ui`). Live `atlas doctor` and `atlas detect-local` verified on the M5 MacBook (`agy` 1.5.15 cached login, `claude` 2.1.325 subscription, `google-antigravity` 0.1.24). Full live end-to-end build through local Gemma 4 + offload + Dual Supervisor remains to be run.
 
 ---
 

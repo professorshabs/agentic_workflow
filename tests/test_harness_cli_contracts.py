@@ -238,6 +238,28 @@ async def test_claude_tokens_include_cache_reads_and_writes(monkeypatch, tmp_pat
     assert json.loads(record.read_text())["stdin"].endswith("USER REQUEST:\nScore it.")
 
 
+async def test_claude_effort_flag_and_validation(monkeypatch, tmp_path):
+    binary, record = _fake_claude(tmp_path)
+    _use_binary(monkeypatch, "claude_code", binary)
+
+    await ClaudeCodeAdapter().run_structured(
+        role="e2e",
+        model="sonnet",
+        effort="high",
+        system="Spec.",
+        user="Generate tests.",
+        auth="subscription",
+    )
+    args = json.loads(record.read_text())["args"]
+    assert args[args.index("--model") + 1] == "sonnet"
+    assert args[args.index("--effort") + 1] == "high"
+
+    with pytest.raises(ValueError, match="Unsupported Claude Code effort level"):
+        await ClaudeCodeAdapter().run_structured(
+            role="e2e", model="sonnet", effort="turbo", system="s", user="u"
+        )
+
+
 async def test_claude_sums_every_billed_model(monkeypatch, tmp_path):
     envelope = json.loads(json.dumps(CLAUDE_SUCCESS))
     envelope["modelUsage"]["claude-haiku-5-5"] = {
@@ -928,3 +950,55 @@ async def test_doctor_reports_signed_out_harness_and_missing_sdk(monkeypatch, tm
     assert by_provider["local_model_daemon"]["ready"] is False
     with pytest.raises(ValueError, match="Unsupported harness provider"):
         get_harness_adapter("codex")
+
+
+async def test_claude_workspace_task_enforces_builder_role_and_captures_diff(monkeypatch, tmp_path):
+    with pytest.raises(ValueError, match="only permitted for role 'builder'"):
+        await ClaudeCodeAdapter().run_workspace_task(
+            role="judge", model="sonnet", prompt_text="Build.", app_dir=tmp_path
+        )
+
+    record = tmp_path / "claude-ws.json"
+    app_dir = tmp_path / "app" / "demo"
+    app_dir.mkdir(parents=True)
+    script = f"""
+import json, pathlib, sys
+args = sys.argv[1:]
+if args == ["--version"]:
+    print("2.1.331 (Claude Code)")
+    sys.exit(0)
+stdin = sys.stdin.read()
+pathlib.Path({str(record)!r}).write_text(json.dumps({{"args": args, "stdin": stdin}}))
+pathlib.Path("app.py").write_text("x = 1\\n", encoding="utf-8")
+print({json.dumps(json.dumps(CLAUDE_SUCCESS))})
+"""
+    binary = _write_cli(tmp_path / "claude", script)
+    _use_binary(monkeypatch, "claude_code", binary)
+
+    build, call = await ClaudeCodeAdapter().run_workspace_task(
+        role="builder",
+        model="sonnet",
+        prompt_text="Write app.py",
+        app_dir=app_dir,
+        auth="subscription",
+        max_budget_usd=3.0,
+    )
+    assert build.created_files == ["app.py"]
+    assert call.harness == "claude_code" and call.auth_mode == "subscription"
+    args = json.loads(record.read_text())["args"]
+    assert args[args.index("--permission-mode") + 1] == "acceptEdits"
+    assert args[args.index("--tools") + 1] == "Read,Grep,Glob,Edit,Write"
+    assert "--restricted" in args
+    assert "--allowedTools" not in args
+    assert "--no-session-persistence" in args
+    assert "--dangerously-skip-permissions" not in args
+
+    await ClaudeCodeAdapter().run_workspace_task(
+        role="builder",
+        model="sonnet",
+        prompt_text="Write app.py",
+        app_dir=app_dir,
+        sandbox=False,
+    )
+    unsandboxed_args = json.loads(record.read_text())["args"]
+    assert "--restricted" not in unsandboxed_args

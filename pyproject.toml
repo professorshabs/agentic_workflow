@@ -32,7 +32,7 @@ atlas = "atlas.cli:main"
 where = ["src"]
 
 [tool.setuptools.package-data]
-atlas = ["prompts/*.md"]
+atlas = ["prompts/*.md", "ui/static/*"]
 
 [tool.pytest.ini_options]
 asyncio_mode = "auto"

@@ -71,6 +71,7 @@ CASES: list[tuple[str, Any, str]] = [
     ("skills.by_role", ["x"], "skills.by_role must be a mapping"),
     ("skills.by_role.builder", "x", r"by_role\['builder'\] must be a list"),
     ("skills.by_role.builder", ["not-allowlisted"], "non-allowlisted skill"),
+    ("backends.e2e.effort", "turbo", "effort must be one of"),
 ]
 
 

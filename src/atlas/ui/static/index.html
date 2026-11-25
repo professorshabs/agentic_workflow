@@ -1,0 +1,1374 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<meta name="color-scheme" content="light dark">
+<title>Atlas run</title>
+<style>
+:root {
+  --paper: #E6ECE7;
+  --panel: #F5F8F4;
+  --ink: #15222C;
+  --ink-2: #52626B;
+  --rule: #C9D3CC;
+  --route: #1D6A8A;
+  --ok: #2B7848;
+  --warn: #A86E12;
+  --bad: #B03A29;
+  --reuse: #23807A;
+  --idle: #B3BFB8;
+  --halo: rgba(29, 106, 138, 0.22);
+  --grid: rgba(21, 34, 44, 0.045);
+  --chip-bg: rgba(29, 106, 138, 0.09);
+  --font: "Avenir Next", Avenir, "Segoe UI", "Helvetica Neue", Arial, sans-serif;
+  --mono: "SF Mono", ui-monospace, Menlo, Consolas, monospace;
+  --log-height: clamp(180px, 30vh, 420px);
+}
+:root[data-theme="dark"] {
+  --paper: #0E161B; --panel: #14202A; --ink: #E1E9E4; --ink-2: #94A49F; --rule: #26353E;
+  --route: #5AAACA; --ok: #5DB57E; --warn: #E0A63A; --bad: #E66A54; --reuse: #4DB5AC;
+  --idle: #34444D; --halo: rgba(90, 170, 202, 0.25); --grid: rgba(225, 233, 228, 0.04);
+  --chip-bg: rgba(90, 170, 202, 0.14);
+}
+@media (prefers-color-scheme: dark) {
+  :root:not([data-theme="light"]) {
+    --paper: #0E161B; --panel: #14202A; --ink: #E1E9E4; --ink-2: #94A49F; --rule: #26353E;
+    --route: #5AAACA; --ok: #5DB57E; --warn: #E0A63A; --bad: #E66A54; --reuse: #4DB5AC;
+    --idle: #34444D; --halo: rgba(90, 170, 202, 0.25); --grid: rgba(225, 233, 228, 0.04);
+    --chip-bg: rgba(90, 170, 202, 0.14);
+  }
+}
+* { box-sizing: border-box; }
+html, body { margin: 0; height: 100%; }
+body {
+  background: var(--paper); color: var(--ink); font-family: var(--font);
+  font-size: 14px; line-height: 1.45; display: grid;
+  grid-template-rows: auto minmax(0, 1fr) var(--log-height);
+}
+body.logs-collapsed { grid-template-rows: auto minmax(0, 1fr) auto; }
+button, select, input { font: inherit; color: inherit; }
+:focus-visible { outline: 2px solid var(--route); outline-offset: 2px; }
+.hidden { display: none !important; }
+
+/* masthead */
+.masthead {
+  display: grid; grid-template-columns: auto minmax(0, 1fr) auto; gap: 6px 28px;
+  align-items: center; padding: 12px 24px 14px; border-bottom: 1px solid var(--rule);
+  background: var(--panel);
+}
+.brand { display: flex; align-items: center; gap: 10px; grid-row: span 2; align-self: start; }
+.brand svg { width: 34px; height: 34px; color: var(--route); }
+.ident h1 { margin: 0; font-size: 20px; font-weight: 600; letter-spacing: -0.01em; }
+.ident p { margin: 0; color: var(--ink-2); font-size: 12.5px; }
+.ident p span + span { margin-left: 14px; }
+.activity { grid-column: 2; margin: 0; font-size: 16px; display: flex; align-items: baseline; gap: 9px; }
+.activity .dot { width: 9px; height: 9px; border-radius: 50%; background: var(--idle); flex: none; transform: translateY(-1px); }
+.activity[data-state="running"] .dot { background: var(--route); box-shadow: 0 0 0 4px var(--halo); }
+.activity[data-state="waiting_input"] .dot { background: var(--warn); }
+.activity[data-state="passed"] .dot { background: var(--ok); }
+.activity[data-state="failed"] .dot, .activity[data-state="cancelled"] .dot { background: var(--bad); }
+.side { grid-column: 3; grid-row: 1 / span 2; display: flex; flex-direction: column; align-items: flex-end; gap: 7px; }
+.stats { display: flex; gap: 20px; margin: 0; }
+.stats div { min-width: 60px; }
+.stats dt { color: var(--ink-2); font-size: 11.5px; }
+.stats dd { margin: 0; font-size: 17px; font-variant-numeric: tabular-nums; font-weight: 500; }
+.stats dd small { display: block; font-size: 11px; color: var(--ink-2); font-weight: 400; }
+.conn { display: flex; align-items: center; gap: 8px; color: var(--ink-2); font-size: 12px; }
+.conn .pill-badge {
+  display: inline-flex; align-items: center; gap: 5px;
+  padding: 2px 8px; border-radius: 999px; border: 1px solid var(--rule);
+  background: var(--paper); font-weight: 500; color: var(--ink);
+}
+.conn .pill-badge::before {
+  content: ""; width: 7px; height: 7px; border-radius: 50%; background: var(--idle);
+}
+.conn .pill-badge[data-live="live"]::before { background: var(--ok); box-shadow: 0 0 0 3px var(--halo); }
+.conn .pill-badge[data-live="replay"]::before { background: var(--reuse); }
+.conn .pill-badge[data-live="snapshot"]::before { background: var(--ink-2); }
+.conn .pill-badge[data-live="warn"]::before { background: var(--warn); }
+.conn button {
+  background: none; border: 1px solid var(--rule); border-radius: 6px;
+  padding: 2px 9px; cursor: pointer; font-size: 12px;
+}
+.conn button:hover { background: var(--paper); }
+
+/* main */
+.layout {
+  display: grid;
+  grid-template-columns: minmax(0, 1fr);
+  grid-template-rows: auto minmax(0, 1fr);
+  min-height: 0;
+}
+.route {
+  overflow-x: hidden;
+  overflow-y: auto;
+  max-height: 38vh;
+  border-bottom: 1px solid var(--rule);
+  padding: 10px 18px 12px;
+  background-image:
+    linear-gradient(var(--grid) 1px, transparent 1px),
+    linear-gradient(90deg, var(--grid) 1px, transparent 1px);
+  background-size: 48px 48px;
+}
+.route-head {
+  display: flex;
+  align-items: center;
+  gap: 12px;
+  padding: 0 2px 8px;
+  font-size: 12px;
+  color: var(--ink-2);
+  font-variant-numeric: tabular-nums;
+}
+.route-head .meter { flex: 1; max-width: 300px; margin: 0; }
+.route > ol {
+  list-style: none;
+  margin: 0;
+  padding: 8px 2px 2px;
+  display: flex;
+  flex-direction: row;
+  align-items: stretch;
+  overflow-x: auto;
+  overscroll-behavior-x: contain;
+  scrollbar-width: thin;
+}
+.station {
+  position: relative;
+  display: flex;
+  flex: 1 0 112px;
+  min-width: 0;
+  max-width: 190px;
+}
+.station[data-stage="e2e_tests"] { flex-basis: 122px; }
+.station[data-stage="build"] {
+  flex: 1.4 0 168px;
+  max-width: 245px;
+}
+.station[data-stage="verify"],
+.station[data-stage="supervisor"] {
+  flex: 1.15 0 132px;
+  max-width: 215px;
+}
+.station > button {
+  display: flex;
+  flex-direction: column;
+  align-items: stretch;
+  width: 100%;
+  text-align: left;
+  background: none;
+  border: 0;
+  padding: 0;
+  cursor: pointer;
+  border-radius: 10px;
+}
+.station > button:hover .body, .station.selected .body { background: var(--panel); }
+.station.selected .body { box-shadow: inset 0 3px 0 var(--route); }
+.track { position: relative; height: 54px; width: 100%; flex: none; }
+.track::before, .track::after {
+  content: "";
+  position: absolute;
+  top: 17px;
+  height: 6px;
+  background: var(--seg-color, var(--idle));
+}
+.track::before { left: 0; right: calc(50% + 15px); background: var(--above, var(--idle)); }
+.track::after { left: calc(50% + 15px); right: 0; background: var(--below, var(--idle)); }
+.station:first-child .track::before, .station:last-child .track::after { display: none; }
+.marker {
+  position: absolute;
+  left: 50%;
+  top: 4px;
+  transform: translateX(-50%);
+  width: 32px;
+  height: 32px;
+  overflow: visible;
+}
+.marker .ring { fill: var(--panel); stroke: var(--idle); stroke-width: 3; }
+.marker .glyph { fill: none; stroke: var(--ink-2); stroke-width: 1.7; stroke-linecap: round; stroke-linejoin: round; }
+.marker .badge { display: none; }
+.marker .badge circle { stroke: var(--panel); stroke-width: 2; }
+.marker .badge path { fill: none; stroke: #fff; stroke-width: 1.8; stroke-linecap: round; stroke-linejoin: round; }
+[data-status="running"] .marker .ring { stroke: var(--route); fill: var(--route); }
+[data-status="running"] .marker .glyph { stroke: #fff; }
+[data-status="running"] .marker .halo { animation: halo 1.8s ease-out infinite; }
+.marker .halo { fill: none; stroke: var(--route); stroke-width: 2; opacity: 0; transform-origin: 16px 16px; }
+@keyframes halo { 0% { opacity: .7; transform: scale(1); } 100% { opacity: 0; transform: scale(1.75); } }
+[data-status="passed"] .marker .ring { stroke: var(--ok); }
+[data-status="passed"] .marker .glyph { stroke: var(--ok); }
+[data-status="reused"] .marker .ring { stroke: var(--reuse); }
+[data-status="reused"] .marker .glyph { stroke: var(--reuse); }
+[data-status="skipped"] .marker .ring { stroke-dasharray: 4 3.5; }
+[data-status="skipped"] .marker .glyph { opacity: .55; }
+[data-status="waiting_input"] .marker .ring { stroke: var(--warn); fill: var(--panel); }
+[data-status="waiting_input"] .marker .glyph { stroke: var(--warn); }
+[data-status="waiting_input"] .marker .halo { stroke: var(--warn); animation: halo 1.4s ease-out infinite; }
+[data-status="partial"] .marker .ring, [data-status="unverifiable"] .marker .ring { stroke: var(--warn); }
+[data-status="partial"] .marker .glyph, [data-status="unverifiable"] .marker .glyph { stroke: var(--warn); }
+[data-status="failed"] .marker .ring { stroke: var(--bad); }
+[data-status="failed"] .marker .glyph { stroke: var(--bad); }
+[data-status="cancelled"] .marker .ring { stroke: var(--ink-2); }
+[data-status="passed"] .badge.ok, [data-status="reused"] .badge.reuse,
+[data-status="failed"] .badge.bad, [data-status="cancelled"] .badge.stop,
+[data-status="partial"] .badge.warn, [data-status="unverifiable"] .badge.warn,
+[data-status="waiting_input"] .badge.wait, [data-status="skipped"] .badge.skip { display: inline; }
+.badge.ok circle { fill: var(--ok); } .badge.reuse circle { fill: var(--reuse); }
+.badge.bad circle { fill: var(--bad); } .badge.stop circle { fill: var(--ink-2); }
+.badge.warn circle, .badge.wait circle { fill: var(--warn); } .badge.skip circle { fill: var(--idle); }
+
+/* the fix loop branches below the horizontal main line */
+.station.loop { flex: 1 0 100px; max-width: 175px; }
+.station.loop .track { height: 54px; }
+.station.loop .track::before { left: 0; right: 0; background: var(--below-main, var(--idle)); }
+.station.loop .track::after { display: none; }
+.station.loop .loop-path {
+  position: absolute;
+  left: 50%;
+  top: 19px;
+  transform: translateX(-50%);
+  width: 76px;
+  height: 30px;
+  fill: none;
+  stroke: var(--loop-color, var(--idle));
+  stroke-width: 3;
+  stroke-linecap: round;
+}
+.station.loop .marker { left: 50%; top: 27px; transform: translateX(-50%); width: 26px; height: 26px; }
+.station.dash-above .track::before {
+  background: repeating-linear-gradient(90deg, var(--idle) 0 5px, transparent 5px 10px);
+}
+.station.dash-below .track::after {
+  background: repeating-linear-gradient(90deg, var(--idle) 0 5px, transparent 5px 10px);
+}
+
+.body {
+  flex: 1;
+  display: flex;
+  flex-direction: column;
+  padding: 6px 7px 8px;
+  border-radius: 10px;
+  margin: 2px 2px 0;
+  min-width: 0;
+}
+.title-row { display: flex; flex-wrap: wrap; align-items: baseline; gap: 2px 5px; }
+.num { color: var(--ink-2); font-size: 11.5px; font-variant-numeric: tabular-nums; flex: none; }
+.name { font-weight: 600; font-size: 13.5px; white-space: nowrap; overflow: hidden; text-overflow: ellipsis; }
+.state {
+  flex: 0 0 100%;
+  margin-left: 0;
+  font-size: 11.5px;
+  color: var(--ink-2);
+  display: -webkit-box;
+  -webkit-box-orient: vertical;
+  -webkit-line-clamp: 2;
+  line-clamp: 2;
+  line-height: 1.35;
+  overflow: hidden;
+  overflow-wrap: break-word;
+  font-variant-numeric: tabular-nums;
+}
+[data-status="running"] .state { color: var(--route); font-weight: 600; }
+[data-status="waiting_input"] .state, [data-status="partial"] .state, [data-status="unverifiable"] .state { color: var(--warn); font-weight: 600; }
+[data-status="failed"] .state { color: var(--bad); font-weight: 600; }
+.sub { display: -webkit-box; -webkit-box-orient: vertical; -webkit-line-clamp: 2; line-clamp: 2; color: var(--ink-2); font-size: 11.5px; line-height: 1.35; margin-left: 0; overflow: hidden; overflow-wrap: break-word; }
+.meter { display: block; height: 4px; border-radius: 2px; background: var(--rule); margin: 5px 0 2px; overflow: hidden; }
+.meter i { display: block; height: 100%; background: var(--route); width: 0; transition: width .4s ease; }
+.meter i.has-fail { background: linear-gradient(90deg, var(--route), var(--warn)); }
+.meter i.warn { background: var(--warn); }
+.meter i.bad { background: var(--bad); }
+.chips { display: flex; flex-wrap: wrap; gap: 4px; margin: 5px 0 0; }
+.chip { display: inline-flex; align-items: center; gap: 4px; font-size: 10.5px; padding: 1px 6px 1px 5px; border-radius: 999px; border: 1px solid var(--rule); background: var(--panel); white-space: nowrap; max-width: 100%; overflow: hidden; text-overflow: ellipsis; }
+.chip::before { content: ""; width: 6px; height: 6px; border-radius: 50%; background: var(--idle); flex: none; }
+.chip[data-s="passed"]::before { background: var(--ok); }
+.chip[data-s="failed"]::before { background: var(--bad); }
+.chip[data-s="partial"]::before, .chip[data-s="offloaded"]::before { background: var(--warn); }
+.chip[data-s="running"]::before { background: var(--route); box-shadow: 0 0 0 3px var(--halo); }
+
+/* build stops: a short branch line inside the Build station */
+.route .stops { list-style: none; display: flex; flex-direction: column; margin: 5px 0 0 5px; padding: 0; }
+.stop { position: relative; display: flex; align-items: baseline; flex-wrap: wrap; gap: 2px 5px; font-size: 11.5px; padding: 1px 0 3px 13px; border-left: 2px solid var(--idle); }
+.stop:last-child { border-left-color: transparent; }
+.stop[data-s="offloaded"], .stop[data-s="failed"] { border-left-color: var(--warn); }
+.stop .kind { color: var(--ink-2); font-size: 11px; }
+.stop .pip { position: absolute; left: -6.5px; top: 4px; width: 11px; height: 11px; border-radius: 50%; border: 2px solid var(--idle); background: var(--panel); }
+.stop[data-s="running"] .pip { border-color: var(--route); background: var(--route); box-shadow: 0 0 0 3px var(--halo); }
+.stop[data-s="passed"] .pip { border-color: var(--ok); background: var(--ok); }
+.stop[data-s="failed"] .pip, .stop[data-s="offloaded"] .pip { border-color: var(--warn); }
+.stop[data-s="pending"] { color: var(--ink-2); }
+
+/* detail */
+.detail { overflow: auto; padding: 20px 28px 28px; min-width: 0; }
+.detail header { display: flex; align-items: center; gap: 12px; margin-bottom: 4px; flex-wrap: wrap; }
+.detail header svg { width: 28px; height: 28px; fill: none; stroke: var(--ink); stroke-width: 1.6; stroke-linecap: round; stroke-linejoin: round; flex: none; }
+.detail h2 { margin: 0; font-size: 20px; font-weight: 600; }
+.detail-actions { margin-left: auto; display: flex; gap: 8px; }
+.detail .follow { background: none; border: 1px solid var(--rule); border-radius: 6px; padding: 3px 10px; cursor: pointer; color: var(--ink-2); font-size: 12.5px; }
+.detail .follow:hover { background: var(--panel); color: var(--ink); }
+.detail .lede { color: var(--ink-2); margin: 0 0 16px 40px; }
+.detail h3 { font-size: 14px; font-weight: 600; margin: 20px 0 8px; }
+.detail p { max-width: 75ch; }
+.facts { display: grid; grid-template-columns: max-content minmax(0, 1fr); gap: 4px 18px; margin: 0; }
+.facts dt { color: var(--ink-2); }
+.facts dd { margin: 0; overflow-wrap: anywhere; }
+.stall-box {
+  margin: 12px 0; padding: 10px 14px; border: 1px solid var(--rule); border-radius: 10px;
+  background: var(--panel); max-width: 70ch;
+}
+.stall-box .meter { margin: 7px 0 0; height: 6px; }
+table { border-collapse: collapse; width: 100%; font-size: 13px; }
+th { text-align: left; font-weight: 600; color: var(--ink-2); border-bottom: 1px solid var(--rule); padding: 5px 10px 5px 0; }
+td { border-bottom: 1px solid var(--rule); padding: 6px 10px 6px 0; vertical-align: top; }
+td.num-cell { font-variant-numeric: tabular-nums; white-space: nowrap; color: var(--ink-2); }
+.s-sym { display: inline-block; width: 18px; font-weight: 700; }
+.s-sym[data-s="passed"] { color: var(--ok); } .s-sym[data-s="failed"] { color: var(--bad); }
+.s-sym[data-s="running"] { color: var(--route); } .s-sym[data-s="partial"], .s-sym[data-s="offloaded"] { color: var(--warn); }
+pre, code, .mono { font-family: var(--mono); font-size: 12px; }
+pre { background: var(--panel); border: 1px solid var(--rule); border-radius: 8px; padding: 10px 12px; overflow: auto; max-height: 360px; white-space: pre-wrap; overflow-wrap: anywhere; }
+details { margin: 6px 0; } summary { cursor: pointer; }
+.note { border-left: 3px solid var(--warn); padding: 6px 12px; background: var(--panel); border-radius: 0 8px 8px 0; max-width: 75ch; }
+.note.bad { border-color: var(--bad); }
+.note.ok { border-color: var(--ok); }
+.files { columns: 2 280px; font-family: var(--mono); font-size: 12px; margin: 0; padding-left: 18px; }
+.files li { padding: 1px 0; break-inside: avoid; }
+.files .fsize { color: var(--ink-2); margin-left: 6px; font-size: 11px; }
+.files .ftag { display: inline-block; margin-left: 6px; padding: 0 6px; border-radius: 999px; background: var(--chip-bg); color: var(--route); font-size: 10.5px; font-family: var(--font); font-weight: 600; }
+.reviewers { display: grid; grid-template-columns: repeat(auto-fit, minmax(260px, 1fr)); gap: 14px; }
+.reviewer { border: 1px solid var(--rule); border-radius: 10px; padding: 12px 14px; background: var(--panel); }
+.reviewer h4 { margin: 0 0 4px; font-size: 14px; }
+.reviewer ul { padding-left: 18px; margin: 6px 0 0; }
+.actions { display: flex; flex-wrap: wrap; gap: 8px; align-items: center; }
+.actions button { background: var(--panel); border: 1px solid var(--rule); border-radius: 6px; padding: 4px 12px; cursor: pointer; font-size: 12.5px; }
+.actions button[aria-pressed="true"] { border-color: var(--route); background: var(--chip-bg); font-weight: 600; }
+.stage-log { list-style: none; padding: 0; margin: 0; font-family: var(--mono); font-size: 12px; }
+.stage-log li { padding: 1px 0; white-space: pre-wrap; overflow-wrap: anywhere; }
+
+/* logs */
+.logs {
+  border-top: 1px solid var(--rule); display: grid; grid-template-rows: auto auto minmax(0, 1fr);
+  background: var(--panel); min-height: 0; position: relative;
+}
+body.logs-collapsed .logs { grid-template-rows: auto auto; }
+body.logs-collapsed .log-list { display: none; }
+.log-resizer {
+  height: 5px; cursor: ns-resize; background: transparent;
+}
+.log-resizer:hover { background: var(--halo); }
+.log-tools { display: flex; flex-wrap: wrap; align-items: center; gap: 6px 10px; padding: 6px 18px 8px; border-bottom: 1px solid var(--rule); }
+.log-tools h2 { font-size: 13.5px; margin: 0 4px 0 0; }
+.log-chips { display: flex; flex-wrap: wrap; gap: 3px; flex: 1 1 auto; min-width: 0; }
+.log-chips button {
+  position: relative; background: none; border: 1px solid transparent; border-radius: 999px;
+  padding: 1px 8px; cursor: pointer; color: var(--ink-2); font-size: 12px; white-space: nowrap;
+}
+.log-chips button[aria-pressed="true"] { border-color: var(--route); color: var(--ink); background: var(--chip-bg); }
+.log-chips button.has-warn::after, .log-chips button.has-err::after {
+  content: ""; display: inline-block; width: 6px; height: 6px; border-radius: 50%; margin-left: 5px; vertical-align: middle;
+}
+.log-chips button.has-warn::after { background: var(--warn); }
+.log-chips button.has-err::after { background: var(--bad); }
+.log-tools select, .log-tools input[type="search"] { background: var(--paper); border: 1px solid var(--rule); border-radius: 6px; padding: 3px 8px; font-size: 12px; }
+.log-tools input[type="search"] { width: 150px; }
+.log-tools label { font-size: 12px; color: var(--ink-2); display: flex; gap: 5px; align-items: center; white-space: nowrap; }
+.log-tools .copy { background: none; border: 1px solid var(--rule); border-radius: 6px; padding: 2px 9px; cursor: pointer; font-size: 12px; white-space: nowrap; }
+.log-list { list-style: none; margin: 0; padding: 6px 18px 12px; overflow: auto; font-family: var(--mono); font-size: 12px; line-height: 1.55; }
+.log-list li { display: grid; grid-template-columns: 64px minmax(0, 1fr); gap: 10px; }
+.log-list time { color: var(--ink-2); }
+.log-list .text { white-space: pre-wrap; overflow-wrap: anywhere; }
+.log-list .WARNING .text { color: var(--warn); }
+.log-list .ERROR .text, .log-list .CRITICAL .text { color: var(--bad); }
+.empty { color: var(--ink-2); padding: 10px 0; }
+
+@media (max-width: 960px) {
+  body { display: block; height: auto; }
+  .masthead { grid-template-columns: auto minmax(0, 1fr); }
+  .side { grid-column: 1 / -1; grid-row: auto; align-items: flex-start; }
+  .layout { display: block; }
+  .route { max-height: none; }
+  .logs { height: 60vh; }
+  body.logs-collapsed .logs { height: auto; }
+  .stats { flex-wrap: wrap; }
+}
+@media (prefers-reduced-motion: reduce) {
+  .marker .halo { animation: none !important; }
+  .meter i { transition: none; }
+}
+</style>
+</head>
+<body>
+<header class="masthead">
+  <div class="brand" aria-hidden="true">
+    <svg viewBox="0 0 34 34" fill="none" stroke="currentColor" stroke-width="2">
+      <circle cx="17" cy="17" r="14"/><ellipse cx="17" cy="17" rx="6.5" ry="14"/>
+      <path d="M3.5 13h27M3.5 21h27"/>
+    </svg>
+  </div>
+  <div class="ident">
+    <h1 id="spec-name">Atlas</h1>
+    <p id="run-meta"><span>Waiting for a run to start</span></p>
+  </div>
+  <p class="activity" id="activity" data-state="pending" aria-live="polite">
+    <span class="dot" aria-hidden="true"></span><span id="activity-text">Connecting to Atlas</span>
+  </p>
+  <div class="side">
+    <dl class="stats">
+      <div><dt>Elapsed</dt><dd id="stat-elapsed">0:00</dd></div>
+      <div><dt>Model calls</dt><dd id="stat-calls">0</dd></div>
+      <div><dt>Tokens</dt><dd id="stat-tokens">0</dd></div>
+      <div><dt id="stat-cost-label">Cost so far</dt><dd id="stat-cost">$0.00</dd></div>
+    </dl>
+    <div class="conn">
+      <span class="pill-badge" id="conn-label" data-live="snapshot">Connecting</span>
+      <button type="button" id="copy-replay" class="hidden" title="Copy replay command">Copy replay cmd</button>
+      <button type="button" id="theme-toggle" aria-label="Switch colour theme">Theme: auto</button>
+    </div>
+  </div>
+</header>
+
+<main class="layout">
+  <nav class="route" aria-label="Pipeline stages">
+    <div class="route-head">
+      <span id="route-summary">0 of 10 stations done</span>
+      <span class="meter" aria-hidden="true"><i id="route-bar" style="width:0%"></i></span>
+    </div>
+    <ol id="route"></ol>
+  </nav>
+  <section class="detail" id="detail" aria-label="Stage details"></section>
+</main>
+
+<section class="logs" aria-label="Run log">
+  <div class="log-resizer" id="log-resizer" title="Drag to resize log panel" aria-hidden="true"></div>
+  <div class="log-tools">
+    <h2>Log</h2>
+    <div class="log-chips" id="log-chips" role="group" aria-label="Show log lines for"></div>
+    <select id="log-level" aria-label="Log level">
+      <option value="all">All levels</option>
+      <option value="warn">Warnings &amp; errors</option>
+      <option value="error">Errors only</option>
+    </select>
+    <input type="search" id="log-search" placeholder="Search logs" aria-label="Search the log">
+    <label><input type="checkbox" id="log-follow" checked> Follow</label>
+    <button type="button" class="copy" id="log-copy">Copy</button>
+    <button type="button" class="copy" id="log-collapse" aria-expanded="true">Hide</button>
+  </div>
+  <ol class="log-list" id="log-list" aria-live="off"></ol>
+</section>
+
+<script>
+"use strict";
+const STAGES = [
+  { id: "run", name: "Spec", short: "Run", num: 1 },
+  { id: "parse", name: "Parse spec", short: "Parse", num: 2 },
+  { id: "research", name: "Research", short: "Research", num: 3 },
+  { id: "clarify", name: "Clarify", short: "Clarify", num: 4 },
+  { id: "judge", name: "Judge", short: "Judge", num: 5 },
+  { id: "e2e_tests", name: "E2E contract", short: "E2E", num: 6 },
+  { id: "build", name: "Build", short: "Build", num: 7 },
+  { id: "verify", name: "Verify", short: "Verify", num: 8 },
+  { id: "fix", name: "Fix loop", short: "Fix", num: null, loop: true },
+  { id: "supervisor", name: "Review", short: "Review", num: 9 },
+  { id: "report", name: "Report", short: "Report", num: 10 },
+];
+const NAMES = Object.fromEntries(STAGES.map(s => [s.id, s.name]));
+const HARNESS_NAMES = {
+  antigravity_sdk: "Local SDK",
+  antigravity: "Antigravity CLI",
+  agy: "Antigravity CLI",
+  claude_code: "Claude Code",
+  openrouter: "OpenRouter",
+  litellm: "LiteLLM",
+  local: "Local SDK",
+  harness: "Harness CLI",
+};
+const GLYPHS = {
+  run: "M10 7.5h7l3.5 3.5V24.5H10z M17 7.5V11h3.5 M13 15h5 M13 18.5h5",
+  parse: "M14.5 9.5a5 5 0 1 0 0 10a5 5 0 1 0 0-10 M18.3 18.3L23 23",
+  research: "M13.5 8h5 M14.5 8v5.5L10 21.5a1.6 1.6 0 0 0 1.4 2.4h9.2a1.6 1.6 0 0 0 1.4-2.4L17.5 13.5V8 M12 18.5h8",
+  clarify: "M8.5 9.5h15v10h-8l-4.5 3.5v-3.5h-2.5z M14.2 13.2a1.8 1.8 0 1 1 2.6 1.6c-.6.3-.8.7-.8 1.2 M16 17.6v.1",
+  judge: "M16 8.5v15 M12 23.5h8 M9.5 11h13 M9.5 11l-2.5 5a2.5 2.5 0 0 0 5 0z M22.5 11l-2.5 5a2.5 2.5 0 0 0 5 0z",
+  e2e_tests: "M16 8a8 8 0 1 0 0 16a8 8 0 1 0 0-16 M16 12a4 4 0 1 0 0 8a4 4 0 1 0 0-8 M16 15.5v1",
+  build: "M8.5 23.5h15 M10.5 23.5v-7h11v7 M13 16.5v-4h6v4 M15 12.5V9h2v3.5",
+  verify: "M10 8.5h12v15H10z M13 13l1.8 1.8 3.7-3.7 M13 19h6",
+  fix: "M19.5 8.5a4 4 0 0 0-4.6 5.3L9 19.7l3.3 3.3 5.9-5.9a4 4 0 0 0 5.3-4.6l-2.6 2.6-2.4-.6-.6-2.4z",
+  supervisor: "M16 8l7 2.6v5c0 4.2-3 7-7 8.4c-4-1.4-7-4.2-7-8.4v-5z M13 15.8l2.2 2.2 4-4",
+  report: "M10 23.5v-7 M14 23.5V12 M18 23.5v-9 M22 23.5V9.5 M8.5 23.5h15",
+};
+const BADGES = {
+  ok: "M-2.4 0l1.6 1.6 3.2-3.2", bad: "M-2 -2l4 4M2 -2l-4 4", warn: "M0 -2.6v2.6M0 2.2v.1",
+  wait: "M-1.2 -2v4M1.2 -2v4", reuse: "M-2 .8a2.2 2.2 0 1 0 .6-2.6 M-2.4 -2.6v1.4h1.4",
+  stop: "M-1.6 -1.6h3.2v3.2h-3.2z", skip: "M-2.2 0h4.4",
+};
+const STATUS_WORD = {
+  pending: "Not started", running: "Running", waiting_input: "Waiting for you", reused: "Reused",
+  skipped: "Skipped", partial: "Done with gaps", unverifiable: "Can't test offline",
+  passed: "Done", failed: "Failed", cancelled: "Stopped",
+};
+const DONE = new Set(["passed", "reused", "partial", "unverifiable", "skipped"]);
+const $ = (id) => document.getElementById(id);
+const esc = (v) => String(v ?? "").replace(/[&<>"']/g, c => ({ "&": "&amp;", "<": "&lt;", ">": "&gt;", '"': "&quot;", "'": "&#39;" }[c]));
+const short = (m) => String(m || "").split("/").filter(Boolean).slice(-1)[0] || String(m || "");
+const harnessLabel = (p) => HARNESS_NAMES[p] || p || "";
+
+function fmtDur(sec) {
+  if (sec == null || !isFinite(sec)) return "";
+  sec = Math.max(0, Math.round(sec));
+  const h = Math.floor(sec / 3600), m = Math.floor((sec % 3600) / 60), s = sec % 60;
+  return h ? `${h}:${String(m).padStart(2, "0")}:${String(s).padStart(2, "0")}` : `${m}:${String(s).padStart(2, "0")}`;
+}
+function fmtBytes(n) {
+  if (n == null || !isFinite(n)) return "";
+  if (n >= 1048576) return (n / 1048576).toFixed(1) + " MB";
+  if (n >= 1024) return (n / 1024).toFixed(1) + " KB";
+  return n + " B";
+}
+function fmtTokens(n) {
+  n = Number(n || 0);
+  if (n >= 1e6) return (n / 1e6).toFixed(2) + "M";
+  if (n >= 1e4) return Math.round(n / 1e3) + "K";
+  return n.toLocaleString();
+}
+function fmtCost(c) { c = Number(c || 0); return "$" + c.toFixed(c > 0 && c < 1 ? 4 : 2); }
+function clock(ts) { const d = new Date(ts * 1000); return d.toTimeString().slice(0, 8); }
+function plural(n, one, many) { return `${n} ${n === 1 ? one : (many || one + "s")}`; }
+
+/* ---------------- state ---------------- */
+const S = {
+  serverMode: "live",
+  run: null, flow: {}, finished: null, stages: {}, items: { research: {}, judge: {} },
+  attempts: {}, attemptOrder: [], rounds: {}, fixes: {}, reviewers: {},
+  usage: { calls: 0, tokens: 0, input: 0, output: 0, hasSplit: false, cost: 0, unpriced: 0 }, usageByStage: {},
+  workspace: null, logs: [], logAlerts: {}, lastSeq: 0,
+};
+let activeArtifact = { name: null, html: "" };
+function stage(id) { return (S.stages[id] ||= { status: "pending", data: {}, startedAt: null, endedAt: null }); }
+
+function apply(ev) {
+  if (ev.seq <= S.lastSeq) return;
+  S.lastSeq = ev.seq;
+  const d = ev.data || {};
+  switch (ev.kind) {
+    case "run":
+      if (ev.status === "running") {
+        S.run = { ...d, startedAt: ev.ts };
+        S.flow = d.flow || {};
+        const attempts = (S.flow.builder && S.flow.builder.attempts) || [];
+        S.attemptOrder = attempts.map(a => a.name);
+        for (const a of attempts) S.attempts[a.name] ||= { ...a, status: "pending" };
+      } else {
+        S.finished = { ...d, status: ev.status, ts: ev.ts };
+        for (const st of Object.values(S.stages)) {
+          if (st.status === "running" || st.status === "waiting_input") {
+            st.status = ev.status === "cancelled" ? "cancelled" : "failed";
+            st.endedAt = ev.ts;
+          }
+        }
+        // A builder still marked running when the run ends did not finish.
+        for (const a of Object.values(S.attempts)) {
+          if (a.status === "running") { a.status = ev.status === "cancelled" ? "cancelled" : "failed"; a.ts = ev.ts; }
+        }
+        if (d.usage && d.usage.calls != null) S.finalUsage = d.usage;
+      }
+      break;
+    case "stage": {
+      const st = stage(ev.stage);
+      if ((ev.status === "running" || ev.status === "waiting_input") && !st.startedAt) st.startedAt = ev.ts;
+      if (ev.status === "running") st.endedAt = null;
+      st.status = ev.status || st.status;
+      Object.assign(st.data, d);
+      if (DONE.has(st.status) || st.status === "failed") st.endedAt = ev.ts;
+      if (ev.stage === "fix" && d.round != null) {
+        const f = (S.fixes[d.round] ||= { round: d.round });
+        Object.assign(f, d, { status: ev.status });
+      }
+      if (ev.stage === "verify" && d.round != null) (S.rounds[d.round] ||= { checks: {}, status: "running" });
+      break;
+    }
+    case "item": {
+      const bucket = (S.items[ev.stage] ||= {});
+      bucket[d.requirement_id] = { ...d, status: ev.status };
+      const st = stage(ev.stage);
+      if (d.total) { st.data.total = d.total; st.data.completed = Math.max(st.data.completed || 0, d.completed || 0); }
+      break;
+    }
+    case "attempt": {
+      const name = d.attempt || "builder";
+      const a = (S.attempts[name] ||= { name, label: d.model || "", provider: d.provider || "", status: "pending" });
+      if (!S.attemptOrder.includes(name)) S.attemptOrder.push(name);
+      a.status = ev.status; a.ts = ev.ts;
+      if (ev.status === "running" && !a.startedAt) a.startedAt = ev.ts;
+      if (ev.status === "passed" || ev.status === "failed" || ev.status === "offloaded") a.endedAt = ev.ts;
+      Object.assign(a, d);
+      if (d.model && d.model !== "auto") a.model = d.model;
+      if (d.provider) a.provider = d.provider;
+      break;
+    }
+    case "check": {
+      const r = (S.rounds[d.round] ||= { checks: {}, status: "running" });
+      r.checks[d.name] = { ...d, status: ev.status };
+      break;
+    }
+    case "round": {
+      const r = (S.rounds[d.round] ||= { checks: {}, status: "running" });
+      Object.assign(r, d, { status: ev.status });
+      break;
+    }
+    case "reviewer":
+      S.reviewers[d.reviewer] = { ...(S.reviewers[d.reviewer] || {}), ...d, status: ev.status };
+      break;
+    case "usage": {
+      const tok = Number(d.tokens || 0);
+      const hasSplit = d.input_tokens != null || d.output_tokens != null;
+      const inp = Number(d.input_tokens || 0);
+      const outp = Number(d.output_tokens || 0);
+      const cost = typeof d.cost_usd === "number" ? d.cost_usd : null;
+      S.usage.calls += 1; S.usage.tokens += tok;
+      if (hasSplit) { S.usage.hasSplit = true; S.usage.input += inp; S.usage.output += outp; }
+      if (cost != null) S.usage.cost += cost; else S.usage.unpriced += 1;
+      const stId = ev.stage || "run";
+      const bs = (S.usageByStage[stId] ||= { calls: 0, tokens: 0, input: 0, output: 0, hasSplit: false, cost: 0, unpriced: 0 });
+      bs.calls += 1; bs.tokens += tok;
+      if (hasSplit) { bs.hasSplit = true; bs.input += inp; bs.output += outp; }
+      if (cost != null) bs.cost += cost; else bs.unpriced += 1;
+      break;
+    }
+    case "workspace":
+      S.workspace = { ...d, changedAt: ev.ts };
+      break;
+    case "log": {
+      const entry = { seq: ev.seq, ts: ev.ts, stage: ev.stage, level: d.level || "INFO", text: d.text || "" };
+      S.logs.push(entry);
+      if (["ERROR", "CRITICAL"].includes(entry.level)) S.logAlerts[entry.stage] = "err";
+      else if (entry.level === "WARNING" && S.logAlerts[entry.stage] !== "err") S.logAlerts[entry.stage] = "warn";
+      pendingLogs.push(entry);
+      break;
+    }
+  }
+}
+
+/* derived status of a station, accounting for the configured flow */
+function statusOf(id) {
+  const st = S.stages[id];
+  if (st && st.status !== "pending") return st.status;
+  const f = S.flow || {};
+  if (id === "run" && S.run) return "passed";
+  if (id === "e2e_tests" && f.e2e === false) return "skipped";
+  if (id === "supervisor" && S.run && f.supervisor_enabled === false) return "skipped";
+  if ((id === "research" || id === "judge") && f.skip_research) return "skipped";
+  if (S.run && S.run.mode === "plan" && ["build", "verify", "fix", "supervisor"].includes(id)) return "skipped";
+  if (S.finished && id === "fix") return "skipped";
+  if (S.finished && id === "supervisor") return "skipped";
+  return "pending";
+}
+function currentStage() {
+  let cur = null;
+  for (const s of STAGES) {
+    const st = S.stages[s.id];
+    if (st && (st.status === "running" || st.status === "waiting_input")) cur = s.id;
+  }
+  return cur;
+}
+function lastRound() {
+  const keys = Object.keys(S.rounds).map(Number).sort((a, b) => a - b);
+  return keys.length ? keys[keys.length - 1] : null;
+}
+function activeAttempt() {
+  return S.attemptOrder.map(n => S.attempts[n]).find(a => a && a.status === "running") || null;
+}
+function idleSeconds(now) {
+  const a = activeAttempt();
+  if (!a || a.name !== "local") return null;
+  const since = Math.max(a.startedAt || 0, S.workspace ? S.workspace.changedAt : 0);
+  return since ? now - since : null;
+}
+
+/* ---------------- station summaries ---------------- */
+function summary(id, status) {
+  const st = S.stages[id] || { data: {} };
+  const d = st.data || {};
+  const f = S.flow || {};
+  const t = f.targets || {};
+  switch (id) {
+    case "run":
+      return { state: S.run ? (S.run.mode === "plan" ? "Plan mode" : "") : "Waiting", sub: S.run ? (S.run.from_run ? `Resumed from ${S.run.from_run.split("/").pop()}` : S.run.spec_path) : "" };
+    case "parse":
+      return { state: d.requirements != null ? plural(d.requirements, "requirement") : "", sub: status === "reused" ? "Reused from earlier run" : short(d.target || t.parser) };
+    case "research":
+    case "judge": {
+      const items = Object.values(S.items[id] || {});
+      const total = d.total || items.length;
+      const done = items.length;
+      const fails = Math.max(items.filter(i => i.status === "failed").length, id === "research" ? Number(d.failures || 0) : 0);
+      let state = status === "running" ? `${done} of ${total}` : status === "skipped" ? (d.reason || "") : status === "reused" ? "Reused" : total ? `${done} of ${total}` : "";
+      if (fails > 0 && status !== "skipped" && total) state = `${Math.max(0, done)}/${total} · ${plural(fails, "gap")}`;
+      else if (id === "research" && d.failures && !total) state = plural(d.failures, "gap");
+      const sub = id === "judge" && d.decisions != null ? `${plural(d.decisions, "decision")}, ${plural(d.tasks || 0, "task")}` : short(d.target || (id === "research" ? t.researcher : t.judge));
+      return { state, sub, meter: total && (status === "running" || status === "partial" || done) ? { pct: Math.min(100, Math.round(100 * done / total)), fail: fails > 0 } : null };
+    }
+    case "clarify":
+      if (status === "waiting_input") return { state: "Answer in Terminal", sub: plural(d.total || 0, "question") + " waiting for your answers" };
+      if (d.answered != null) return { state: `${d.answered} of ${d.total} answered`, sub: status === "reused" ? "Reused answers" : "" };
+      return { state: "", sub: status === "skipped" ? (d.reason || "No questions") : status === "reused" ? "Reused answers" : "" };
+    case "e2e_tests":
+      if (status === "unverifiable") return { state: "Not testable offline", sub: d.reason || "" };
+      if (d.test_files) return { state: plural(d.test_files.length, "test file"), sub: (d.test_files || []).join(", ") };
+      return { state: "", sub: status === "skipped" ? "Turned off for this run" : short(d.target || t.e2e) };
+    case "build": {
+      const a = activeAttempt();
+      const files = S.workspace ? S.workspace.count : null;
+      const state = d.files != null && DONE.has(status) ? plural(d.files, "file") : files != null && status === "running" ? plural(files, "file") + " so far" : "";
+      const stopped = !a && !DONE.has(status) && S.attemptOrder.map(n => S.attempts[n]).find(x => x && (x.status === "cancelled" || x.status === "failed"));
+      return { state, sub: a ? `Building with ${short(a.model || a.label)}` : stopped ? `Stopped while building with ${short(stopped.model || stopped.label)}` : d.offloaded_to ? `Built by ${short(d.offloaded_to)}` : d.model ? `Built by ${short(d.model)}` : "", stops: true };
+    }
+    case "verify": {
+      const r = lastRound();
+      if (r == null) return { state: "", sub: "" };
+      const checks = Object.values(S.rounds[r].checks);
+      const passed = checks.filter(c => c.status === "passed").length;
+      return { state: `Round ${r}`, sub: checks.length ? `${passed} of ${checks.length} checks pass` : "Running checks", checks };
+    }
+    case "fix": {
+      const rounds = Object.values(S.fixes);
+      if (!rounds.length) return { state: status === "skipped" ? "Not needed" : "", sub: f.fixer && f.fixer.length ? f.fixer.map(short).join(" / ") : "" };
+      const last = rounds[rounds.length - 1];
+      return { state: `Round ${last.round} of ${last.max_rounds || f.max_fix_rounds || "?"}`, sub: last.model ? `With ${short(last.model)}` : "" };
+    }
+    case "supervisor": {
+      const revs = Object.values(S.reviewers);
+      if (status === "skipped" && !revs.length) return { state: S.run && f.supervisor_enabled === false ? "Off" : "Not reached", sub: "" };
+      const verdict = d.approved === true ? "Approved" : d.approved === false ? "Changes requested" : "";
+      return { state: verdict, sub: revs.length ? "" : (f.supervisor_reviewers || []).join(", "), reviewers: revs };
+    }
+    case "report": {
+      const fin = S.finished;
+      if (!fin) return { state: "", sub: "" };
+      if (S.run && S.run.mode === "plan") return { state: fin.status === "passed" ? "Plan ready" : "Failed", sub: "plan.md and usage ledger" };
+      return { state: fin.result === "verified" ? "Verified" : fin.status === "cancelled" ? "Stopped" : fin.result === "verification_failed" ? "Checks failing" : "Failed", sub: "report.md and usage ledger" };
+    }
+  }
+  return { state: "", sub: "" };
+}
+
+/* ---------------- rendering ---------------- */
+function markerSVG(id, small) {
+  const size = small ? 26 : 32;
+  return `<svg class="marker" viewBox="0 0 32 32" width="${size}" height="${size}" aria-hidden="true">
+    <circle class="halo" cx="16" cy="16" r="14"/>
+    <circle class="ring" cx="16" cy="16" r="14"/>
+    <path class="glyph" d="${GLYPHS[id]}"/>
+    ${Object.entries(BADGES).map(([k, p]) => `<g class="badge ${k}" transform="translate(26 6)"><circle r="5.6"/><path d="${p}"/></g>`).join("")}
+  </svg>`;
+}
+const SEG = (s) => (s === "skipped" ? "var(--idle)" : DONE.has(s) ? "var(--route)" : s === "failed" ? "var(--bad)" : s === "cancelled" ? "var(--ink-2)" : "var(--idle)");
+let selected = null;
+let lastScrolledTo = null;
+let lastRouteSeq = -1;
+let lastRouteSel = null;
+
+function renderRoute() {
+  if (lastRouteSeq === S.lastSeq && lastRouteSel === selected) return;
+  lastRouteSeq = S.lastSeq;
+  lastRouteSel = selected;
+  const ol = $("route");
+  const statuses = STAGES.map(s => statusOf(s.id));
+  const mainStages = STAGES.filter(s => !s.loop);
+  const mainDone = mainStages.filter(s => DONE.has(statusOf(s.id))).length;
+  $("route-summary").textContent = `${mainDone} of ${mainStages.length} stations done`;
+  $("route-bar").style.width = `${Math.round(100 * mainDone / mainStages.length)}%`;
+
+  const html = STAGES.map((s, i) => {
+    const status = statuses[i];
+    let prevIdx = i - 1;
+    if (STAGES[prevIdx] && STAGES[prevIdx].loop) prevIdx -= 1;
+    const above = prevIdx >= 0 ? SEG(statuses[prevIdx]) : "var(--idle)";
+    const below = SEG(status);
+    const sm = summary(s.id, status);
+    const cls = ["station", s.loop ? "loop" : "", selected === s.id ? "selected" : "",
+      prevIdx >= 0 && statuses[prevIdx] === "skipped" ? "dash-above" : "", status === "skipped" ? "dash-below" : ""].filter(Boolean).join(" ");
+    let extra = "";
+    if (sm.meter) extra += `<span class="meter" aria-hidden="true"><i class="${sm.meter.fail ? "has-fail" : ""}" style="width:${sm.meter.pct}%"></i></span>`;
+    if (sm.stops && S.attemptOrder.length) {
+      extra += `<ol class="stops" aria-label="Build attempts">${S.attemptOrder.map(n => {
+        const a = S.attempts[n] || {};
+        const label = n === "local" ? short(a.model || a.label) : (a.name || n);
+        const hName = a.provider ? harnessLabel(a.provider) : "";
+        const kind = n === "local" ? "local" : hName;
+        const word = a.status === "offloaded" ? "handed on" : a.status === "failed" ? "failed" : a.status === "cancelled" ? "stopped" : a.status === "passed" ? "built it" : "";
+        const suffix = [kind, word || (a.status === "pending" && n !== "local" ? "if needed" : "")].filter(Boolean).join(" · ");
+        return `<li class="stop" data-s="${esc(a.status || "pending")}" title="${esc(a.model || a.label || "")}"><span class="pip"></span>${esc(label)}${suffix ? ` <span class="kind">${esc(suffix)}</span>` : ""}</li>`;
+      }).join("")}</ol>`;
+    }
+    if (sm.checks && sm.checks.length) {
+      extra += `<span class="chips">${sm.checks.map(c => `<span class="chip" data-s="${esc(c.status)}">${esc(c.name)}</span>`).join("")}</span>`;
+    }
+    if (sm.reviewers && sm.reviewers.length) {
+      extra += `<span class="chips">${sm.reviewers.map(r => `<span class="chip" data-s="${esc(r.status)}">${esc(r.reviewer)}${r.approved === true ? ": approved" : r.approved === false ? ": changes" : ""}</span>`).join("")}</span>`;
+    }
+    const track = s.loop
+      ? `<span class="track" style="--below-main:${SEG(statuses[i - 1])};--loop-color:${Object.keys(S.fixes).length ? "var(--route)" : "var(--idle)"}">
+           <svg class="loop-path" viewBox="0 0 76 30" aria-hidden="true"><path d="M4 1 C 14 1, 14 21, 25 21 M51 21 C 62 21, 62 1, 72 1"/></svg>
+           ${markerSVG(s.id, true)}</span>`
+      : `<span class="track" style="--above:${above};--below:${below}">${markerSVG(s.id)}</span>`;
+    return `<li class="${cls}" data-stage="${s.id}" data-status="${status}">
+      <button type="button" aria-pressed="${selected === s.id}" aria-label="${esc(s.name)}: ${esc(STATUS_WORD[status] || status)}">
+        ${track}
+        <span class="body">
+          <span class="title-row"><span class="num">${s.num ?? "↻"}</span><span class="name">${esc(s.name)}</span><span class="state" title="${esc(sm.state || "")}">${esc(sm.state || (status === "pending" ? "" : STATUS_WORD[status]))}</span></span>
+          ${sm.sub ? `<span class="sub" title="${esc(sm.sub)}">${esc(sm.sub).replace(/\//g, "/<wbr>")}</span>` : ""}
+          ${extra}
+        </span>
+      </button></li>`;
+  }).join("");
+  ol.innerHTML = html;
+  const cur = currentStage();
+  if (!selected && cur && cur !== lastScrolledTo) {
+    lastScrolledTo = cur;
+    const li = ol.querySelector(`[data-stage="${cur}"]`);
+    if (li) li.scrollIntoView({ inline: "center", block: "nearest", behavior: matchMedia("(prefers-reduced-motion: reduce)").matches ? "auto" : "smooth" });
+  }
+}
+
+function activitySentence(now) {
+  if (!S.run && !S.finished) return { text: "Waiting for Atlas to start the run", state: "pending" };
+  const fin = S.finished;
+  if (fin) {
+    const took = S.run ? ` in ${fmtDur((fin.ts || now) - S.run.startedAt)}` : "";
+    if (S.run && S.run.mode === "plan" && fin.status === "passed") return { text: `Plan ready${took}.`, state: "passed" };
+    if (fin.result === "verified") return { text: `Verified${took}. Every check passed.`, state: "passed" };
+    if (fin.status === "cancelled") return { text: `Stopped${took}${fin.error ? ". " + String(fin.error).replace(/^Stopped:\s*/i, "").replace(/^./, c => c.toUpperCase()) : ""}`, state: "cancelled" };
+    if (fin.result === "verification_failed") return { text: `Finished${took} with failing checks. See Verify for what failed.`, state: "failed" };
+    return { text: `Run failed${took}: ${fin.error || "see the log"}`, state: "failed" };
+  }
+  const cur = currentStage();
+  const st = cur ? S.stages[cur] : null;
+  const d = (st && st.data) || {};
+  switch (cur) {
+    case "parse": return { text: `Parsing the spec with ${short(d.target)}`, state: "running" };
+    case "research": case "judge": {
+      const done = Object.keys(S.items[cur] || {}).length;
+      const verb = cur === "research" ? "Researching requirements" : "Judging the options for each requirement";
+      return { text: `${verb}: ${done} of ${d.total || "?"} done`, state: "running" };
+    }
+    case "clarify":
+      if (st.status === "waiting_input") return { text: `Waiting for your answers in Terminal (${plural(d.total || 0, "question")})`, state: "waiting_input" };
+      return { text: "Collecting answers to clarifying questions", state: "running" };
+    case "e2e_tests": {
+      const e2eTarget = short(d.target || (S.flow.targets && S.flow.targets.e2e));
+      return { text: `Writing the end-to-end tests${e2eTarget ? ` with ${e2eTarget}` : ""}`, state: "running" };
+    }
+    case "build": {
+      const a = activeAttempt();
+      if (!a) return { text: "Starting the build", state: "running" };
+      if (a.phase === "resolving") return { text: "Checking that the local model is loaded and ready", state: "running" };
+      const who = a.name === "local" ? `${short(a.model)} on this Mac` : a.name === "builder" ? short(a.model || a.label) : `${a.name} (${short(a.model || a.label)})`;
+      const idle = idleSeconds(now);
+      const limit = a.stall_seconds ? ` (handed on at ${fmtDur(a.stall_seconds)})` : "";
+      const idleNote = idle != null && idle > 30 ? `. No file changes for ${fmtDur(idle)}${limit}` : "";
+      return { text: `Building with ${who}${idleNote}`, state: "running" };
+    }
+    case "verify": return { text: `Running the product's checks, round ${d.round || lastRound() || 1}`, state: "running" };
+    case "fix": {
+      const failing = (d.failing || []).join(", ");
+      return { text: `Fixing ${failing || "failing checks"} with ${short(d.model)} (round ${d.round} of ${d.max_rounds})`, state: "running" };
+    }
+    case "supervisor": return { text: "Reviewers are checking the finished product", state: "running" };
+  }
+  return { text: "Working", state: "running" };
+}
+
+function updateConnectionBadge() {
+  const badge = $("conn-label");
+  if (S.serverMode === "replay") {
+    badge.textContent = S.finished ? "Replay" : "Replay · live tail";
+    badge.dataset.live = S.finished ? "replay" : "live";
+  } else if (S.finished) {
+    badge.textContent = S.streamEnded ? "Snapshot · server closed" : "Run finished";
+    badge.dataset.live = "snapshot";
+  } else if (S.connected) {
+    badge.textContent = "Live";
+    badge.dataset.live = "live";
+  } else if (S.streamFailed) {
+    badge.textContent = "Disconnected";
+    badge.dataset.live = "warn";
+  }
+  const copyBtn = $("copy-replay");
+  if (S.serverMode !== "replay" && S.finished && S.run && S.run.out_dir) copyBtn.classList.remove("hidden");
+}
+
+function hasUnrecordedUsage(u) {
+  if (!S.finished || Number(u.calls || 0) > 0) return false;
+  const st = String(S.finished.result || S.finished.status || "");
+  if (st !== "cancelled" && st !== "failed") return false;
+  return Object.entries(S.stages).some(([k, v]) => k !== "run" && v && (v.startedAt || (v.status && v.status !== "pending")));
+}
+
+function renderHeader(now) {
+  const run = S.run;
+  if (run) {
+    const spec = String(run.spec_path || "").split("/").pop().replace(/\.md$/, "");
+    $("spec-name").textContent = spec || "Atlas run";
+    document.title = `${spec || "Atlas"}: Atlas run`;
+    const parts = [`<span>Run ${esc(run.run_id || "")}</span>`];
+    if (run.app_dir) parts.push(`<span>Product folder ${esc(run.app_dir)}</span>`);
+    else if (run.mode === "plan") parts.push(`<span>Plan run</span>`);
+    $("run-meta").innerHTML = parts.join("");
+  }
+  const a = activitySentence(now);
+  $("activity").dataset.state = a.state;
+  $("activity-text").textContent = a.text;
+  const started = run ? run.startedAt : null;
+  const end = S.finished ? S.finished.ts : now;
+  $("stat-elapsed").textContent = started ? fmtDur(end - started) : "0:00";
+  $("stat-cost-label").textContent = S.finished ? "Est. cost" : "Cost so far";
+  const u = S.finalUsage ? {
+    calls: S.finalUsage.calls,
+    tokens: S.finalUsage.tokens,
+    input: S.finalUsage.input_tokens || 0,
+    output: S.finalUsage.output_tokens || 0,
+    hasSplit: S.finalUsage.input_tokens != null || S.finalUsage.output_tokens != null,
+    cost: S.finalUsage.cost_usd || 0,
+    unpriced: S.finalUsage.unpriced_calls || 0,
+  } : S.usage;
+  $("stat-calls").textContent = Number(u.calls || 0).toLocaleString();
+  const tokEl = $("stat-tokens");
+  if (u.hasSplit || Number(u.tokens || 0) === 0) {
+    tokEl.innerHTML = `${esc(fmtTokens(u.tokens))}<small>${esc(fmtTokens(u.input))} in · ${esc(fmtTokens(u.output))} out</small>`;
+    tokEl.title = `Input: ${Number(u.input || 0).toLocaleString()} · Output: ${Number(u.output || 0).toLocaleString()} · Total: ${Number(u.tokens || 0).toLocaleString()}`;
+  } else {
+    tokEl.textContent = fmtTokens(u.tokens);
+    tokEl.title = `Total: ${Number(u.tokens || 0).toLocaleString()}`;
+  }
+  if (hasUnrecordedUsage(u)) {
+    $("stat-cost").innerHTML = `Unknown<small>stopped before usage was recorded</small>`;
+  } else {
+    $("stat-cost").innerHTML = esc(fmtCost(u.cost)) + (u.unpriced ? `<small>+ ${plural(u.unpriced, "call")} not priced</small>` : "");
+  }
+  updateConnectionBadge();
+}
+
+/* ---------------- detail panel ---------------- */
+function facts(rows) {
+  const body = rows.filter(r => r && r[1] != null && r[1] !== "").map(([k, v, raw]) => `<dt>${esc(k)}</dt><dd>${raw ? v : esc(v)}</dd>`).join("");
+  return body ? `<dl class="facts">${body}</dl>` : "";
+}
+const SYM = { passed: "✓", failed: "×", running: "•", partial: "!", offloaded: "↪", pending: "○", unverifiable: "!" };
+function sym(s) { return `<span class="s-sym" data-s="${esc(s)}" aria-label="${esc(STATUS_WORD[s] || s)}">${SYM[s] || "○"}</span>`; }
+
+function artifactButtons(names) {
+  if (!S.run || !S.run.out_dir) return "";
+  const btns = names.map(n => `<button type="button" data-artifact="${esc(n)}" aria-pressed="${activeArtifact.name === n}">${esc(n)}</button>`).join("");
+  const close = activeArtifact.name ? `<button type="button" data-artifact-close="1">Close</button>` : "";
+  return `<p class="actions">${btns}${close}</p><div id="artifact-view">${activeArtifact.name && names.includes(activeArtifact.name) ? activeArtifact.html : ""}</div>`;
+}
+
+function ledeText(id, status, now) {
+  const st = S.stages[id] || {};
+  let lede = STATUS_WORD[status] || status;
+  if (st.startedAt && !st.endedAt && status === "running") lede = `Running for ${fmtDur(now - st.startedAt)}`;
+  else if (st.startedAt && !st.endedAt && status === "waiting_input") lede = `Waiting for you for ${fmtDur(now - st.startedAt)}`;
+  else if (st.startedAt && st.endedAt) lede += `. Took ${fmtDur(st.endedAt - st.startedAt)}`;
+  return lede;
+}
+
+function detailBody(id, status, now) {
+  const st = S.stages[id] || { data: {} };
+  const d = st.data || {};
+  const f = S.flow || {};
+  const run = S.run || {};
+  let h = "";
+  switch (id) {
+    case "run": {
+      const builder = (f.builder && f.builder.attempts) || [];
+      h += facts([["Spec", run.spec_path], ["Run folder", run.out_dir], ["Product folder", run.app_dir], ["Resumed from", run.from_run]]);
+      h += `<h3>What this run is set up to do</h3>` + facts([
+        ["Research", f.skip_research ? "Skipped (--skip-research)" : short((f.targets || {}).researcher)],
+        ["Judge", f.skip_research ? "Skipped" : short((f.targets || {}).judge)],
+        ["E2E tests", f.e2e === false ? "Off" : f.e2e ? "On" : ""],
+        ["Builder", builder.map(b => `${b.name === "local" ? short(b.label) : b.name} (${harnessLabel(b.provider || b.kind)})`).join(", then ")],
+        ["Fixer", (f.fixer || []).map(short).join(", then ") + (f.max_fix_rounds != null ? `, up to ${f.max_fix_rounds} rounds` : "")],
+        ["Reviewers", f.supervisor_enabled ? (f.supervisor_reviewers || []).join(", ") : f.supervisor_enabled === false ? "Off" : ""],
+      ]);
+      if (run.replayed_from_artifacts) h += `<p class="note">This run is older than the live view, so its timeline was rebuilt from saved files. Live per-requirement timings and log lines aren't available.</p>`;
+      h += artifactButtons(["spec.md", "manifest.json"]);
+      break;
+    }
+    case "parse":
+      h += facts([["Model", short(d.target)], ["Requirements", d.requirements], ["Functional", d.functional], ["Open questions", d.open_questions]]);
+      if (d.summary) h += `<h3>Summary</h3><p>${esc(d.summary)}</p>`;
+      h += artifactButtons(["spec.md", "spec.json"]);
+      break;
+    case "research":
+    case "judge": {
+      const items = S.items[id] || {};
+      const titles = (S.stages.parse && S.stages.parse.data.requirement_titles) || {};
+      const ids = Object.keys({ ...titles, ...items });
+      h += facts([["Model", short(d.target)], ["Progress", d.total ? `${Object.keys(items).length} of ${d.total}` : ""],
+        id === "research" ? ["Notes", d.notes] : ["Decisions", d.decisions], id === "research" ? ["Failures", d.failures] : ["Tasks", d.tasks]]);
+      if (ids.length) {
+        h += `<h3>${id === "research" ? "Requirements researched" : "Choice per requirement"}</h3><table><thead><tr><th></th><th>ID</th><th>Requirement</th>${id === "judge" ? "<th>Chosen approach</th>" : "<th>Model</th>"}<th>Time</th></tr></thead><tbody>`;
+        for (const rid of ids) {
+          const it = items[rid] || {};
+          const pick = it.pick || (d.picks || {})[rid] || "";
+          h += `<tr><td>${sym(it.status || (DONE.has(status) ? "passed" : "pending"))}</td><td class="mono">${esc(rid)}</td><td>${esc(it.title || titles[rid] || "")}${it.error ? `<br><small>${esc(it.error)}</small>` : ""}</td><td>${esc(id === "judge" ? pick : short(it.model))}</td><td class="num-cell">${it.seconds != null ? it.seconds + "s" : ""}</td></tr>`;
+        }
+        h += `</tbody></table>`;
+      }
+      if (id === "research") h += artifactButtons(["research.json"]);
+      else h += artifactButtons(["plan.md", "plan.json"]);
+      break;
+    }
+    case "clarify":
+      if (status === "waiting_input") h += `<p class="note">Atlas is waiting for you to answer ${plural(d.total || 0, "question")} in the Terminal window that started this run.</p>`;
+      if (d.items && d.items.length) {
+        h += `<h3>Questions and answers</h3><table><tbody>${d.items.map(i => `<tr><td class="mono">${esc(i.requirement_id || "")}</td><td><strong>${esc(i.question)}</strong><br>${esc(i.answer || "Unanswered")}</td></tr>`).join("")}</tbody></table>`;
+      } else if (d.questions && d.questions.length) {
+        h += `<h3>Questions</h3><ol>${d.questions.map(q => `<li>${esc(q)}</li>`).join("")}</ol>`;
+      } else if (d.reason) h += `<p>${esc(d.reason)}.</p>`;
+      if (d.answered != null) h += artifactButtons(["clarifications.json"]);
+      break;
+    case "e2e_tests": {
+      const target = d.target || (f.targets && f.targets.e2e) || "";
+      const harness = target.includes("/") ? harnessLabel(target.split("/")[0]) : "";
+      h += facts([["Harness", harness], ["Model", short(target)], ["Product interface", d.interface], ["Test files", (d.test_files || []).join(", ")]]);
+      if (status === "unverifiable") h += `<p class="note">These tests can't run offline: ${esc(d.reason || "no reason given")}</p>`;
+      if (d.verifiable !== undefined || (d.test_files && d.test_files.length)) h += artifactButtons(["e2e_tests.json"]);
+      break;
+    }
+    case "build": {
+      const rows = S.attemptOrder.map(n => S.attempts[n]).filter(Boolean);
+      if (rows.length) {
+        h += `<h3>Attempts</h3><table><thead><tr><th></th><th>Builder</th><th>Harness</th><th>Model</th><th>Time</th><th>What happened</th></tr></thead><tbody>`;
+        for (const a of rows) {
+          const what = a.status === "running" ? (a.phase === "resolving" ? "Checking local model readiness" : "Building") : a.status === "passed" ? `Built ${a.files != null ? plural(a.files, "file") : "the product"}` : a.status === "offloaded" ? `Handed on to ${a.next || "next builder"}: ${a.error || ""}` : a.status === "failed" ? (a.error || "Failed") : a.status === "cancelled" ? "Stopped before it finished, when the run ended" : "Standby unless earlier target cannot finish";
+          const took = a.startedAt ? fmtDur((a.endedAt || (a.status === "running" ? now : a.ts || now)) - a.startedAt) : "";
+          h += `<tr><td>${sym(a.status || "pending")}</td><td>${esc(a.name === "local" ? "Local model" : a.name)}</td><td>${esc(harnessLabel(a.provider || a.kind))}</td><td class="mono">${esc(a.model || a.label || "")}</td><td class="num-cell">${esc(took)}</td><td>${esc(what)}</td></tr>`;
+        }
+        h += `</tbody></table>`;
+      }
+      const idle = idleSeconds(now);
+      const a = activeAttempt();
+      if (a && a.name === "local" && a.stall_seconds) {
+        const curIdle = idle != null ? idle : 0;
+        const pct = Math.min(100, Math.round(100 * curIdle / a.stall_seconds));
+        const cls = pct >= 85 ? "bad" : pct >= 60 ? "warn" : "";
+        h += `<div class="stall-box"><div id="stall-label">Last file change ${fmtDur(curIdle)} ago · stall handoff to ${esc(S.attemptOrder[1] || "next builder")} at ${fmtDur(a.stall_seconds)}</div><span class="meter" aria-hidden="true"><i id="stall-fill" class="${cls}" style="width:${pct}%"></i></span></div>`;
+      }
+      if (S.workspace) {
+        const ws = S.workspace;
+        const changedSet = new Set(ws.changed || []);
+        h += `<h3>Files in the product folder (${ws.count}${ws.truncated ? ", first " + ws.files.length + " shown" : ""})</h3><ul class="files">${ws.files.map(([p, sz]) => `<li>${esc(p)}${sz != null ? `<span class="fsize">${esc(fmtBytes(sz))}</span>` : ""}${changedSet.has(p) ? `<span class="ftag">updated</span>` : ""}</li>`).join("")}</ul>`;
+      }
+      if (d.summary) h += `<h3>Builder's summary</h3><pre>${esc(d.summary)}</pre>`;
+      if (DONE.has(status) || status === "failed") h += artifactButtons(["build.json", "plan.md"]);
+      break;
+    }
+    case "verify": {
+      const keys = Object.keys(S.rounds).map(Number).sort((x, y) => y - x);
+      if (!keys.length) { h += `<p class="empty">Checks run after the build.</p>`; break; }
+      for (const r of keys) {
+        const round = S.rounds[r];
+        const checks = Object.values(round.checks);
+        h += `<h3>Round ${r}${round.stack ? ` (${esc(round.stack)})` : ""}: ${round.status === "passed" ? "all checks pass" : round.status === "failed" ? "checks failing" : "running"}</h3>`;
+        h += `<table><thead><tr><th></th><th>Check</th><th>Command</th><th>Time</th></tr></thead><tbody>${checks.map(c => `<tr><td>${sym(c.status)}</td><td>${esc(c.name)}${c.output ? `<details data-key="verify-${r}-${esc(c.name)}"><summary>Output</summary><pre>${esc(c.output)}</pre></details>` : ""}</td><td class="mono">${esc(c.command || "")}</td><td class="num-cell">${c.seconds != null ? c.seconds + "s" : ""}</td></tr>`).join("")}</tbody></table>`;
+      }
+      if (DONE.has(status) || status === "failed") h += artifactButtons(["verification.json"]);
+      break;
+    }
+    case "fix": {
+      const rounds = Object.values(S.fixes).sort((x, y) => y.round - x.round);
+      if (!rounds.length) { h += `<p class="empty">${status === "skipped" ? "No fixes were needed." : "Runs only when a check fails or a reviewer asks for changes."}</p>`; break; }
+      for (const fx of rounds) {
+        h += `<h3>Round ${fx.round} of ${fx.max_rounds || f.max_fix_rounds || "?"}${fx.model ? ` with ${esc(short(fx.model))}` : ""}</h3>`;
+        h += facts([["Fixing", (fx.failing || []).join(", ")], ["Files changed", (fx.updated || []).join(", ")]]);
+        if (fx.diagnosis) h += `<pre>${esc(fx.diagnosis)}</pre>`;
+      }
+      break;
+    }
+    case "supervisor": {
+      const revs = Object.values(S.reviewers);
+      if (!revs.length) { h += `<p class="empty">${f.supervisor_enabled === false ? "Reviewers are off for this run." : "Reviewers inspect the product once every check passes."}</p>`; break; }
+      h += `<div class="reviewers">${revs.map(r => `<article class="reviewer"><h4>${sym(r.status)} ${esc(r.reviewer)}</h4><div class="sub" style="margin:0">${esc(harnessLabel(r.harness))}${r.model ? " · " + esc(short(r.model)) : ""}${r.seconds ? `, ${r.seconds}s` : ""}</div><p>${esc(r.approved === true ? "Approved." : r.approved === false ? "Asked for changes." : "Reviewing…")} ${esc(r.summary || "")}</p>${(r.issues || []).length ? `<ul>${r.issues.map(i => `<li>${esc(i)}</li>`).join("")}</ul>` : ""}</article>`).join("")}</div>`;
+      if ((d.improvement_plan || []).length) h += `<h3>Improvement plan sent to the fixer</h3><ol>${d.improvement_plan.map(i => `<li>${esc(i)}</li>`).join("")}</ol>`;
+      if (DONE.has(status) || status === "failed") h += artifactButtons(["supervisor_review.json"]);
+      break;
+    }
+    case "report": {
+      const fin = S.finished;
+      if (!fin) { h += `<p class="empty">Written when the run ends.</p>`; break; }
+      const u = fin.usage || {};
+      const hasSplit = u.input_tokens != null || u.output_tokens != null || S.usage.hasSplit;
+      const inTok = u.input_tokens != null ? u.input_tokens : (S.usage.hasSplit ? S.usage.input : null);
+      const outTok = u.output_tokens != null ? u.output_tokens : (S.usage.hasSplit ? S.usage.output : null);
+      const costText = hasUnrecordedUsage({ calls: u.calls })
+        ? "Unknown (stopped before usage was recorded)"
+        : (u.cost_usd != null ? fmtCost(u.cost_usd) : "");
+      const tokenRows = hasSplit
+        ? [
+            ["Input tokens", inTok != null ? Number(inTok).toLocaleString() : ""],
+            ["Output tokens", outTok != null ? Number(outTok).toLocaleString() : ""],
+            ["Total tokens", u.tokens != null ? Number(u.tokens).toLocaleString() : ""],
+          ]
+        : [["Tokens", u.tokens != null ? Number(u.tokens).toLocaleString() : ""]];
+      h += facts([["Result", fin.result || fin.status], ["Model calls", u.calls], ...tokenRows, ["Cost", costText], ["Calls not priced", u.unpriced_calls ? `${u.unpriced_calls} (subscription or local)` : ""], ["Output file", d.report]]);
+      if (fin.error) h += `<p class="note bad">${esc(fin.error)}</p>`;
+      const stageRows = STAGES.filter(s => S.usageByStage[s.id]);
+      if (stageRows.length) {
+        h += `<h3>Usage by stage</h3><table><thead><tr><th>Stage</th><th>Calls</th><th>Input</th><th>Output</th><th>Total</th><th>Cost</th></tr></thead><tbody>`;
+        for (const s of stageRows) {
+          const bs = S.usageByStage[s.id];
+          const inCell = bs.hasSplit || bs.tokens === 0 ? fmtTokens(bs.input) : "—";
+          const outCell = bs.hasSplit || bs.tokens === 0 ? fmtTokens(bs.output) : "—";
+          const costNote = bs.cost > 0 ? fmtCost(bs.cost) + (bs.unpriced ? ` (+${bs.unpriced} unpriced)` : "") : (bs.unpriced ? "subscription / local" : "$0.00");
+          h += `<tr><td>${esc(s.name)}</td><td class="num-cell">${bs.calls}</td><td class="num-cell">${esc(inCell)}</td><td class="num-cell">${esc(outCell)}</td><td class="num-cell">${fmtTokens(bs.tokens)}</td><td class="num-cell">${esc(costNote)}</td></tr>`;
+        }
+        h += `</tbody></table>`;
+      }
+      const names = (S.run && S.run.mode === "plan") ? ["plan.md", "tokens.json", "manifest.json"] : ["report.md", "plan.md", "tokens.json", "manifest.json"];
+      h += artifactButtons(names);
+      break;
+    }
+  }
+  const lines = S.logs.filter(l => l.stage === id).slice(-80);
+  if (lines.length) h += `<h3>Log for this stage</h3><ol class="stage-log">${lines.map(l => `<li>${clock(l.ts)}  ${esc(l.text)}</li>`).join("")}</ol>`;
+  return h;
+}
+
+let lastDetailStructKey = "";
+function renderDetail(now) {
+  const id = selected || currentStage() || (S.finished ? "report" : "run");
+  const status = statusOf(id);
+  const structKey = `${id}|${status}|${S.lastSeq}|${selected || ""}`;
+  if (structKey === lastDetailStructKey) {
+    updateDetailClock(id, status, now);
+    return;
+  }
+  lastDetailStructKey = structKey;
+  const openKeys = new Set();
+  for (const el of $("detail").querySelectorAll("details[open][data-key]")) openKeys.add(el.dataset.key);
+
+  const lede = ledeText(id, status, now);
+  const body = detailBody(id, status, now);
+  $("detail").innerHTML = `<header>
+      <svg viewBox="0 0 32 32" aria-hidden="true"><path d="${GLYPHS[id]}"/></svg>
+      <h2>${esc(NAMES[id])}</h2>
+      <div class="detail-actions">
+        <button type="button" class="follow" data-filter-log="${esc(id)}">Filter log</button>
+        ${selected ? `<button type="button" class="follow" id="follow-live">Follow the run</button>` : ""}
+      </div>
+    </header>
+    <p class="lede" id="detail-lede">${esc(lede)}</p>${body}`;
+
+  for (const el of $("detail").querySelectorAll("details[data-key]")) {
+    if (openKeys.has(el.dataset.key)) el.open = true;
+  }
+}
+
+function updateDetailClock(id, status, now) {
+  const ledeEl = $("detail-lede");
+  if (ledeEl) ledeEl.textContent = ledeText(id, status, now);
+  const stallLabel = $("stall-label");
+  const stallFill = $("stall-fill");
+  if (stallLabel && stallFill) {
+    const a = activeAttempt();
+    const idle = idleSeconds(now);
+    if (a && a.name === "local" && a.stall_seconds) {
+      const curIdle = idle != null ? idle : 0;
+      const pct = Math.min(100, Math.round(100 * curIdle / a.stall_seconds));
+      stallLabel.textContent = `Last file change ${fmtDur(curIdle)} ago · stall handoff to ${S.attemptOrder[1] || "next builder"} at ${fmtDur(a.stall_seconds)}`;
+      stallFill.style.width = `${pct}%`;
+      stallFill.className = pct >= 85 ? "bad" : pct >= 60 ? "warn" : "";
+    }
+  }
+}
+
+/* ---------------- logs ---------------- */
+let logStage = "all";
+const pendingLogs = [];
+let lastChipAlertKey = "";
+function logMatches(l) {
+  if (logStage !== "all" && l.stage !== logStage) return false;
+  const lvl = $("log-level").value;
+  if (lvl === "warn" && !["WARNING", "ERROR", "CRITICAL"].includes(l.level)) return false;
+  if (lvl === "error" && !["ERROR", "CRITICAL"].includes(l.level)) return false;
+  const q = $("log-search").value.trim().toLowerCase();
+  return !q || l.text.toLowerCase().includes(q);
+}
+function logLi(l) { return `<li class="${esc(l.level)}"><time>${clock(l.ts)}</time><span class="text">${esc(l.text)}</span></li>`; }
+function renderLogChips() {
+  const opts = [["all", "All"], ...STAGES.map(s => [s.id, s.short])];
+  $("log-chips").innerHTML = opts.map(([v, n]) => {
+    const alert = v !== "all" ? S.logAlerts[v] : "";
+    const cls = alert === "err" ? "has-err" : alert === "warn" ? "has-warn" : "";
+    return `<button type="button" class="${cls}" data-log-stage="${v}" aria-pressed="${logStage === v}">${esc(n)}</button>`;
+  }).join("");
+}
+function rebuildLogs() {
+  const list = $("log-list");
+  const rows = S.logs.filter(logMatches).slice(-3000);
+  list.innerHTML = rows.length ? rows.map(logLi).join("") : `<li class="empty"><span></span><span>${S.logs.length ? "No log lines match these filters." : "Log lines appear here as Atlas works."}</span></li>`;
+  if ($("log-follow").checked) list.scrollTop = list.scrollHeight;
+}
+function flushLogs() {
+  const alertKey = logStage + "|" + JSON.stringify(S.logAlerts);
+  if (alertKey !== lastChipAlertKey) { lastChipAlertKey = alertKey; renderLogChips(); }
+  if (!pendingLogs.length) return;
+  const list = $("log-list");
+  const empty = list.querySelector(".empty");
+  if (empty) empty.remove();
+  const fresh = pendingLogs.splice(0).filter(logMatches);
+  if (fresh.length) list.insertAdjacentHTML("beforeend", fresh.map(logLi).join(""));
+  while (list.children.length > 3000) list.firstElementChild.remove();
+  if ($("log-follow").checked) list.scrollTop = list.scrollHeight;
+}
+
+/* ---------------- wiring ---------------- */
+let frame = 0;
+function schedule() { if (!frame) frame = requestAnimationFrame(() => { frame = 0; renderAll(); }); }
+function renderAll() {
+  const now = Date.now() / 1000;
+  renderRoute(); renderHeader(now); renderDetail(now); flushLogs();
+}
+setInterval(() => { if (S.run && !S.finished) { const now = Date.now() / 1000; renderHeader(now); renderDetail(now); } }, 1000);
+
+$("route").addEventListener("click", (e) => {
+  const li = e.target.closest(".station");
+  if (!li) return;
+  selected = li.dataset.stage; lastDetailStructKey = ""; activeArtifact = { name: null, html: "" }; renderAll();
+});
+$("route").addEventListener("keydown", (e) => {
+  const delta = (e.key === "ArrowRight" || e.key === "ArrowDown") ? 1
+    : (e.key === "ArrowLeft" || e.key === "ArrowUp") ? -1 : 0;
+  if (!delta) return;
+  const curBtn = e.target.closest(".station > button");
+  if (!curBtn) return;
+  const items = Array.from($("route").querySelectorAll(".station > button"));
+  const idx = items.indexOf(curBtn);
+  const next = items[idx + delta];
+  if (!next) return;
+  e.preventDefault();
+  next.focus();
+  selected = next.closest(".station").dataset.stage;
+  lastDetailStructKey = ""; activeArtifact = { name: null, html: "" }; renderAll();
+});
+$("detail").addEventListener("click", async (e) => {
+  if (e.target.id === "follow-live") { selected = null; lastDetailStructKey = ""; activeArtifact = { name: null, html: "" }; renderAll(); return; }
+  const filterStage = e.target.dataset && e.target.dataset.filterLog;
+  if (filterStage) {
+    logStage = filterStage;
+    if (document.body.classList.contains("logs-collapsed")) toggleLogs(false);
+    renderLogChips(); rebuildLogs();
+    return;
+  }
+  if (e.target.dataset && e.target.dataset.artifactClose) {
+    activeArtifact = { name: null, html: "" }; lastDetailStructKey = ""; renderAll(); return;
+  }
+  const name = e.target.dataset && e.target.dataset.artifact;
+  if (!name) return;
+  if (activeArtifact.name === name) { activeArtifact = { name: null, html: "" }; lastDetailStructKey = ""; renderAll(); return; }
+  const view = $("artifact-view");
+  try {
+    const res = await fetch(`/api/artifact/${encodeURIComponent(name)}`);
+    const html = res.ok ? `<pre>${esc(await res.text())}</pre>` : `<p class="note">${esc(name)} isn't available${res.status === 404 ? " for this run" : ""}.</p>`;
+    activeArtifact = { name, html };
+    if (view) view.innerHTML = html;
+    for (const b of $("detail").querySelectorAll("[data-artifact]")) b.setAttribute("aria-pressed", String(b.dataset.artifact === name));
+  } catch {
+    const html = `<p class="note">The run has ended and its live server closed. Run <code>atlas ui ${esc((S.run && S.run.out_dir) || "runs/<run-id>")}</code> to inspect its files.</p>`;
+    activeArtifact = { name, html };
+    if (view) view.innerHTML = html;
+  }
+});
+$("log-chips").addEventListener("click", (e) => {
+  const v = e.target.dataset && e.target.dataset.logStage;
+  if (!v) return;
+  logStage = v; renderLogChips(); rebuildLogs();
+});
+for (const id of ["log-level", "log-search"]) $(id).addEventListener("input", rebuildLogs);
+$("log-follow").addEventListener("change", () => { if ($("log-follow").checked) rebuildLogs(); });
+$("log-list").addEventListener("scroll", () => {
+  const l = $("log-list");
+  const atBottom = l.scrollHeight - l.scrollTop - l.clientHeight < 24;
+  if (!atBottom && $("log-follow").checked) $("log-follow").checked = false;
+});
+$("log-copy").addEventListener("click", async () => {
+  const text = S.logs.filter(logMatches).map(l => `[${clock(l.ts)}] ${l.text}`).join("\n");
+  try { await navigator.clipboard.writeText(text); $("log-copy").textContent = "Copied"; }
+  catch { $("log-copy").textContent = "Failed"; }
+  setTimeout(() => { $("log-copy").textContent = "Copy"; }, 1500);
+});
+function toggleLogs(collapsed) {
+  document.body.classList.toggle("logs-collapsed", collapsed);
+  $("log-collapse").textContent = collapsed ? "Show logs" : "Hide";
+  $("log-collapse").setAttribute("aria-expanded", String(!collapsed));
+}
+$("log-collapse").addEventListener("click", () => toggleLogs(!document.body.classList.contains("logs-collapsed")));
+$("log-resizer").addEventListener("pointerdown", (e) => {
+  if (document.body.classList.contains("logs-collapsed")) return;
+  const startY = e.clientY;
+  const startH = document.querySelector(".logs").getBoundingClientRect().height;
+  const onMove = (ev) => {
+    const nextH = Math.max(120, Math.min(window.innerHeight * 0.7, startH + (startY - ev.clientY)));
+    document.documentElement.style.setProperty("--log-height", `${Math.round(nextH)}px`);
+  };
+  const onUp = () => { window.removeEventListener("pointermove", onMove); window.removeEventListener("pointerup", onUp); };
+  window.addEventListener("pointermove", onMove);
+  window.addEventListener("pointerup", onUp);
+});
+$("copy-replay").addEventListener("click", async () => {
+  const cmd = `atlas ui ${(S.run && S.run.out_dir) || "runs/<run-id>"}`;
+  try { await navigator.clipboard.writeText(cmd); $("copy-replay").textContent = "Copied!"; }
+  catch { $("copy-replay").textContent = "Copy failed"; }
+  setTimeout(() => { $("copy-replay").textContent = "Copy replay cmd"; }, 1800);
+});
+const THEMES = ["auto", "light", "dark"];
+function applyTheme(t) {
+  if (t === "auto") delete document.documentElement.dataset.theme; else document.documentElement.dataset.theme = t;
+  $("theme-toggle").textContent = `Theme: ${t}`;
+}
+let theme = "auto";
+try { theme = localStorage.getItem("atlas-ui-theme") || "auto"; } catch {}
+applyTheme(theme);
+$("theme-toggle").addEventListener("click", () => {
+  theme = THEMES[(THEMES.indexOf(theme) + 1) % THEMES.length];
+  applyTheme(theme);
+  try { localStorage.setItem("atlas-ui-theme", theme); } catch {}
+});
+
+async function loadInfo() {
+  try {
+    const res = await fetch("/api/info");
+    if (res.ok) {
+      const info = await res.json();
+      S.serverMode = info.mode || "live";
+      updateConnectionBadge();
+    }
+  } catch {}
+}
+
+function connect() {
+  let failures = 0;
+  const es = new EventSource("/api/events");
+  es.onopen = () => { failures = 0; S.connected = true; S.streamFailed = false; updateConnectionBadge(); };
+  es.onmessage = (m) => {
+    try { apply(JSON.parse(m.data)); } catch (err) { console.error(err); }
+    schedule();
+  };
+  es.addEventListener("end", () => {
+    es.close();
+    S.streamEnded = true;
+    S.connected = false;
+    updateConnectionBadge();
+    schedule();
+  });
+  es.onerror = () => {
+    S.connected = false;
+    if (S.finished) { S.streamEnded = true; es.close(); updateConnectionBadge(); return; }
+    failures += 1;
+    if (failures > 5) { S.streamFailed = true; es.close(); }
+    updateConnectionBadge();
+  };
+}
+loadInfo();
+renderLogChips();
+renderAll();
+connect();
+</script>
+</body>
+</html>

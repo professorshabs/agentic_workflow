@@ -11,6 +11,7 @@ from typing import Any
 import litellm
 import yaml
 
+from atlas.events import publish, publishing
 from atlas.schemas import TokenUsageSummary
 from atlas.telemetry import extract_usage_metrics, summarize_usage
 
@@ -37,6 +38,15 @@ _PROVIDER_DOWN_STATUSES = {401, 402}
 _MODEL_DOWN_STATUSES = {403, 404}
 # Client errors that the same request will hit again: do not retry the same model.
 _NO_RETRY_STATUSES = {400, 401, 402, 403, 404, 422}
+_ROLE_STAGE = {
+    "parser": "parse",
+    "researcher": "research",
+    "judge": "judge",
+    "e2e": "e2e_tests",
+    "builder": "build",
+    "fixer": "fix",
+    "supervisor": "supervisor",
+}
 _ALLOWED_BACKEND_TYPES = {"openrouter", "litellm", "harness", "local_harness"}
 _ALLOWED_HARNESS_PROVIDERS = {"antigravity", "claude_code"}
 _ALLOWED_LOCAL_HARNESSES = {"antigravity_sdk"}
@@ -45,6 +55,7 @@ _ALLOWED_AUTH_MODES = {"subscription", "oauth_token", "api"}
 _ALLOWED_SUPERVISOR_TOOLS = {"Read", "Grep", "Glob"}
 _ALLOWED_SUPERVISOR_MODES = {"unanimous", "any_approve"}
 _ALLOWED_SUPERVISOR_TYPES = {"harness", "openrouter", "litellm"}
+_ALLOWED_EFFORT_LEVELS = {"low", "medium", "high", "xhigh", "max"}
 
 
 def _validate_offload_targets(label: str, targets: Any) -> None:
@@ -59,10 +70,10 @@ def _validate_offload_targets(label: str, targets: Any) -> None:
             raise ValueError(f"{tlabel} must be a mapping")
         ttype = str(target.get("type") or "harness").strip()
         if ttype == "harness":
-            if target.get("provider", "antigravity") != "antigravity":
+            prov = target.get("provider", "antigravity")
+            if prov not in _ALLOWED_HARNESS_PROVIDERS:
                 raise ValueError(
-                    f"{tlabel}.provider must be 'antigravity' (the only harness that can "
-                    "write a workspace; Claude Code runs read-only in Atlas)"
+                    f"{tlabel}.provider must be one of {sorted(_ALLOWED_HARNESS_PROVIDERS)}"
                 )
         elif ttype in ("openrouter", "litellm"):
             model = target.get("model")
@@ -70,20 +81,37 @@ def _validate_offload_targets(label: str, targets: Any) -> None:
                 raise ValueError(f"{tlabel}.model must be a non-empty string")
         else:
             raise ValueError(f"{tlabel}.type must be 'harness', 'openrouter' or 'litellm'")
+        auth_val = target.get("auth")
+        if auth_val is not None and auth_val not in _ALLOWED_AUTH_MODES:
+            raise ValueError(f"{tlabel}.auth must be one of {sorted(_ALLOWED_AUTH_MODES)}")
+        effort = target.get("effort")
+        if effort is not None and (
+            not isinstance(effort, str) or effort not in _ALLOWED_EFFORT_LEVELS
+        ):
+            raise ValueError(
+                f"{tlabel}.effort must be one of {sorted(_ALLOWED_EFFORT_LEVELS)}"
+            )
+        max_budget = target.get("max_budget_usd")
+        if max_budget is not None and (
+            isinstance(max_budget, bool) or float(max_budget) <= 0
+        ):
+            raise ValueError(f"{tlabel}.max_budget_usd must be > 0")
         timeout = target.get("timeout_seconds")
         if timeout is not None and (isinstance(timeout, bool) or float(timeout) <= 0):
             raise ValueError(f"{tlabel}.timeout_seconds must be > 0")
 
 
-def _validate_harness_fields(label: str, cfg: dict[str, Any]) -> None:
+def _validate_harness_fields(
+    label: str, cfg: dict[str, Any], *, allow_workspace: bool = False
+) -> None:
     prov = cfg.get("provider")
     if prov not in _ALLOWED_HARNESS_PROVIDERS:
         raise ValueError(
             f"{label}.provider must be one of {sorted(_ALLOWED_HARNESS_PROVIDERS)}"
         )
-    if prov == "claude_code" and cfg.get("read_only") is False:
+    if prov == "claude_code" and not allow_workspace and cfg.get("read_only") is False:
         raise ValueError(f"{label}: claude_code backend is strictly read-only")
-    if prov == "claude_code" and cfg.get("tools") is not None:
+    if prov == "claude_code" and not allow_workspace and cfg.get("tools") is not None:
         tools = cfg["tools"]
         if not isinstance(tools, list) or any(
             t not in _ALLOWED_SUPERVISOR_TOOLS for t in tools
@@ -94,6 +122,13 @@ def _validate_harness_fields(label: str, cfg: dict[str, Any]) -> None:
     auth_val = cfg.get("auth")
     if auth_val is not None and auth_val not in _ALLOWED_AUTH_MODES:
         raise ValueError(f"{label}.auth must be one of {sorted(_ALLOWED_AUTH_MODES)}")
+    effort = cfg.get("effort")
+    if effort is not None and (
+        not isinstance(effort, str) or effort not in _ALLOWED_EFFORT_LEVELS
+    ):
+        raise ValueError(
+            f"{label}.effort must be one of {sorted(_ALLOWED_EFFORT_LEVELS)}"
+        )
     fb_mode = cfg.get("fallback")
     if fb_mode is not None and fb_mode != "router":
         raise ValueError(f"{label}.fallback must be 'router' or null")
@@ -109,6 +144,34 @@ def _validate_harness_fields(label: str, cfg: dict[str, Any]) -> None:
         not isinstance(cfg["router_model"], str) or not cfg["router_model"].strip()
     ):
         raise ValueError(f"{label}.router_model must be a non-empty string")
+
+
+def _validate_fixer_rotate(rotate: Any) -> None:
+    """Validate `backends.fixer.rotate`: non-empty list of model strings or target dicts."""
+    if not isinstance(rotate, list) or not rotate:
+        raise ValueError("backends['fixer'].rotate must be a non-empty list")
+    for idx, entry in enumerate(rotate):
+        elabel = f"backends['fixer'].rotate[{idx}]"
+        if isinstance(entry, str):
+            if not entry.strip():
+                raise ValueError("backends['fixer'].rotate must be a non-empty list")
+            continue
+        if not isinstance(entry, dict):
+            raise ValueError(f"{elabel} must be a model string or mapping")
+        etype = str(entry.get("type") or "openrouter").strip()
+        if etype == "harness":
+            _validate_harness_fields(elabel, entry)
+        elif etype in ("openrouter", "litellm"):
+            rmodel = entry.get("model")
+            if not isinstance(rmodel, str) or not rmodel.strip():
+                raise ValueError(f"{elabel}.model must be a non-empty string")
+            timeout = entry.get("timeout_seconds")
+            if timeout is not None and (isinstance(timeout, bool) or float(timeout) <= 0):
+                raise ValueError(f"{elabel}.timeout_seconds must be > 0")
+        else:
+            raise ValueError(
+                f"{elabel}.type '{etype}' must be 'harness', 'openrouter' or 'litellm'"
+            )
 
 
 def _status_code(exc: BaseException) -> int | None:
@@ -312,7 +375,14 @@ class ModelRouter:
                         f"backends['{role}'].offload is only supported with type local_harness"
                     )
                 if btype == "harness":
-                    _validate_harness_fields(f"backends['{role}']", bcfg)
+                    if role == "fixer" and "rotate" in bcfg and bcfg.get("provider") is None:
+                        fb_mode = bcfg.get("fallback")
+                        if fb_mode is not None and fb_mode != "router":
+                            raise ValueError("backends['fixer'].fallback must be 'router' or null")
+                    else:
+                        _validate_harness_fields(
+                            f"backends['{role}']", bcfg, allow_workspace=(role == "builder")
+                        )
                 elif btype == "local_harness":
                     lh = bcfg.get("local_harness", "antigravity_sdk")
                     if lh not in _ALLOWED_LOCAL_HARNESSES:
@@ -344,12 +414,8 @@ class ModelRouter:
                             f"backends['{role}'].local_providers must be a non-empty dict or "
                             f"list of {sorted(_ALLOWED_LOCAL_PROVIDERS)}"
                         )
-                elif role == "fixer" and bcfg.get("rotate") is not None:
-                    rot = bcfg["rotate"]
-                    if not isinstance(rot, list) or not rot or not all(
-                        isinstance(m, str) and m.strip() for m in rot
-                    ):
-                        raise ValueError("backends['fixer'].rotate must be a non-empty list")
+                if role == "fixer" and bcfg.get("rotate") is not None:
+                    _validate_fixer_rotate(bcfg["rotate"])
 
         limits_extra = self.cfg.get("limits_extra")
         if limits_extra is not None:
@@ -563,6 +629,26 @@ class ModelRouter:
         skills = self.cfg.get("skills")
         return dict(skills) if isinstance(skills, dict) else {}
 
+    def _append_call(self, entry: dict[str, Any]) -> None:
+        """Record one billed (or free) model call and tell a listening UI about it."""
+        self.call_log.append(entry)
+        if publishing():
+            role = str(entry.get("role") or "")
+            publish(
+                "usage",
+                _ROLE_STAGE.get(role, "run"),
+                "failed" if entry.get("error") else "passed",
+                role=role,
+                model=entry.get("used_model") or entry.get("requested_model"),
+                harness=entry.get("harness"),
+                tokens=int(entry.get("total_tokens") or 0),
+                input_tokens=int(entry.get("prompt_tokens") or 0),
+                output_tokens=int(entry.get("completion_tokens") or 0),
+                cost_usd=entry.get("cost_usd"),
+                cost_source=entry.get("cost_source"),
+                error=str(entry.get("error") or "")[:300],
+            )
+
     def record_harness_call(
         self,
         *,
@@ -584,7 +670,7 @@ class ModelRouter:
         error: str | None = None,
     ) -> None:
         """Append one harness invocation's honest telemetry into `call_log`."""
-        self.call_log.append(
+        self._append_call(
             {
                 "role": role,
                 "requested_model": requested_model,
@@ -625,6 +711,9 @@ class ModelRouter:
         sem = self._get_role_semaphore(role)
         started = time.monotonic()
         adapter = get_harness_adapter(provider)
+        extra_kwargs: dict[str, Any] = {}
+        if backend.get("effort") is not None:
+            extra_kwargs["effort"] = str(backend["effort"])
         try:
             async with sem:
                 self._check_budget()
@@ -642,6 +731,7 @@ class ModelRouter:
                         else None
                     ),
                     tools=list(backend["tools"]) if backend.get("tools") is not None else None,
+                    **extra_kwargs,
                 )
             self.record_harness_call(
                 role=role or "unknown",
@@ -685,12 +775,14 @@ class ModelRouter:
                 error=f"{type(exc).__name__}: {exc}",
             )
             if isinstance(exc, HarnessError) and backend.get("fallback") == "router":
+                fallback_model = str(backend.get("router_model") or model)
                 logger.warning(
-                    "Harness failed for role '%s' (%s); falling back to LiteLLM ModelRouter.",
+                    "Harness failed for role '%s' (%s); falling back to LiteLLM ModelRouter (%s).",
                     role,
                     exc,
+                    fallback_model,
                 )
-                return await self._complete_litellm(model, system, user, role=role)
+                return await self._complete_litellm(fallback_model, system, user, role=role)
             raise
 
     async def complete_structured(
@@ -702,9 +794,10 @@ class ModelRouter:
         role: str | None = None,
         json_schema: dict[str, Any] | None = None,
         use_harness: bool = True,
+        backend_override: dict[str, Any] | None = None,
     ) -> tuple[str, str]:
         """Dispatch structured JSON request with optional JSON Schema enforcement for harnesses."""
-        backend = self.backend_for(role)
+        backend = dict(backend_override) if backend_override is not None else self.backend_for(role)
         if use_harness and backend.get("type") == "harness":
             return await self._complete_with_harness(
                 backend, model, system, user, role=role, json_schema=json_schema
@@ -735,7 +828,7 @@ class ModelRouter:
         def record(response: Any, candidate: str, error: str | None = None) -> None:
             # Every response the provider returned is logged, including unusable ones:
             # they are normally billed, so leaving them out would under-report spend.
-            self.call_log.append(
+            self._append_call(
                 {
                     "role": role,
                     "requested_model": model,

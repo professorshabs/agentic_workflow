@@ -1,4 +1,4 @@
-"""Strictly read-only Claude Code CLI adapter for Judge / Supervisor checkpoints."""
+"""Claude Code CLI adapter: read-only for Judge/Supervisor and file-scoped for Builder offload."""
 
 from __future__ import annotations
 
@@ -18,10 +18,16 @@ from .base import (
     HarnessError,
     HarnessInvocationResult,
     HarnessUnavailableError,
+    capture_workspace_build_result,
+    find_git_changes_outside_app,
     scoped_subprocess_env,
+    snapshot_file_hashes,
+    snapshot_git_status,
 )
 
 ALLOWED_READONLY_TOOLS = {"Read", "Grep", "Glob"}
+ALLOWED_WORKSPACE_TOOLS = ("Read", "Grep", "Glob", "Edit", "Write")
+ALLOWED_EFFORT_LEVELS = frozenset({"low", "medium", "high", "xhigh", "max"})
 
 _AUTH_ERROR_MARKERS = (
     "not logged in",
@@ -379,6 +385,7 @@ class ClaudeCodeAdapter(HarnessAdapter):
         max_budget_usd: float | None = None,
         tools: list[str] | None = None,
         cwd: Path | None = None,
+        effort: str | None = None,
     ) -> HarnessInvocationResult:
         """Execute a strictly read-only evaluation (`--tools ""` or `--tools Read,Grep,Glob`)."""
         binary = self._find_binary()
@@ -386,6 +393,12 @@ class ClaudeCodeAdapter(HarnessAdapter):
             raise HarnessUnavailableError(
                 "Claude Code CLI (`claude`) is not installed on PATH. "
                 "Install it or switch Judge to `antigravity` (`claude-opus-5-5-high`)."
+            )
+
+        if effort is not None and effort not in ALLOWED_EFFORT_LEVELS:
+            raise ValueError(
+                f"Unsupported Claude Code effort level '{effort}'; expected one of "
+                f"{sorted(ALLOWED_EFFORT_LEVELS)}"
             )
 
         if tools is not None:
@@ -410,6 +423,7 @@ class ClaudeCodeAdapter(HarnessAdapter):
             "-p",
             "--model",
             model,
+            *(["--effort", effort] if effort is not None else []),
             "--output-format",
             "json",
             "--tools",
@@ -458,7 +472,94 @@ class ClaudeCodeAdapter(HarnessAdapter):
         timeout_seconds: float = 600.0,
         sandbox: bool = True,
         skill_dirs: list[Path] | None = None,
+        auth: str | None = None,
+        max_budget_usd: float | None = None,
+        effort: str | None = None,
     ) -> tuple[WorkspaceBuildResult, HarnessInvocationResult]:
-        raise NotImplementedError(
-            "ClaudeCodeAdapter is strictly read-only and cannot modify workspace files."
+        """Build or edit workspace files inside `app_dir` using file-only tools (`acceptEdits`)."""
+        del skill_dirs
+        if role != "builder":
+            raise ValueError(
+                "ClaudeCodeAdapter.run_workspace_task is only permitted for role 'builder'."
+            )
+        if effort is not None and effort not in ALLOWED_EFFORT_LEVELS:
+            raise ValueError(
+                f"Unsupported Claude Code effort level '{effort}'; expected one of "
+                f"{sorted(ALLOWED_EFFORT_LEVELS)}"
+            )
+        binary = self._find_binary()
+        if not binary:
+            raise HarnessUnavailableError(
+                "Claude Code CLI (`claude`) is not installed on PATH. "
+                "Install it or configure a different builder offload target."
+            )
+
+        env = _claude_env(auth)
+        auth_mode = _resolved_auth_mode(auth, env)
+        version = await self._version(binary, env)
+        app_dir.mkdir(parents=True, exist_ok=True)
+        resolved_app_dir = app_dir.resolve()
+        before_hashes = snapshot_file_hashes(resolved_app_dir)
+        before_git = snapshot_git_status(resolved_app_dir)
+
+        tools_csv = ",".join(ALLOWED_WORKSPACE_TOOLS)
+        args = [
+            binary,
+            "-p",
+            "--model",
+            model,
+            *(["--effort", effort] if effort is not None else []),
+            "--output-format",
+            "json",
+            "--permission-mode",
+            "acceptEdits",
+            *(["--restricted"] if sandbox else []),
+            "--tools",
+            tools_csv,
+            "--no-session-persistence",
+        ]
+        if max_budget_usd is not None:
+            args.extend(["--max-budget-usd", format(max_budget_usd, "g")])
+
+        started = time.monotonic()
+        rc, out, err = await _run_cli(
+            args,
+            env=env,
+            timeout_seconds=timeout_seconds,
+            cwd=resolved_app_dir,
+            input_text=prompt_text,
         )
+        elapsed_ms = round((time.monotonic() - started) * 1000, 1)
+
+        envelope = _parse_envelope(out)
+        if rc != 0 or (envelope is not None and envelope.get("is_error") is True):
+            raise _claude_failure(role=role, rc=rc, stdout=out, stderr=err, auth_mode=auth_mode)
+
+        text, usage = _extract_claude_text_and_usage(out, auth_mode=auth_mode)
+        escaped_paths = find_git_changes_outside_app(resolved_app_dir, before_git)
+        if escaped_paths:
+            raise HarnessError(
+                f"Harness modified files outside '{app_dir}': {', '.join(escaped_paths)}",
+                usage=usage,
+            )
+
+        build_result = capture_workspace_build_result(
+            resolved_app_dir,
+            before_hashes,
+            summary=text or f"Workspace built by claude_code ({model})",
+            harness=self.provider,
+            harness_version=version,
+            model=model,
+            exit_code=rc,
+        )
+        invocation = HarnessInvocationResult(
+            text=text.strip() or build_result.summary,
+            used_model=model,
+            harness=self.provider,
+            harness_version=version,
+            auth_mode=auth_mode,
+            elapsed_ms=elapsed_ms,
+            exit_code=rc,
+            **usage,
+        )
+        return build_result, invocation

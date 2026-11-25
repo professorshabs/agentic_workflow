@@ -286,6 +286,7 @@ class HarnessAdapter(ABC):
         max_budget_usd: float | None = None,
         tools: list[str] | None = None,
         cwd: Path | None = None,
+        effort: str | None = None,
     ) -> HarnessInvocationResult:
         """Execute a structured, non-mutating call returning JSON or plain text."""
 
@@ -300,5 +301,8 @@ class HarnessAdapter(ABC):
         timeout_seconds: float = 600.0,
         sandbox: bool = True,
         skill_dirs: list[Path] | None = None,
+        auth: str | None = None,
+        max_budget_usd: float | None = None,
+        effort: str | None = None,
     ) -> tuple[WorkspaceBuildResult, HarnessInvocationResult]:
         """Execute a workspace build/edit task confined inside `app_dir`."""

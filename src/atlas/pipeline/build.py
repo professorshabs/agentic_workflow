@@ -11,6 +11,7 @@ import time
 from pathlib import Path
 from typing import Any
 
+from atlas.events import publish
 from atlas.harnesses import (
     AntigravitySDKAdapter,
     HarnessError,
@@ -161,7 +162,10 @@ def _resolve_model(router: ModelRouter, role: str, fallbacks: tuple[str, ...]) -
 
 
 def _format_e2e_contract(
-    e2e_suite: E2ETestSuite, *, preseeded: bool = False
+    e2e_suite: E2ETestSuite,
+    *,
+    preseeded: bool = False,
+    workspace_root: Path | None = None,
 ) -> str:
     if not e2e_suite.verifiable:
         reason = e2e_suite.unverifiable_reason or "Not verifiable offline"
@@ -171,10 +175,14 @@ def _format_e2e_contract(
             f"- Automated offline E2E tests unavailable: {reason}"
         )
     if preseeded:
+        test_paths = [
+            str((workspace_root / f.path).resolve()) if workspace_root is not None else f.path
+            for f in e2e_suite.files
+        ]
         payload: dict[str, Any] = {
             "product_interface": e2e_suite.product_interface,
             "scenarios": e2e_suite.scenarios,
-            "preseeded_test_files": [f.path for f in e2e_suite.files],
+            "preseeded_test_files": test_paths,
             "instructions": (
                 "These authoritative E2E test files are already on disk. Read them directly "
                 "and run pytest / node test against them while building; do NOT delete or "
@@ -252,6 +260,36 @@ async def build_app(
     return generated
 
 
+def fixer_target_for_round(
+    router: ModelRouter, fix_round: int
+) -> tuple[str, dict[str, Any] | None, str]:
+    """Return `(fallback_model, backend_override, display_label)` for `fix_round` (1-based)."""
+    bcfg = router.backend_for("fixer")
+    rotate = bcfg.get("rotate")
+    default_fb = _resolve_model(router, "fixer", ("builder", "judge"))
+    if isinstance(rotate, list) and rotate:
+        entry = rotate[(max(1, fix_round) - 1) % len(rotate)]
+        if isinstance(entry, dict):
+            etype = str(entry.get("type") or "openrouter").strip()
+            if etype == "harness":
+                prov = str(entry.get("provider") or "harness")
+                hmodel = str(entry.get("model") or default_fb)
+                override = dict(entry)
+                if override.get("fallback") is None and bcfg.get("fallback") is not None:
+                    override["fallback"] = bcfg["fallback"]
+                fb_model = str(entry.get("router_model") or default_fb)
+                return fb_model, override, f"{prov}/{hmodel}"
+            rmodel = str(entry.get("model") or default_fb)
+            return rmodel, dict(entry), rmodel
+        return str(entry), None, str(entry)
+    return default_fb, None, role_target_label(router, "fixer", fallback_model=default_fb)
+
+
+def fixer_model_for_round(router: ModelRouter, fix_round: int) -> str:
+    """Display target or model string for `fix_round` (1-based)."""
+    return fixer_target_for_round(router, fix_round)[2]
+
+
 async def fix_app(
     router: ModelRouter,
     spec: ParsedSpec,
@@ -263,12 +301,7 @@ async def fix_app(
     previous_diagnoses: list[str] | None = None,
 ) -> PatchResult:
     """Diagnose failing verification checks and generate file patches."""
-    fixer_backend = router.backend_for("fixer")
-    rotate = fixer_backend.get("rotate")
-    if isinstance(rotate, list) and rotate:
-        model = str(rotate[(max(1, fix_round) - 1) % len(rotate)])
-    else:
-        model = _resolve_model(router, "fixer", ("builder", "judge"))
+    model, backend_override, target = fixer_target_for_round(router, fix_round)
 
     failing_checks = [
         {
@@ -302,7 +335,6 @@ async def fix_app(
     if skill_prompt:
         system = f"{system.rstrip()}\n\n{skill_prompt}"
 
-    target = role_target_label(router, "fixer", fallback_model=model)
     logger.info(
         "[fix] Calling model %s (round %d, %d failing check(s), %d workspace file(s))...",
         target,
@@ -317,6 +349,7 @@ async def fix_app(
         system=system,
         user=json.dumps(payload, indent=2),
         schema=PatchResult,
+        backend_override=backend_override,
     )
     return patch
 
@@ -454,8 +487,21 @@ async def supervise_app(
         rtype = str(rcfg.get("type") or "harness").strip()
         rev_started = time.monotonic()
         logger.info("[supervisor] Starting reviewer '%s' (%s)...", reviewer_name, rtype)
+        publish("reviewer", "supervisor", "running", reviewer=reviewer_name, harness=rtype)
 
         def _finish_verdict(verdict: ReviewerVerdict) -> ReviewerVerdict:
+            publish(
+                "reviewer",
+                "supervisor",
+                "passed" if verdict.approved else "partial",
+                reviewer=verdict.reviewer,
+                model=verdict.model,
+                harness=verdict.harness,
+                approved=verdict.approved,
+                issues=verdict.issues[:20],
+                summary=verdict.summary[:800],
+                seconds=round(time.monotonic() - rev_started, 1),
+            )
             logger.info(
                 "[supervisor] Reviewer '%s' (%s/%s): %s in %.1fs (%d issue(s))",
                 verdict.reviewer,
@@ -490,6 +536,9 @@ async def supervise_app(
             adapter = get_harness_adapter(provider)
             try:
                 router._check_budget()
+                sup_extra: dict[str, Any] = {}
+                if rcfg.get("effort") is not None:
+                    sup_extra["effort"] = str(rcfg["effort"])
                 res = await adapter.run_structured(
                     role="supervisor",
                     model=model,
@@ -501,6 +550,7 @@ async def supervise_app(
                     max_budget_usd=max_budget,
                     tools=tools,
                     cwd=resolved_app_dir,
+                    **sup_extra,
                 )
             except TokenBudgetExceededError:
                 raise
@@ -633,7 +683,16 @@ def _build_workspace_prompt(
     e2e_preseeded: bool = False,
     previous_attempt: bool = False,
     max_prompt_chars: int = 12_000,
+    workspace_root: Path | None = None,
+    require_absolute_paths: bool = False,
 ) -> str:
+    resolved_root = workspace_root.resolve() if workspace_root is not None else None
+
+    def _path_ref(rel: str) -> str:
+        if resolved_root is not None and require_absolute_paths:
+            return str((resolved_root / rel).resolve())
+        return rel
+
     parts = [prompt("build_workspace").strip()]
     if skill_prompt:
         parts.append(skill_prompt)
@@ -644,19 +703,27 @@ def _build_workspace_prompt(
         "- Include the requirement ID (for example `# R001` or `// R001`) in tests covering each "
         "functional requirement so `spec-coverage` verification passes.",
     ]
+    if resolved_root is not None:
+        workspace_notes.append(f"- Workspace root directory: `{resolved_root}`.")
+    if require_absolute_paths and resolved_root is not None:
+        workspace_notes.append(
+            f"- IMPORTANT: Always pass full absolute paths under `{resolved_root}` to every "
+            f"file tool (for example `{resolved_root}/BUILD_BRIEF.md`, never relative filenames "
+            "like `BUILD_BRIEF.md`)."
+        )
     if brief_file:
         workspace_notes.append(
-            f"- Read `{brief_file}` first: it lists the chosen approach for each requirement, "
-            "answers to clarifying questions and the implementation tasks."
+            f"- Read `{_path_ref(brief_file)}` first: it lists the chosen approach for each "
+            "requirement, answers to clarifying questions and the implementation tasks."
         )
         if plan_file:
             workspace_notes.append(
-                f"- `{plan_file}` is the long research version of the plan; do not read it "
-                "whole (it does not fit your context)."
+                f"- `{_path_ref(plan_file)}` is the long research version of the plan; do not "
+                "read it whole (it does not fit your context)."
             )
     elif plan_file:
         workspace_notes.append(
-            f"- Read `{plan_file}` on disk for the full architecture plan, clarified "
+            f"- Read `{_path_ref(plan_file)}` on disk for the full architecture plan, clarified "
             "assumptions, chosen libraries, and implementation tasks before writing code."
         )
     if previous_attempt:
@@ -686,11 +753,18 @@ def _build_workspace_prompt(
                 + json.dumps({"decisions": decisions_payload, "tasks": plan.tasks}, indent=2)
             )
     if e2e_suite is not None:
-        parts.append(_format_e2e_contract(e2e_suite, preseeded=e2e_preseeded))
+        parts.append(
+            _format_e2e_contract(
+                e2e_suite,
+                preseeded=e2e_preseeded,
+                workspace_root=resolved_root if require_absolute_paths else None,
+            )
+        )
 
     assembled = "\n\n".join(parts)
     if max_prompt_chars > 0 and len(assembled) > max_prompt_chars:
-        on_disk = brief_file or plan_file
+        raw_ref = brief_file or plan_file
+        on_disk = _path_ref(raw_ref) if raw_ref else None
         trailer = (
             f"\n\n... [prompt trimmed to fit local context window; read `{on_disk}` on disk]"
             if on_disk
@@ -732,6 +806,7 @@ async def _run_local_build(
     timeout_seconds: float,
     skill_dirs: list[Path] | None,
     local_model_override: str | None,
+    emit_passed: bool = True,
 ) -> WorkspaceBuildResult:
     """Resolve the configured local model and build in `root` with the Antigravity SDK."""
     explicit_model = local_model_override or backend.get("local_model")
@@ -743,6 +818,15 @@ async def _run_local_build(
         "[build] Resolving local model (explicit=%s)...",
         explicit_model or "auto",
     )
+    publish(
+        "attempt",
+        "build",
+        "running",
+        attempt="local",
+        phase="resolving",
+        provider="antigravity_sdk",
+        model=str(explicit_model or "auto"),
+    )
     resolution = await resolve_local_model(
         explicit_model=str(explicit_model) if explicit_model else None,
         providers=providers,
@@ -750,9 +834,28 @@ async def _run_local_build(
         **local_resolution_kwargs(backend),
     )
     if resolution.selected is None:
+        publish(
+            "attempt",
+            "build",
+            "failed",
+            attempt="local",
+            provider="antigravity_sdk",
+            error=resolution.reason,
+        )
         raise HarnessUnavailableError(resolution.reason)
 
     candidate = resolution.selected
+    publish(
+        "attempt",
+        "build",
+        "running",
+        attempt="local",
+        phase="building",
+        provider="antigravity_sdk",
+        model=f"{candidate.provider}/{candidate.name}",
+        stall_seconds=backend.get("stall_seconds"),
+        timeout_seconds=timeout_seconds,
+    )
     logger.info(
         "[build] Selected local model %s/%s — starting Antigravity SDK agent...",
         candidate.provider,
@@ -783,8 +886,26 @@ async def _run_local_build(
             cost_source="local_free",
             error=f"{type(exc).__name__}: {exc}",
         )
+        publish(
+            "attempt",
+            "build",
+            "failed",
+            attempt="local",
+            provider="antigravity_sdk",
+            error=f"{type(exc).__name__}: {exc}",
+        )
         raise
     _record_build_success(router, requested_model=candidate.name, invocation=invocation)
+    if emit_passed:
+        publish(
+            "attempt",
+            "build",
+            "passed",
+            attempt="local",
+            provider="antigravity_sdk",
+            model=invocation.used_model,
+            files=len(result.created_files) + len(result.modified_files),
+        )
     return result
 
 
@@ -797,10 +918,14 @@ async def _run_harness_build(
     root: Path,
     timeout_seconds: float,
     sandbox: bool,
+    auth: str | None = None,
+    max_budget_usd: float | None = None,
+    effort: str | None = None,
 ) -> WorkspaceBuildResult:
-    """Build in `root` with a CLI workspace harness (`agy`), recording billed usage."""
+    """Build in `root` with a CLI workspace harness (`agy` or `claude_code`), recording usage."""
     adapter = get_harness_adapter(provider)
     logger.info("[build] Starting %s workspace harness (model=%s)...", provider, model)
+    ws_extra: dict[str, Any] = {"effort": effort} if effort is not None else {}
     try:
         result, invocation = await adapter.run_workspace_task(
             role="builder",
@@ -809,6 +934,9 @@ async def _run_harness_build(
             app_dir=root,
             timeout_seconds=timeout_seconds,
             sandbox=sandbox,
+            auth=auth,
+            max_budget_usd=max_budget_usd,
+            **ws_extra,
         )
     except Exception as exc:
         failed_usage: dict[str, Any] = dict(getattr(exc, "usage", None) or {})
@@ -818,6 +946,7 @@ async def _run_harness_build(
             used_model=model,
             harness=provider,
             harness_version=None,
+            auth_mode=failed_usage.get("auth_mode"),
             elapsed_ms=0.0,
             prompt_tokens=int(failed_usage.get("prompt_tokens") or 0),
             completion_tokens=int(failed_usage.get("completion_tokens") or 0),
@@ -885,21 +1014,44 @@ async def _offload_build(
 ) -> WorkspaceBuildResult:
     """Hand the build to stronger models in order until one succeeds."""
     failures = [f"local: {type(local_error).__name__}: {local_error}"]
-    for target in targets:
+    for idx, target in enumerate(targets):
         label = _offload_label(target)
         target_type = str(target.get("type") or "harness")
+        has_next = idx + 1 < len(targets)
+        provider = (
+            str(target.get("provider") or "antigravity")
+            if target_type == "harness"
+            else target_type
+        )
+        default_model = "sonnet" if provider == "claude_code" else "gemini-4-hydrogen-high"
+        display_model = str(
+            target.get("model") or (default_model if target_type == "harness" else "")
+        )
+        publish(
+            "attempt",
+            "build",
+            "running",
+            attempt=label,
+            phase="building",
+            provider=provider,
+            model=display_model,
+        )
         try:
             router._check_budget()
             if target_type == "harness":
-                provider = str(target.get("provider") or "antigravity")
-                model = str(target.get("model") or "gemini-4-hydrogen-high")
+                model = str(target.get("model") or default_model)
+                max_budget = (
+                    float(target["max_budget_usd"])
+                    if target.get("max_budget_usd") is not None
+                    else None
+                )
                 logger.info(
                     "[build] Offloading to '%s' (%s workspace harness, model=%s)...",
                     label,
                     provider,
                     model,
                 )
-                return await _run_harness_build(
+                result = await _run_harness_build(
                     router,
                     provider=provider,
                     model=model,
@@ -909,24 +1061,72 @@ async def _offload_build(
                         target.get("timeout_seconds") or router.timeout_for("builder")
                     ),
                     sandbox=bool(target.get("sandbox", sandbox)),
+                    auth=str(target["auth"]) if target.get("auth") is not None else None,
+                    max_budget_usd=max_budget,
+                    effort=str(target["effort"]) if target.get("effort") is not None else None,
                 )
-            model = str(target.get("model") or "")
-            logger.info("[build] Offloading to '%s' (%s, model=%s)...", label, target_type, model)
-            return await _run_single_shot_build(
-                router,
-                model=model,
-                spec=spec,
-                plan=plan,
-                raw_spec=raw_spec,
-                e2e_suite=e2e_suite,
-                root=root,
+            else:
+                model = str(target.get("model") or "")
+                logger.info(
+                    "[build] Offloading to '%s' (%s, model=%s)...", label, target_type, model
+                )
+                result = await _run_single_shot_build(
+                    router,
+                    model=model,
+                    spec=spec,
+                    plan=plan,
+                    raw_spec=raw_spec,
+                    e2e_suite=e2e_suite,
+                    root=root,
+                )
+            written = len(result.created_files) + len(result.modified_files)
+            if has_next and written == 0:
+                raise HarnessError(
+                    f"Offload target '{label}' ({result.model}) finished without writing any files."
+                )
+            publish(
+                "attempt",
+                "build",
+                "passed",
+                attempt=label,
+                provider=provider,
+                model=result.model,
+                files=written,
             )
+            return result
         except TokenBudgetExceededError:
+            publish(
+                "attempt",
+                "build",
+                "failed",
+                attempt=label,
+                provider=provider,
+                error="Budget cap reached",
+            )
             raise
         except Exception as exc:
             logger.warning(
                 "[build] Offload target '%s' failed: %s: %s", label, type(exc).__name__, exc
             )
+            if has_next:
+                publish(
+                    "attempt",
+                    "build",
+                    "offloaded",
+                    attempt=label,
+                    provider=provider,
+                    next=_offload_label(targets[idx + 1]),
+                    error=f"{type(exc).__name__}: {exc}",
+                )
+            else:
+                publish(
+                    "attempt",
+                    "build",
+                    "failed",
+                    attempt=label,
+                    provider=provider,
+                    error=f"{type(exc).__name__}: {exc}",
+                )
             failures.append(f"{label}: {type(exc).__name__}: {exc}")
     raise HarnessError("Local build and every offload target failed: " + " | ".join(failures))
 
@@ -987,9 +1187,13 @@ async def build_app_workspace(
     created_links = sync_workspace_skills(root, skills_cfg) if skills_cfg else []
     discovery_mode = str(skills_cfg.get("discovery_mode") or "").strip().lower()
     if discovery_mode == "progressive" and created_links:
-        skill_prompt = format_role_skill_index("builder", skills_cfg)
+        skill_prompt = format_role_skill_index(
+            "builder", skills_cfg, workspace_root=root if is_local else None
+        )
+        offload_skill_prompt = format_role_skill_index("builder", skills_cfg)
     else:
         skill_prompt = load_role_skill_prompt("builder", skills_cfg)
+        offload_skill_prompt = skill_prompt
 
     prompt_text = _build_workspace_prompt(
         spec,
@@ -1000,6 +1204,8 @@ async def build_app_workspace(
         plan_file=plan_file,
         brief_file=brief_file,
         e2e_preseeded=e2e_preseeded,
+        workspace_root=root,
+        require_absolute_paths=is_local,
     )
     skill_dirs = [root / ".agents" / "skills"] if created_links else None
     logger.info(
@@ -1022,11 +1228,22 @@ async def build_app_workspace(
                     timeout_seconds=timeout_seconds,
                     skill_dirs=skill_dirs,
                     local_model_override=local_model_override,
+                    emit_passed=False,
                 )
-                if offload and not (result.created_files or result.modified_files):
+                written = len(result.created_files) + len(result.modified_files)
+                if offload and written == 0:
                     raise HarnessError(
                         f"Local model {result.model} finished without writing any files."
                     )
+                publish(
+                    "attempt",
+                    "build",
+                    "passed",
+                    attempt="local",
+                    provider="antigravity_sdk",
+                    model=result.model,
+                    files=written,
+                )
                 return result
             except TokenBudgetExceededError:
                 raise
@@ -1035,6 +1252,14 @@ async def build_app_workspace(
                     raise
                 local_error: BaseException = exc
 
+            publish(
+                "attempt",
+                "build",
+                "offloaded",
+                attempt="local",
+                error=f"{type(local_error).__name__}: {local_error}",
+                next=_offload_label(offload[0]),
+            )
             logger.warning(
                 "[build] Local model could not finish (%s: %s); offloading to %s.",
                 type(local_error).__name__,
@@ -1048,12 +1273,14 @@ async def build_app_workspace(
                 spec,
                 plan,
                 raw_spec,
-                skill_prompt,
+                offload_skill_prompt,
                 e2e_suite,
                 plan_file=plan_file,
                 e2e_preseeded=e2e_preseeded,
                 previous_attempt=not clean,
                 max_prompt_chars=_OFFLOAD_PROMPT_CHARS,
+                workspace_root=root,
+                require_absolute_paths=False,
             )
             return await _offload_build(
                 router,
@@ -1070,19 +1297,57 @@ async def build_app_workspace(
 
         if backend_type == "harness":
             provider = str(backend.get("provider") or "antigravity")
-            model = str(backend.get("model") or "gemini-4-hydrogen-high")
+            default_model = "sonnet" if provider == "claude_code" else "gemini-4-hydrogen-high"
+            model = str(backend.get("model") or default_model)
         else:
             raise HarnessError(f"Unsupported workspace builder backend type: {backend_type}")
 
-        return await _run_harness_build(
-            router,
+        publish(
+            "attempt",
+            "build",
+            "running",
+            attempt=provider,
+            phase="building",
             provider=provider,
             model=model,
-            prompt_text=prompt_text,
-            root=root,
-            timeout_seconds=timeout_seconds,
-            sandbox=sandbox,
         )
+        try:
+            harness_result = await _run_harness_build(
+                router,
+                provider=provider,
+                model=model,
+                prompt_text=prompt_text,
+                root=root,
+                timeout_seconds=timeout_seconds,
+                sandbox=sandbox,
+                auth=str(backend["auth"]) if backend.get("auth") is not None else None,
+                max_budget_usd=(
+                    float(backend["max_budget_usd"])
+                    if backend.get("max_budget_usd") is not None
+                    else None
+                ),
+                effort=str(backend["effort"]) if backend.get("effort") is not None else None,
+            )
+        except Exception as exc:
+            publish(
+                "attempt",
+                "build",
+                "failed",
+                attempt=provider,
+                provider=provider,
+                error=f"{type(exc).__name__}: {exc}",
+            )
+            raise
+        publish(
+            "attempt",
+            "build",
+            "passed",
+            attempt=provider,
+            provider=provider,
+            model=harness_result.model,
+            files=len(harness_result.created_files) + len(harness_result.modified_files),
+        )
+        return harness_result
     finally:
         for link in created_links:
             if link.is_symlink():

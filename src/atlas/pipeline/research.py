@@ -3,6 +3,7 @@ import logging
 import time
 from typing import Any
 
+from atlas.events import publish
 from atlas.router import ModelRouter
 from atlas.schemas import ParsedSpec, Requirement, ResearchFailure, ResearchNote, ResearchReport
 
@@ -71,6 +72,18 @@ async def research(router: ModelRouter, spec: ParsedSpec) -> ResearchReport:
                 type(exc).__name__,
                 time.monotonic() - started,
             )
+            publish(
+                "item",
+                "research",
+                "failed",
+                requirement_id=req.id,
+                title=req.title,
+                completed=completed,
+                total=total,
+                model=model,
+                error=f"{type(exc).__name__}: {exc}",
+                seconds=round(time.monotonic() - started, 1),
+            )
             raise
         completed += 1
         logger.info(
@@ -81,6 +94,17 @@ async def research(router: ModelRouter, spec: ParsedSpec) -> ResearchReport:
             req.title[:50],
             used_model,
             time.monotonic() - started,
+        )
+        publish(
+            "item",
+            "research",
+            "passed",
+            requirement_id=req.id,
+            title=req.title,
+            completed=completed,
+            total=total,
+            model=used_model,
+            seconds=round(time.monotonic() - started, 1),
         )
         return note
 

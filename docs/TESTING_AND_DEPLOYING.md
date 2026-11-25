@@ -78,6 +78,7 @@ You should see `OPENROUTER_API_KEY` and/or `GEMINI_API_KEY`.
 ### 3a. Full local-first harness run
 
 ```bash
+# Optional: export ATLAS_CONFIG=config/harness.yaml once instead of repeating --config
 atlas run specs/example-app.md --config config/harness.yaml --clarify --e2e-tests
 # Resume straight from build/verify using a prior run's plan + E2E tests:
 atlas run specs/example-app.md --config config/harness.yaml --from-run runs/<run-id> --clean
@@ -115,8 +116,27 @@ You can also inspect the full Markdown report and raw JSON telemetry for the new
 - `runs/<run-id>/tokens.json` — per-stage, per-model, and per-call token + USD cost records
 - `runs/<run-id>/verification.json` — exact check commands, exit codes, `stdout`, and `stderr`
 - `runs/<run-id>/supervisor_review.json` — unified post-build review verdict, merged issues, improvement plan, and per-reviewer breakdown (when `backends.supervisor.enabled: true`)
-- `runs/<run-id>/manifest.json` — overall run status (`verified`, `verification_failed`, or `failed`)
+- `runs/<run-id>/events.jsonl` — persisted live workflow UI timeline events
+- `runs/<run-id>/manifest.json` — overall run status (`verified`, `verification_failed`, or `failed`), plus `local_model` / `build_offloaded_to` / `build_offload_harness`
 - `usage/ledger.jsonl` — append-only cross-run token ledger
+
+### 3d. Visually follow & replay runs with the Workflow UI (`0` extra LLM tokens)
+
+In an interactive terminal outside CI, `atlas run` and `atlas build` automatically start the local read-only workflow UI (`127.0.0.1`) and open it in your browser, showing the horizontal left-to-right transit strip map (`Spec → Parse → Research → Clarify → Judge → E2E (sonnet high) → Build (12B → sonnet/claude_code → hydrogen/agy) → Verify ↔ Fix → Review → Report`), live stall-guard bar, per-stage artifacts, usage-by-stage breakdown, and filterable log drawer.
+
+```bash
+# Replay an existing run (0 LLM tokens, useful to test the UI immediately):
+atlas ui
+atlas ui runs/<run-id>
+
+# Customize live UI behavior during a run:
+atlas run specs/example-app.md --config config/harness.yaml --no-open      # print URL only
+atlas run specs/example-app.md --config config/harness.yaml --ui-keep-open # keep server open after exit until Ctrl+C
+atlas run specs/example-app.md --config config/harness.yaml --no-ui        # terminal output only
+atlas plan specs/example-app.md --config config/harness.yaml --ui          # opt-in live UI for planning
+```
+
+Clarifying questions remain in your terminal (`--clarify`), even when the browser opens. Older runs created before `events.jsonl` existed are synthesized from their saved JSON artifacts when opened with `atlas ui`.
 
 ### Quick Troubleshooting
 
@@ -124,8 +144,8 @@ You can also inspect the full Markdown report and raw JSON telemetry for the new
 | :--- | :--- |
 | `All configured models failed` / 401 / 403 / 404 | Check `OPENROUTER_API_KEY` / `GEMINI_API_KEY` in `.env` and confirm the model IDs in `config/models.yaml` are enabled on your OpenRouter/Google account. |
 | `OutputTruncatedError` / cut-off reply | Raise the per-role limit in `config/models.yaml` or `config/harness.yaml` (`limits.max_tokens_by_role.e2e` / `researcher` / `builder` / `fixer`, or `limits.timeout_seconds_by_role`; reasoning models count thinking tokens inside `max_tokens`). |
-| `agy` `DEADLINE_EXCEEDED` / `print_timeout` | Increase `backends.<role>.timeout_seconds` in `config/harness.yaml` (e.g. `e2e: 600`, `researcher: 420`). Structured `agy` calls also enforce `--disable-slash-commands` and a single-turn constraint to prevent runaway tool loops. |
-| LM Studio model rejected for small context | In LM Studio's **Load** panel, set **Context Length** to `>= 32768` (e.g. `32768` or `65536`) before running `atlas detect-local --config config/harness.yaml`. |
+| `agy` `DEADLINE_EXCEEDED` / `print_timeout` | Increase `backends.<role>.timeout_seconds` in `config/harness.yaml` (e.g. `researcher: 420`, `parser: 180`). Structured `agy` calls also enforce `--disable-slash-commands` and a single-turn constraint to prevent runaway tool loops. For `e2e`/`judge` (`claude_code`), tune `timeout_seconds` or `max_budget_usd`. |
+| LM Studio model rejected for small context | In LM Studio's **Load** panel, set **Context Length** to `>= 49152` (e.g. `lms unload --all && lms load google/gemma-4-12b-qat --context-length 49152`) before running `atlas detect-local --config config/harness.yaml`. |
 | Missing requirement-ID test failure | With `verification.require_requirement_tests: true` in `config/models.yaml`, every functional requirement needs a test mentioning its ID (e.g. `R001`, `R002`). The fixer is asked to add it, or you can set this to `false`. |
 | `Token budget exceeded` / `Cost budget exceeded` | Increase or set `null` on `max_total_tokens` / `max_cost_usd` in `config/models.yaml`. |
 | `Build status: verification_failed` (exit code 1) | Inspect `runs/<run-id>/report.md` or `runs/<run-id>/verification.json` to see which check failed; increase `max_fix_rounds` or refine acceptance criteria in your spec. |

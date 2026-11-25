@@ -162,11 +162,24 @@ def format_role_skill_index(
     skills_cfg: dict[str, Any],
     *,
     extra_skills: list[str] | None = None,
+    workspace_root: Path | None = None,
 ) -> str:
     """Return a compact progressive-disclosure skill index pointing to `.agents/skills/`."""
     resolved = resolve_role_skills(role, skills_cfg, extra_skills=extra_skills)
     if not resolved:
         return ""
+
+    if workspace_root is not None:
+        skill_root = (workspace_root / ".agents" / "skills").resolve()
+        lines = [
+            f"## Active Skills (read on demand from `{skill_root}`)",
+            "",
+        ]
+        for meta in resolved:
+            skill_key = Path(meta.path).parent.name
+            desc = f": {meta.description}" if meta.description else ""
+            lines.append(f"- `{meta.name}`{desc} — read `{skill_root / skill_key / 'SKILL.md'}`")
+        return "\n".join(lines)
 
     lines = [
         "## Active Skills (read on demand from `.agents/skills/`)",

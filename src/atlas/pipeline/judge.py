@@ -4,6 +4,7 @@ import logging
 import time
 from typing import Any
 
+from atlas.events import publish
 from atlas.router import ModelRouter
 from atlas.schemas import (
     JudgeOutput,
@@ -134,6 +135,18 @@ async def judge(
                 type(exc).__name__,
                 time.monotonic() - started,
             )
+            publish(
+                "item",
+                "judge",
+                "failed",
+                requirement_id=req.id,
+                title=req.title,
+                completed=completed,
+                total=total,
+                model=model,
+                error=f"{type(exc).__name__}: {exc}",
+                seconds=round(time.monotonic() - started, 1),
+            )
             raise
         completed += 1
         logger.info(
@@ -144,6 +157,19 @@ async def judge(
             judged.decisions[0].pick[:60],
             used_model,
             time.monotonic() - started,
+        )
+        publish(
+            "item",
+            "judge",
+            "passed",
+            requirement_id=req.id,
+            title=req.title,
+            completed=completed,
+            total=total,
+            model=used_model,
+            pick=judged.decisions[0].pick,
+            confidence=judged.decisions[0].confidence,
+            seconds=round(time.monotonic() - started, 1),
         )
         return judged
 

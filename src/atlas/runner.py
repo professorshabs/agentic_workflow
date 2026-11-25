@@ -10,10 +10,12 @@ from datetime import UTC, datetime
 from pathlib import Path
 from typing import Any, Literal
 
+from atlas.events import publish, publishing
 from atlas.pipeline.build import (
     build_app,
     build_app_workspace,
     fix_app,
+    fixer_model_for_round,
     materialize_files,
     supervise_app,
 )
@@ -69,8 +71,132 @@ def _fmt_usage_brief(summary: Any) -> str:
     return f"{summary.total_calls} calls, {summary.total_tokens:,} tokens{cost_part}"
 
 
+def _flow_description(
+    router: ModelRouter,
+    *,
+    skip_research: bool,
+    use_e2e: bool,
+    max_fix_rounds: int,
+    local_model: str | None,
+    from_run: Path | None,
+) -> dict[str, Any]:
+    """What this run is configured to do, so the UI can draw the right stations and stops."""
+    targets: dict[str, str] = {}
+    for role in ("parser", "researcher", "judge", "e2e"):
+        try:
+            targets[role] = role_target_label(router, role)
+        except Exception:
+            targets[role] = role
+    builder = router.backend_for("builder")
+    btype = str(builder.get("type") or "openrouter")
+    attempts: list[dict[str, str]] = []
+    if btype == "local_harness":
+        preferred = builder.get("preferred") or []
+        local = local_model or builder.get("local_model") or (preferred[0] if preferred else "")
+        attempts.append({
+            "name": "local",
+            "label": str(local or "local model"),
+            "kind": "local",
+            "provider": "antigravity_sdk",
+        })
+        for target in builder.get("offload") or []:
+            if isinstance(target, dict):
+                ttype = str(target.get("type") or "harness")
+                tprov = (
+                    str(target.get("provider") or "antigravity")
+                    if ttype == "harness"
+                    else ttype
+                )
+                tlabel = str(target.get("model") or target.get("provider") or "")
+                attempts.append({
+                    "name": str(target.get("name") or target.get("model") or "offload"),
+                    "label": tlabel,
+                    "kind": ttype,
+                    "provider": tprov,
+                })
+    elif btype == "harness":
+        prov = str(builder.get("provider") or "harness")
+        attempts.append({
+            "name": prov,
+            "label": str(builder.get("model") or ""),
+            "kind": "harness",
+            "provider": prov,
+        })
+    else:
+        try:
+            label = role_target_label(router, "builder")
+        except Exception:
+            label = "builder"
+        attempts.append({"name": "builder", "label": label, "kind": btype, "provider": btype})
+    rotate = router.backend_for("fixer").get("rotate")
+    if isinstance(rotate, list) and rotate:
+        fixer_models = [
+            f"{m.get('provider', 'harness')}/{m.get('model', '')}"
+            if isinstance(m, dict) and m.get("type") == "harness"
+            else str(m.get("model", "") if isinstance(m, dict) else m)
+            for m in rotate
+        ]
+    else:
+        try:
+            fixer_models = router.models_for("fixer")[:1]
+        except ValueError:
+            fixer_models = []
+    supervisor_enabled = bool(router.backend_for("supervisor").get("enabled", False))
+    reviewers = (
+        [str(r.get("name") or "reviewer") for r in router.supervisor_reviewers()]
+        if supervisor_enabled
+        else []
+    )
+    return {
+        "skip_research": skip_research,
+        "e2e": use_e2e,
+        "from_run": str(from_run) if from_run else None,
+        "targets": targets,
+        "builder": {"type": btype, "attempts": attempts},
+        "fixer": fixer_models,
+        "max_fix_rounds": max_fix_rounds,
+        "supervisor_enabled": supervisor_enabled,
+        "supervisor_reviewers": reviewers,
+    }
+
+
+def _publish_e2e(e2e_suite: E2ETestSuite) -> None:
+    publish(
+        "stage",
+        "e2e_tests",
+        "passed" if e2e_suite.verifiable else "unverifiable",
+        verifiable=e2e_suite.verifiable,
+        test_files=[f.path for f in e2e_suite.files],
+        reason=e2e_suite.unverifiable_reason or "",
+        interface=e2e_suite.product_interface,
+    )
+
+
 def _log_verification_round(round_obj: VerificationRound, elapsed_s: float) -> None:
     passed_count = sum(1 for c in round_obj.checks if c.passed)
+    if publishing():
+        for chk in round_obj.checks:
+            publish(
+                "check",
+                "verify",
+                "passed" if chk.passed else "failed",
+                round=round_obj.round_number,
+                name=chk.name,
+                exit_code=chk.exit_code,
+                seconds=round(chk.duration_ms / 1000.0, 1),
+                command=chk.command,
+                output="" if chk.passed else (chk.stderr or chk.stdout)[-1500:],
+            )
+        publish(
+            "round",
+            "verify",
+            "passed" if round_obj.passed else "failed",
+            round=round_obj.round_number,
+            stack=round_obj.stack_detected,
+            passed_checks=passed_count,
+            total_checks=len(round_obj.checks),
+            seconds=round(elapsed_s, 1),
+        )
     logger.info(
         "[verify] Round %d %s in %.1fs (stack=%s, %d/%d checks passed)",
         round_obj.round_number,
@@ -127,6 +253,7 @@ def _run_clarifications(
     questions = collect_clarifying_questions(spec, report)
     if not questions:
         logger.info("[clarify] No clarifying questions needed")
+        publish("stage", "clarify", "skipped", reason="No clarifying questions needed")
         return spec, None
     will_prompt = ask_fn is not None or (interactive_clarify and sys.stdin.isatty())
     if clarification_answers:
@@ -145,6 +272,14 @@ def _run_clarifications(
     else:
         mode = "interactive" if will_prompt else "non-interactive"
     logger.info("[clarify] %d clarifying question(s) (%s)", len(questions), mode)
+    publish(
+        "stage",
+        "clarify",
+        "waiting_input" if mode in ("interactive", "prefilled + interactive") else "running",
+        total=len(questions),
+        mode=mode,
+        questions=[q.question for q in questions][:30],
+    )
     clarifications = clarify_with_user(
         questions,
         ask_fn=ask_fn,
@@ -163,6 +298,17 @@ def _run_clarifications(
         (out / "spec.json").write_text(spec.model_dump_json(indent=2), encoding="utf-8")
     _write_manifest(out, manifest)
     logger.info("[clarify] Done — %d/%d answered", answered_count, len(clarifications.items))
+    publish(
+        "stage",
+        "clarify",
+        "passed",
+        answered=answered_count,
+        total=len(clarifications.items),
+        items=[
+            {"question": i.question, "answer": i.answer, "requirement_id": i.requirement_id}
+            for i in clarifications.items
+        ][:30],
+    )
     return spec, clarifications
 
 
@@ -194,6 +340,7 @@ async def run_plan(
 
     manifest: dict[str, Any] = {
         "run_id": run_id,
+        "mode": "plan",
         "status": "running",
         "created_at": datetime.now(UTC).isoformat(),
         "spec_path": str(spec_path),
@@ -202,7 +349,30 @@ async def run_plan(
     _write_manifest(out, manifest)
     run_started = time.monotonic()
     failed = False
+    error_text: str | None = None
     logger.info("Atlas plan started: run_id=%s spec=%s out=%s", run_id, spec_path, out)
+    if publishing():
+        planned_e2e = (
+            generate_e2e if generate_e2e is not None else active_router.require_e2e_tests
+        )
+        publish(
+            "run",
+            "run",
+            "running",
+            run_id=run_id,
+            mode="plan",
+            spec_path=str(spec_path),
+            out_dir=str(out.resolve()),
+            flow=_flow_description(
+                active_router,
+                skip_research=False,
+                use_e2e=bool(planned_e2e),
+                max_fix_rounds=0,
+                local_model=None,
+                from_run=None,
+            ),
+        )
+        publish("stage", "run", "passed", spec_path=str(spec_path), run_id=run_id)
 
     try:
         stage_started = time.monotonic()
@@ -210,6 +380,7 @@ async def run_plan(
             "[parse] Parsing specification (%s)...",
             role_target_label(active_router, "parser"),
         )
+        publish("stage", "parse", "running", target=role_target_label(active_router, "parser"))
         spec = await parse_spec(active_router, raw_spec)
         manifest["stages"]["parse"] = "completed"
         (out / "spec.json").write_text(spec.model_dump_json(indent=2), encoding="utf-8")
@@ -222,12 +393,29 @@ async def run_plan(
             functional_count,
             len(spec.open_questions),
         )
+        publish(
+            "stage",
+            "parse",
+            "passed",
+            requirements=len(spec.requirements),
+            functional=functional_count,
+            open_questions=len(spec.open_questions),
+            summary=spec.summary,
+            requirement_titles={r.id: r.title for r in spec.requirements},
+        )
 
         stage_started = time.monotonic()
         logger.info(
             "[research] Researching %d requirement(s) (%s)...",
             len(spec.requirements),
             role_target_label(active_router, "researcher"),
+        )
+        publish(
+            "stage",
+            "research",
+            "running",
+            target=role_target_label(active_router, "researcher"),
+            total=len(spec.requirements),
         )
         report = await research(active_router, spec)
         manifest["stages"]["research"] = "completed"
@@ -240,6 +428,13 @@ async def run_plan(
             _fmt_elapsed(stage_started),
             len(report.notes),
             len(report.failures),
+        )
+        publish(
+            "stage",
+            "research",
+            "partial" if report.failures else "passed",
+            notes=len(report.notes),
+            failures=len(report.failures),
         )
 
         spec, clarifications = _run_clarifications(
@@ -258,6 +453,13 @@ async def run_plan(
             len(spec.requirements),
             role_target_label(active_router, "judge"),
         )
+        publish(
+            "stage",
+            "judge",
+            "running",
+            target=role_target_label(active_router, "judge"),
+            total=len(spec.requirements),
+        )
         plan = await judge(active_router, spec, report)
         plan_hash = plan.content_sha256()
         manifest["stages"]["judge"] = "completed"
@@ -270,6 +472,15 @@ async def run_plan(
             len(plan.tasks),
             len(plan.risks),
         )
+        publish(
+            "stage",
+            "judge",
+            "passed",
+            decisions=len(plan.decisions),
+            tasks=len(plan.tasks),
+            risks=len(plan.risks),
+            picks={d.requirement_id: d.pick for d in plan.decisions},
+        )
 
         e2e_suite: E2ETestSuite | None = None
         use_e2e = (
@@ -280,6 +491,12 @@ async def run_plan(
         if use_e2e:
             stage_started = time.monotonic()
             logger.info("[e2e] Generating authoritative E2E product tests...")
+            publish(
+                "stage",
+                "e2e_tests",
+                "running",
+                target=role_target_label(active_router, "e2e"),
+            )
             e2e_suite = await generate_e2e_tests(
                 active_router,
                 spec,
@@ -295,6 +512,7 @@ async def run_plan(
             manifest["e2e_verifiable"] = e2e_suite.verifiable
             manifest["e2e_test_files"] = [f.path for f in e2e_suite.files]
             _write_manifest(out, manifest)
+            _publish_e2e(e2e_suite)
             if e2e_suite.verifiable:
                 e2e_desc = ", ".join(f.path for f in e2e_suite.files) or "no files"
                 logger.info(
@@ -306,6 +524,8 @@ async def run_plan(
                     _fmt_elapsed(stage_started),
                     e2e_suite.unverifiable_reason or "unspecified",
                 )
+        else:
+            publish("stage", "e2e_tests", "skipped")
 
         rendered = render_plan(
             plan,
@@ -324,7 +544,8 @@ async def run_plan(
     except Exception as exc:
         failed = True
         manifest["status"] = "failed"
-        manifest["error"] = f"{type(exc).__name__}: {exc}"
+        error_text = f"{type(exc).__name__}: {exc}"
+        manifest["error"] = error_text
         logger.error(
             "[failed] Plan %s failed after %s: %s: %s",
             run_id,
@@ -346,6 +567,25 @@ async def run_plan(
                 _fmt_elapsed(run_started),
                 out / "plan.md",
                 _fmt_usage_brief(summary),
+            )
+        if publishing():
+            if not failed:
+                publish("stage", "report", "passed", report=str(out / "plan.md"))
+            publish(
+                "run",
+                "run",
+                "failed" if failed else "passed",
+                result=str(manifest.get("status") or "plan_ready"),
+                error=error_text,
+                elapsed_seconds=round(time.monotonic() - run_started, 1),
+                usage={
+                    "calls": summary.total_calls,
+                    "tokens": summary.total_tokens,
+                    "input_tokens": summary.prompt_tokens,
+                    "output_tokens": summary.completion_tokens,
+                    "cost_usd": summary.cost_usd,
+                    "unpriced_calls": summary.unpriced_calls,
+                },
             )
 
     return out
@@ -443,6 +683,34 @@ async def run_build(
     _write_manifest(out, manifest)
     run_started = time.monotonic()
     logger.info("Atlas build started: run_id=%s spec=%s app_dir=%s", run_id, spec_path, app_dir)
+    if publishing():
+        planned_e2e = (
+            generate_e2e if generate_e2e is not None else active_router.require_e2e_tests
+        )
+        publish(
+            "run",
+            "run",
+            "running",
+            run_id=run_id,
+            mode="build",
+            spec_path=str(spec_path),
+            app_dir=str(app_dir),
+            out_dir=str(out.resolve()),
+            from_run=str(from_run) if from_run is not None else None,
+            flow=_flow_description(
+                active_router,
+                skip_research=skip_research,
+                use_e2e=bool(planned_e2e),
+                max_fix_rounds=(
+                    max_fix_rounds
+                    if max_fix_rounds is not None
+                    else active_router.max_fix_rounds
+                ),
+                local_model=local_model,
+                from_run=from_run,
+            ),
+        )
+        publish("stage", "run", "passed", spec_path=str(spec_path), run_id=run_id)
 
     spec: ParsedSpec | None = None
     plan: Plan | None = None
@@ -497,10 +765,77 @@ async def run_build(
             else:
                 manifest["stages"]["judge"] = "skipped"
 
+            functional_count = sum(1 for r in spec.requirements if r.kind == "functional")
+            publish(
+                "stage",
+                "parse",
+                "reused",
+                from_run=str(from_run),
+                requirements=len(spec.requirements),
+                functional=functional_count,
+                open_questions=len(spec.open_questions),
+                summary=spec.summary,
+                requirement_titles={r.id: r.title for r in spec.requirements},
+            )
+            if report_obj is not None:
+                publish(
+                    "stage",
+                    "research",
+                    "reused",
+                    from_run=str(from_run),
+                    notes=len(report_obj.notes),
+                    failures=len(report_obj.failures),
+                    total=len(spec.requirements),
+                )
+            else:
+                publish("stage", "research", "skipped", from_run=str(from_run))
+            if clarifications is not None:
+                publish(
+                    "stage",
+                    "clarify",
+                    "reused",
+                    from_run=str(from_run),
+                    answered=manifest.get("clarifications_answered", 0),
+                    total=len(clarifications.items),
+                    items=[
+                        {
+                            "question": i.question,
+                            "answer": i.answer,
+                            "requirement_id": i.requirement_id,
+                        }
+                        for i in clarifications.items
+                    ][:30],
+                )
+            else:
+                publish("stage", "clarify", "skipped", from_run=str(from_run))
+            if plan is not None:
+                publish(
+                    "stage",
+                    "judge",
+                    "reused",
+                    from_run=str(from_run),
+                    decisions=len(plan.decisions),
+                    tasks=len(plan.tasks),
+                    risks=len(plan.risks),
+                    picks={d.requirement_id: d.pick for d in plan.decisions},
+                )
+            else:
+                publish("stage", "judge", "skipped", from_run=str(from_run))
             if not use_e2e:
                 e2e_suite = None
+                publish("stage", "e2e_tests", "skipped", from_run=str(from_run))
             elif e2e_suite is not None:
                 manifest["stages"]["e2e_tests"] = "reused"
+                publish(
+                    "stage",
+                    "e2e_tests",
+                    "reused",
+                    from_run=str(from_run),
+                    verifiable=e2e_suite.verifiable,
+                    test_files=[f.path for f in e2e_suite.files],
+                    reason=e2e_suite.unverifiable_reason or "",
+                    interface=e2e_suite.product_interface,
+                )
                 manifest["e2e_verifiable"] = e2e_suite.verifiable
                 manifest["e2e_test_files"] = [f.path for f in e2e_suite.files]
                 (out / "e2e_tests.json").write_text(
@@ -509,6 +844,12 @@ async def run_build(
             else:
                 stage_started = time.monotonic()
                 logger.info("[e2e] Generating authoritative E2E product tests...")
+                publish(
+                    "stage",
+                    "e2e_tests",
+                    "running",
+                    target=role_target_label(active_router, "e2e"),
+                )
                 e2e_suite = await generate_e2e_tests(
                     active_router,
                     spec,
@@ -523,6 +864,7 @@ async def run_build(
                 manifest["stages"]["e2e_tests"] = "completed"
                 manifest["e2e_verifiable"] = e2e_suite.verifiable
                 manifest["e2e_test_files"] = [f.path for f in e2e_suite.files]
+                _publish_e2e(e2e_suite)
                 if e2e_suite.verifiable:
                     e2e_desc = ", ".join(f.path for f in e2e_suite.files) or "no files"
                     logger.info(
@@ -563,6 +905,9 @@ async def run_build(
                 "[parse] Parsing specification (%s)...",
                 role_target_label(active_router, "parser"),
             )
+            publish(
+                "stage", "parse", "running", target=role_target_label(active_router, "parser")
+            )
             spec = await parse_spec(active_router, raw_spec)
             manifest["stages"]["parse"] = "completed"
             (out / "spec.json").write_text(spec.model_dump_json(indent=2), encoding="utf-8")
@@ -575,12 +920,24 @@ async def run_build(
                 functional_count,
                 len(spec.open_questions),
             )
+            publish(
+                "stage",
+                "parse",
+                "passed",
+                requirements=len(spec.requirements),
+                functional=functional_count,
+                open_questions=len(spec.open_questions),
+                summary=spec.summary,
+                requirement_titles={r.id: r.title for r in spec.requirements},
+            )
 
             if skip_research:
                 manifest["stages"]["research"] = "skipped"
                 manifest["stages"]["judge"] = "skipped"
                 logger.info("[research] Skipped (--skip-research)")
                 logger.info("[judge] Skipped (--skip-research)")
+                publish("stage", "research", "skipped", reason="--skip-research")
+                publish("stage", "judge", "skipped", reason="--skip-research")
                 spec, clarifications = _run_clarifications(
                     out,
                     manifest,
@@ -593,6 +950,12 @@ async def run_build(
                 if use_e2e:
                     stage_started = time.monotonic()
                     logger.info("[e2e] Generating authoritative E2E product tests...")
+                    publish(
+                        "stage",
+                        "e2e_tests",
+                        "running",
+                        target=role_target_label(active_router, "e2e"),
+                    )
                     e2e_suite = await generate_e2e_tests(
                         active_router,
                         spec,
@@ -608,6 +971,7 @@ async def run_build(
                     manifest["e2e_verifiable"] = e2e_suite.verifiable
                     manifest["e2e_test_files"] = [f.path for f in e2e_suite.files]
                     _write_manifest(out, manifest)
+                    _publish_e2e(e2e_suite)
                     if e2e_suite.verifiable:
                         e2e_desc = ", ".join(f.path for f in e2e_suite.files) or "no files"
                         logger.info(
@@ -628,6 +992,13 @@ async def run_build(
                     len(spec.requirements),
                     role_target_label(active_router, "researcher"),
                 )
+                publish(
+                    "stage",
+                    "research",
+                    "running",
+                    target=role_target_label(active_router, "researcher"),
+                    total=len(spec.requirements),
+                )
                 report_obj = await research(active_router, spec)
                 manifest["stages"]["research"] = "completed"
                 manifest["research_notes_count"] = len(report_obj.notes)
@@ -641,6 +1012,13 @@ async def run_build(
                     _fmt_elapsed(stage_started),
                     len(report_obj.notes),
                     len(report_obj.failures),
+                )
+                publish(
+                    "stage",
+                    "research",
+                    "partial" if report_obj.failures else "passed",
+                    notes=len(report_obj.notes),
+                    failures=len(report_obj.failures),
                 )
 
                 spec, clarifications = _run_clarifications(
@@ -659,6 +1037,13 @@ async def run_build(
                     len(spec.requirements),
                     role_target_label(active_router, "judge"),
                 )
+                publish(
+                    "stage",
+                    "judge",
+                    "running",
+                    target=role_target_label(active_router, "judge"),
+                    total=len(spec.requirements),
+                )
                 plan = await judge(active_router, spec, report_obj)
                 plan_hash = plan.content_sha256()
                 manifest["stages"]["judge"] = "completed"
@@ -671,10 +1056,25 @@ async def run_build(
                     len(plan.tasks),
                     len(plan.risks),
                 )
+                publish(
+                    "stage",
+                    "judge",
+                    "passed",
+                    decisions=len(plan.decisions),
+                    tasks=len(plan.tasks),
+                    risks=len(plan.risks),
+                    picks={d.requirement_id: d.pick for d in plan.decisions},
+                )
 
                 if use_e2e:
                     stage_started = time.monotonic()
                     logger.info("[e2e] Generating authoritative E2E product tests...")
+                    publish(
+                        "stage",
+                        "e2e_tests",
+                        "running",
+                        target=role_target_label(active_router, "e2e"),
+                    )
                     e2e_suite = await generate_e2e_tests(
                         active_router,
                         spec,
@@ -689,6 +1089,7 @@ async def run_build(
                     manifest["stages"]["e2e_tests"] = "completed"
                     manifest["e2e_verifiable"] = e2e_suite.verifiable
                     manifest["e2e_test_files"] = [f.path for f in e2e_suite.files]
+                    _publish_e2e(e2e_suite)
                     if e2e_suite.verifiable:
                         e2e_desc = ", ".join(f.path for f in e2e_suite.files) or "no files"
                         logger.info(
@@ -731,6 +1132,10 @@ async def run_build(
             builder_type,
             target_label,
         )
+        for planned_stage in ("research", "clarify", "judge", "e2e_tests"):
+            if planned_stage not in manifest["stages"]:
+                publish("stage", planned_stage, "skipped")
+        publish("stage", "build", "running", backend=builder_type, target=target_label)
         if builder_type in ("local_harness", "harness"):
             generated_app = await build_app_workspace(
                 active_router,
@@ -753,14 +1158,43 @@ async def run_build(
                     manifest["build_offloaded_to"] = generated_app.model
                     manifest["build_offload_harness"] = generated_app.harness
         else:
-            generated_app = await build_app(
-                active_router,
-                spec,
-                plan,
-                raw_spec=raw_spec,
-                e2e_suite=e2e_suite,
+            publish(
+                "attempt",
+                "build",
+                "running",
+                attempt="builder",
+                phase="building",
+                provider=builder_type,
+                model=target_label,
             )
+            try:
+                generated_app = await build_app(
+                    active_router,
+                    spec,
+                    plan,
+                    raw_spec=raw_spec,
+                    e2e_suite=e2e_suite,
+                )
+            except Exception as exc:
+                publish(
+                    "attempt",
+                    "build",
+                    "failed",
+                    attempt="builder",
+                    provider=builder_type,
+                    error=f"{type(exc).__name__}: {exc}",
+                )
+                raise
             written_files = materialize_files(app_dir, generated_app.files, clean=clean_app_dir)
+            publish(
+                "attempt",
+                "build",
+                "passed",
+                attempt="builder",
+                provider=builder_type,
+                model=target_label,
+                files=len(written_files),
+            )
 
         if e2e_suite is not None and e2e_suite.files:
             e2e_written = materialize_files(app_dir, e2e_suite.files, clean=False)
@@ -780,6 +1214,18 @@ async def run_build(
             _fmt_elapsed(stage_started),
             len(written_files),
             model_note,
+        )
+        publish(
+            "stage",
+            "build",
+            "passed",
+            files=len(written_files),
+            model=generated_app.model if isinstance(generated_app, WorkspaceBuildResult) else None,
+            harness=(
+                generated_app.harness if isinstance(generated_app, WorkspaceBuildResult) else None
+            ),
+            offloaded_to=manifest.get("build_offloaded_to"),
+            summary=generated_app.summary[:600],
         )
 
         rounds_limit = (
@@ -820,6 +1266,7 @@ async def run_build(
         round_num = 1
         verify_started = time.monotonic()
         logger.info("[verify] Round %d: running verification checks in %s...", round_num, app_dir)
+        publish("stage", "verify", "running", round=round_num)
         stack_detected, checks = await _run_verify()
         current_round = VerificationRound(
             round_number=round_num,
@@ -841,6 +1288,7 @@ async def run_build(
                     for r in active_router.supervisor_reviewers()
                 )
                 logger.info("[supervisor] Running acceptance review (%s)...", rnames)
+                publish("stage", "supervisor", "running", reviewers=rnames.split(", "))
                 review = await supervise_app(
                     active_router, spec, app_dir, current_round, plan=plan
                 )
@@ -855,6 +1303,14 @@ async def run_build(
                     _fmt_elapsed(sup_started),
                     "APPROVED" if review.approved else "CHANGES REQUESTED",
                     len(review.issues),
+                )
+                publish(
+                    "stage",
+                    "supervisor",
+                    "passed" if review.approved else "partial",
+                    approved=review.approved,
+                    issues=review.issues[:30],
+                    improvement_plan=review.improvement_plan[:30],
                 )
                 if review.approved:
                     break
@@ -906,6 +1362,15 @@ async def run_build(
             logger.info(
                 "[fix] Round %d/%d: fixing [%s]...", fix_attempt, rounds_limit, failing_names
             )
+            publish(
+                "stage",
+                "fix",
+                "running",
+                round=fix_attempt,
+                max_rounds=rounds_limit,
+                failing=[c.name for c in current_round.checks if not c.passed],
+                model=fixer_model_for_round(active_router, fix_attempt),
+            )
             patch = await fix_app(
                 active_router,
                 spec,
@@ -935,12 +1400,22 @@ async def run_build(
                 len(updated),
                 f" — {diag_line}" if diag_line else "",
             )
+            publish(
+                "stage",
+                "fix",
+                "passed",
+                round=fix_attempt,
+                max_rounds=rounds_limit,
+                updated=updated[:50],
+                diagnosis=patch.diagnosis[:1500],
+            )
 
             round_num += 1
             verify_started = time.monotonic()
             logger.info(
                 "[verify] Round %d: running verification checks in %s...", round_num, app_dir
             )
+            publish("stage", "verify", "running", round=round_num)
             stack_detected, checks = await _run_verify()
             current_round = VerificationRound(
                 round_number=round_num,
@@ -964,6 +1439,13 @@ async def run_build(
         )
         manifest["stages"]["verify"] = "completed"
         manifest["verification_passed"] = verification.passed
+        publish(
+            "stage",
+            "verify",
+            "passed" if verification.passed else "failed",
+            rounds=len(rounds),
+            fix_rounds=fix_attempt,
+        )
         manifest["verification_rounds"] = len(rounds)
         manifest["status"] = "verified" if verification.passed else "verification_failed"
         manifest["completed_at"] = datetime.now(UTC).isoformat()
@@ -1018,6 +1500,27 @@ async def run_build(
                 _fmt_elapsed(run_started),
                 out / "report.md",
                 _fmt_usage_brief(token_summary),
+            )
+        if publishing():
+            final_status = str(manifest.get("status", "unknown"))
+            publish("stage", "report", "passed", report=str(out / "report.md"))
+            publish(
+                "run",
+                "run",
+                {"verified": "passed", "verification_failed": "failed", "failed": "failed"}.get(
+                    final_status, "cancelled"
+                ),
+                result=final_status,
+                error=error_text,
+                elapsed_seconds=round(time.monotonic() - run_started, 1),
+                usage={
+                    "calls": token_summary.total_calls,
+                    "tokens": token_summary.total_tokens,
+                    "input_tokens": token_summary.prompt_tokens,
+                    "output_tokens": token_summary.completion_tokens,
+                    "cost_usd": token_summary.cost_usd,
+                    "unpriced_calls": token_summary.unpriced_calls,
+                },
             )
 
     return out

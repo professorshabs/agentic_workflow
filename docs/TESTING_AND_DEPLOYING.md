@@ -1,6 +1,6 @@
-# Step-by-Step: Testing Locally & Deploying to GitHub
+# Locally Testing Atlas and Generated Products
 
-Follow these steps in order to verify everything locally, safely push the template to GitHub, and test the live GitHub Actions pipeline end-to-end.
+Use this guide to test the Atlas framework and products built under `app/<spec-name>/` on your Mac. The repository-level `tests/` suite tests Atlas; each generated product has its own tests, which `atlas verify` runs from that product. GitHub product builds and deployment are deferred.
 
 ---
 
@@ -18,6 +18,8 @@ source .venv/bin/activate
 python3 -m venv .venv
 source .venv/bin/activate
 pip install -e ".[dev]"
+# Optional: include `google-antigravity` SDK when running `config/harness.yaml`:
+pip install -e ".[dev,harnesses]"
 ```
 
 Run the full offline quality and test suite:
@@ -27,13 +29,29 @@ ruff check .
 mypy src/ --ignore-missing-imports
 pytest -v
 atlas validate-config
+atlas validate-config --config config/harness.yaml
 ```
 
 **What passing looks like:**
 - `ruff check .` prints `All checks passed!`
 - `mypy src/ --ignore-missing-imports` prints `Success: no issues found ...`
 - `pytest -v` passes all automated unit, verification, and workflow tests (no API keys required)
-- `atlas validate-config` prints `Config valid: .../config/models.yaml`
+- `atlas validate-config` prints `Config valid: .../config/models.yaml` (and `.../config/harness.yaml`)
+
+Optional deeper checks (still 0 tokens):
+
+```bash
+# Line + branch coverage of the framework (about 92 % today)
+pytest --cov=atlas --cov-branch --cov-report=term-missing:skip-covered
+
+# Check the Claude adapter against your installed `claude` binary. It talks to a local
+# mock of the Anthropic API with a throwaway HOME, so your login is not used or touched.
+ATLAS_CLAUDE_CONTRACT=1 pytest tests/test_harness_cli_contracts.py -k real_claude
+```
+
+With `pip install -e ".[dev,harnesses]"`, `pytest` also checks that the installed `google-antigravity` SDK still has every API the local builder calls (it is alpha, so re-run this after upgrading it).
+
+*(If you are using the local-first hybrid profile in `config/harness.yaml`, start LM Studio with `google/gemma-4-26b-a4b-qat` loaded at `>= 32768` context length — or start Ollama (`OLLAMA_CONTEXT_LENGTH=64000 ollama serve`) with `gemma4:12b-mlx` / `gemma4:12b` — and run `atlas doctor --config config/harness.yaml` and `atlas detect-local --config config/harness.yaml` before building to verify `agy`, `claude`, `OPENROUTER_API_KEY`, local daemons, and allowlisted skills.)*
 
 ---
 
@@ -57,25 +75,29 @@ You should see `OPENROUTER_API_KEY` and/or `GEMINI_API_KEY`.
 
 ## Step 3 — Run a Live Local Build, Verify, and Inspect Token Usage
 
-### 3a. Fast live test (skips multi-model research & judge)
+### 3a. Full local-first harness run
 
 ```bash
-atlas build specs/example-app.md --skip-research --clean
+atlas run specs/example-app.md --config config/harness.yaml --clarify --e2e-tests
+# Resume straight from build/verify using a prior run's plan + E2E tests:
+atlas run specs/example-app.md --config config/harness.yaml --from-run runs/<run-id> --clean
+# Non-interactive with prefilled answers JSON:
+atlas run specs/example-app.md --config config/harness.yaml --answers answers.json
+# Suppress step-by-step stderr progress (or use --verbose for full debug logs):
+atlas run specs/example-app.md --config config/harness.yaml --quiet
 ```
 
-### 3b. Full live test (includes parallel 3-model `researcher` + `judge` + `build` + `verify`)
+`atlas run`, `atlas build`, and `atlas plan` stream live `[HH:MM:SS]` milestones to `stderr` (`[parse]`, `[research] k/N`, `[clarify]`, `[judge] k/N`, `[e2e]`, `[build]`, per-check `[PASS]`/`[FAIL]` `[verify]` lines, `[fix]` rounds, and `[supervisor]` verdicts) without polluting `stdout`. When using `config/harness.yaml`, Atlas pre-seeds `PLAN.md`, authoritative `tests/` E2E test files, and progressive `.agents/skills/` symlinks inside `app/<spec-name>/` before the local Builder starts so the local model stays within its context window, can test against the E2E suite as it builds, and has any tampered E2E files restored automatically before `verify_app` runs.
 
-```bash
-atlas build specs/example-app.md --clean
-```
-
-### 3c. Re-run verification alone (0 LLM tokens)
+### 3b. Re-run product verification alone (0 LLM tokens)
 
 ```bash
 atlas verify --app-dir app/example-app
 ```
 
-### 3d. Inspect token usage and estimated cost
+This runs the product's own tests (for example, `app/example-app/tests/`) alongside the configured compile, lint, build, and spec-coverage checks. To run the product's test command directly, use the product's own instructions from its directory, such as `cd app/example-app && pytest`.
+
+### 3c. Inspect token usage and estimated cost
 
 ```bash
 atlas tokens
@@ -87,9 +109,12 @@ atlas tokens --all
 - `atlas tokens --all` reads `usage/ledger.jsonl` and shows **cumulative totals across all runs** grouped by spec, model, and stage.
 
 You can also inspect the full Markdown report and raw JSON telemetry for the newest run under `runs/<run-id>/`:
-- `runs/<run-id>/report.md` — verification table, auto-fix diagnoses, generated files, and token/cost breakdown
+- `runs/<run-id>/report.md` — verification table, auto-fix diagnoses, optional **Clarifications**, **End-to-end product tests**, and **Supervisor review** sections, generated files, and token/cost breakdown
+- `runs/<run-id>/clarifications.json` — collected spec/research clarifying questions and user answers applied before planning/building
+- `runs/<run-id>/e2e_tests.json` — authoritative black-box end-product contract and test files pre-seeded into `app/<spec-name>/tests/` (`e2e-product-tests` check; sets `verifiable: false` with `unverifiable_reason` if offline E2E testing isn't possible)
 - `runs/<run-id>/tokens.json` — per-stage, per-model, and per-call token + USD cost records
 - `runs/<run-id>/verification.json` — exact check commands, exit codes, `stdout`, and `stderr`
+- `runs/<run-id>/supervisor_review.json` — unified post-build review verdict, merged issues, improvement plan, and per-reviewer breakdown (when `backends.supervisor.enabled: true`)
 - `runs/<run-id>/manifest.json` — overall run status (`verified`, `verification_failed`, or `failed`)
 - `usage/ledger.jsonl` — append-only cross-run token ledger
 
@@ -98,106 +123,15 @@ You can also inspect the full Markdown report and raw JSON telemetry for the new
 | Symptom | Likely Cause & Fix |
 | :--- | :--- |
 | `All configured models failed` / 401 / 403 / 404 | Check `OPENROUTER_API_KEY` / `GEMINI_API_KEY` in `.env` and confirm the model IDs in `config/models.yaml` are enabled on your OpenRouter/Google account. |
-| `OutputTruncatedError` / cut-off reply | Raise the per-role limit in `config/models.yaml` (`limits.max_tokens_by_role.builder` / `fixer`, or `limits.timeout_seconds_by_role`). |
+| `OutputTruncatedError` / cut-off reply | Raise the per-role limit in `config/models.yaml` or `config/harness.yaml` (`limits.max_tokens_by_role.e2e` / `researcher` / `builder` / `fixer`, or `limits.timeout_seconds_by_role`; reasoning models count thinking tokens inside `max_tokens`). |
+| `agy` `DEADLINE_EXCEEDED` / `print_timeout` | Increase `backends.<role>.timeout_seconds` in `config/harness.yaml` (e.g. `e2e: 600`, `researcher: 420`). Structured `agy` calls also enforce `--disable-slash-commands` and a single-turn constraint to prevent runaway tool loops. |
+| LM Studio model rejected for small context | In LM Studio's **Load** panel, set **Context Length** to `>= 32768` (e.g. `32768` or `65536`) before running `atlas detect-local --config config/harness.yaml`. |
 | Missing requirement-ID test failure | With `verification.require_requirement_tests: true` in `config/models.yaml`, every functional requirement needs a test mentioning its ID (e.g. `R001`, `R002`). The fixer is asked to add it, or you can set this to `false`. |
 | `Token budget exceeded` / `Cost budget exceeded` | Increase or set `null` on `max_total_tokens` / `max_cost_usd` in `config/models.yaml`. |
 | `Build status: verification_failed` (exit code 1) | Inspect `runs/<run-id>/report.md` or `runs/<run-id>/verification.json` to see which check failed; increase `max_fix_rounds` or refine acceptance criteria in your spec. |
 
 ---
 
-## Step 4 — Clean Local Test Ledger Before Pushing the Template
+## Later: Framework CI and product deployment
 
-Built products inside `app/<spec-name>/` and `runs/` are already git-ignored (keeping `.gitkeep`), so they are **never pushed to Git**. If Step 3 recorded local test entries in `usage/ledger.jsonl` that you don't want in the clean template, remove `usage/`:
-
-```bash
-rm -rf usage
-```
-
----
-
-## Step 5 — Stage, Verify No Secrets Are Included, Commit & Push
-
-Check what is modified or untracked:
-
-```bash
-git status
-```
-
-Stage changes and **verify `.env` and `runs/` are NOT staged**:
-
-```bash
-git add -A
-git diff --cached --name-only
-```
-
-Commit and push `main` to GitHub:
-
-```bash
-git commit -m "chore: verify local changes and prepare GitHub template"
-git remote add origin https://github.com/professorshabs/agentic_workflow.git
-git push -u origin main
-```
-
-*(If `origin` is already configured, check with `git remote -v` and just run `git push -u origin main`. If your GitHub repo already has an initial commit, run `git pull --rebase origin main` first.)*
-
----
-
-## Step 6 — Check Required GitHub Repository Settings
-
-In `https://github.com/professorshabs/agentic_workflow/settings`:
-
-1. **General**:
-   - Check **Template repository** so you get the **Use this template** button.
-2. **Actions → General**:
-   - **Actions permissions**: select **Allow all actions and reusable workflows** and click **Save**.
-   - **Workflow permissions**: select **Read and write permissions**, check **Allow GitHub Actions to create and approve pull requests**, and click **Save**.
-3. **Secrets and variables → Actions → Secrets** *(use **Secrets**, NOT Variables)*:
-   - Add **Repository secret** `OPENROUTER_API_KEY`
-   - Add **Repository secret** `GEMINI_API_KEY`
-
----
-
-## Step 7 — Test the Live GitHub Actions Pipeline
-
-1. Open the **Actions** tab on GitHub → select **Spec to App** → click **Run workflow**.
-2. Leave `spec_path` as `specs/example-app.md` (leave **Skip research & judge** checked for a quick test, or uncheck it to test full multi-model research + judge) and click **Run workflow**.
-3. Once the run completes, confirm all four outcomes:
-   - **Job Summary**: displays the verification table, **Token Usage & Cost** table, and published Docker image tags.
-   - **Artifacts**: `atlas-product-<spec-name>` contains the built product (`app/<spec-name>/`) and `run-report.md`; `atlas-run-artifacts` contains `runs/`, `run-report.md`, and `usage/`.
-   - **Pull Requests**: a new PR was opened for `usage/ledger.jsonl` with the full report as the PR description (marked **Draft** if verification failed) — `app/` itself is never committed to Git.
-   - **PR CI Check**: `spec-to-app.yml` invokes the reusable **CI** workflow (`.github/workflows/ci.yml`) directly against the PR branch (`quality` + `verify-app`) with 0 LLM tokens.
-
----
-
-## Step 8 — Test Creating a New Project From the Template
-
-1. On your repository homepage, click **Use this template → Create a new repository** (creating the repo does **not** trigger a paid build on its initial commit).
-2. In the **new** repository, re-apply Step 6 (`Secrets` and `Actions → General → Workflow permissions`) — GitHub does **not** copy repository secrets from templates.
-3. Copy `specs/TEMPLATE.md` to `specs/001-my-app.md`, fill in your requirements and acceptance criteria, commit, and push to `main` (push one spec per push, or trigger each manually with **Actions → Spec to App → Run workflow**):
-
-```bash
-cp specs/TEMPLATE.md specs/001-my-app.md
-# Edit specs/001-my-app.md
-git add specs/001-my-app.md
-git commit -m "feat: add 001-my-app spec"
-git push origin main
-```
-
-GitHub Actions uses `atlas changed-specs` across the full push to detect `specs/001-my-app.md`, builds and verifies the app into `app/001-my-app/` (including requirement-ID test checks), uploads the product artifact, publishes its Docker image, appends to `usage/ledger.jsonl`, and opens a usage PR for review.
-
----
-
-## Step 9 — Continuous Delivery (Docker to GHCR, Free)
-
-When verification passes, `spec-to-app.yml` automatically calls [`.github/workflows/cd.yml`](../.github/workflows/cd.yml) with the `atlas-product-<spec-name>` artifact:
-
-1. **Downloads the verified product** from the workflow artifact (no built code needs to be committed to Git).
-2. **Builds a Docker image** using `Dockerfile` inside the built product (or a minimal Python `3.12-slim` / Node `20-slim` fallback Dockerfile if the generated app did not emit one).
-3. **Publishes to GitHub Container Registry (`ghcr.io`)** using the built-in `GITHUB_TOKEN` (no extra secrets or paid services required), tagging `ghcr.io/professorshabs/agentic_workflow/<spec-name>:<short-sha>` and `:latest`:
-
-```bash
-docker pull ghcr.io/professorshabs/agentic_workflow/example-app:latest
-docker run --rm ghcr.io/professorshabs/agentic_workflow/example-app:latest
-```
-
-4. **Optional manual approval gate**: in GitHub **Settings → Environments → `production`**, enable **Required reviewers** if you want every container release to wait for your approval before pushing to `ghcr.io`.
+These are separate follow-up tasks, not part of current testing. When framework CI is introduced, it should run Atlas's quality checks (`ruff`, `mypy`, `pytest`, and dependency audit) only. Generated products should continue to be built and tested locally; when a product is ready to deploy, give it its own repository and CI/deployment flow for its own tests. See [the harness plan](HARNESS_PLAN.md#9-framework-vs-products-where-things-are-tested).

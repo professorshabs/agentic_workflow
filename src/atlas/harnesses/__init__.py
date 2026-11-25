@@ -43,6 +43,20 @@ async def run_doctor(
     needs_local_sdk = False
     needs_openrouter = False
 
+    def _collect_backend_deps(cfg: dict[str, Any]) -> None:
+        nonlocal needs_local_sdk, needs_openrouter
+        btype = cfg.get("type", "openrouter")
+        if btype == "harness":
+            prov = str(cfg.get("provider") or "")
+            if prov:
+                harness_configs.setdefault(prov, cfg.get("auth"))
+        elif btype == "local_harness":
+            needs_local_sdk = True
+        elif btype in ("openrouter", "litellm"):
+            needs_openrouter = True
+        if cfg.get("fallback") == "router":
+            needs_openrouter = True
+
     if not backends:
         needs_openrouter = True
     else:
@@ -51,17 +65,12 @@ async def run_doctor(
                 continue
             if role_name == "supervisor" and not role_cfg.get("enabled", False):
                 continue
-            btype = role_cfg.get("type", "openrouter")
-            if btype == "harness":
-                prov = str(role_cfg.get("provider") or "")
-                if prov:
-                    harness_configs.setdefault(prov, role_cfg.get("auth"))
-            elif btype == "local_harness":
-                needs_local_sdk = True
-            elif btype in ("openrouter", "litellm"):
-                needs_openrouter = True
-            if role_cfg.get("fallback") == "router":
-                needs_openrouter = True
+            if role_name == "supervisor" and isinstance(role_cfg.get("reviewers"), list):
+                for reviewer_cfg in role_cfg["reviewers"]:
+                    if isinstance(reviewer_cfg, dict):
+                        _collect_backend_deps(reviewer_cfg)
+                continue
+            _collect_backend_deps(role_cfg)
 
     checks: list[dict[str, Any]] = []
     all_ok = True

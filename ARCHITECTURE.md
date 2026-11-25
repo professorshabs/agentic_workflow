@@ -12,7 +12,7 @@ Per [ADR 0001: Plain Python pipeline in Phase 1](docs/decisions/0001-phase1-plai
 
 - **Orchestrator ([`src/atlas/runner.py`](src/atlas/runner.py)):** `run_plan` and `run_build` are plain `async` functions that call each pipeline stage in sequence, manage artifacts under `runs/<run-id>/`, and drive the build/verify/fix loop.
 - **Typed State Contracts ([`src/atlas/schemas.py`](src/atlas/schemas.py)):** Every stage communicates via strict `Pydantic` (`StrictModel`, `extra="forbid"`) schemas — `ParsedSpec`, `ResearchReport`, `Plan`, `GeneratedApp`, `PatchResult`, and `VerificationReport`.
-- **Unified LLM Client ([`src/atlas/router.py`](src/atlas/router.py)):** `ModelRouter` wraps `litellm.acompletion` across providers (currently OpenRouter primary with Gemini fallbacks in [`config/models.yaml`](config/models.yaml)), enforcing concurrency caps, output token limits, timeouts, budgets, key fallbacks, and token/cost logging.
+- **Unified LLM & Harness Router ([`src/atlas/router.py`](src/atlas/router.py)):** `ModelRouter` wraps `litellm.acompletion` across cloud providers ([`config/models.yaml`](config/models.yaml)) and dispatches harness-backed roles (`antigravity` CLI, `claude_code` read-only CLI, and local `antigravity_sdk` via [`config/harness.yaml`](config/harness.yaml)), enforcing concurrency caps, output token limits, timeouts, budgets, key fallbacks, skills allowlists, and token/cost logging.
 
 **Why this choice:** Keeping orchestration in plain Python makes execution paths, failure modes, and exact token spend transparent with minimal dependencies. At the same time, each stage function and Pydantic schema is cleanly decoupled so it can map 1:1 to LangGraph nodes if multi-turn agent loops, persistent checkpoints, or human-in-the-loop pause/resume are added in a later phase (see [ROADMAP.md](ROADMAP.md)).
 
@@ -26,42 +26,52 @@ flowchart TD
     Copy --> Parse["1. parse_spec (parser) -> ParsedSpec (spec.json)"]
     Parse --> SkipCheck{"skip_research?"}
 
-    SkipCheck -- "No (default)" --> Research["2. research (researcher, parallel/req) -> ResearchReport"]
-    Research --> Judge["3. judge (judge, parallel/req) -> Plan (plan.json, plan.md)"]
-    Judge --> Build["4. build_app (builder) -> GeneratedApp (build.json)"]
+    SkipCheck -- "No (default)" --> Research["2. research (researcher: findings, clarifying_questions, e2e_scenarios)"]
+    Research --> Clarify["2b. clarify_with_user (clarify.py) -> clarifications.json + updated spec"]
+    Clarify --> Judge["3. judge (judge, parallel/req) -> Plan (plan.json, plan.md)"]
+    Judge --> E2E["3b. generate_e2e_tests (e2e.py) -> E2ETestSuite (e2e_tests.json)"]
+    E2E --> Build["4. build_app / build_app_workspace (builder) -> build.json"]
 
-    SkipCheck -- "Yes (--skip-research)" --> Build
+    SkipCheck -- "Yes (--skip-research)" --> SkipClarify["2b/3b. Clarify spec open_questions + optional E2E tests"] --> Build
 
-    Build --> Mat["5. materialize_files -> app/spec-name/ (git-ignored)"]
-    Mat --> Verify["6. verify_app + spec-coverage"]
+    Build --> Mat["5. Workspace / materialize + authoritative E2E test files -> app/spec-name/"]
+    Mat --> Verify["6. verify_app + spec-coverage + product-contract + e2e-product-tests"]
     Verify --> PassedCheck{"All checks pass?"}
 
-    PassedCheck -- "No & attempts under max_fix_rounds" --> Fix["7. fix_app (fixer) -> PatchResult"]
+    PassedCheck -- "No & attempts under max_fix_rounds" --> Fix["7. fix_app (fixer, alternating models) -> PatchResult"]
     Fix --> PatchMat["materialize_files(..., clean=False) -> app/spec-name/"]
     PatchMat --> Verify
 
-    PassedCheck -- "Yes or rounds exhausted" --> Reports["Write verification.json, tokens.json, report.md, manifest.json"]
+    PassedCheck -- "Yes" --> SupCheck{"Supervisor enabled?"}
+    SupCheck -- "Yes" --> Sup["8. supervise_app (Opus + Neon in parallel) -> Review"]
+    Sup -- "Changes requested & rounds left" --> Fix
+    Sup -- "Approved or rounds exhausted" --> Reports["Write verification.json, supervisor_review.json, tokens.json, report.md, manifest.json"]
+    SupCheck -- "No" --> Reports
+    PassedCheck -- "No & rounds exhausted" --> Reports
     Reports --> Ledger["Append usage/ledger.jsonl"]
     Ledger --> CI["GitHub Actions: artifact + cd.yml (ghcr.io) + ledger PR -> ci.yml"]
 ```
 
 ### Markdown File vs. Typed / Interactive Spec Input
 
-Today, the CLI commands `atlas plan <spec.md>` and `atlas build <spec.md>` ([`src/atlas/cli.py`](src/atlas/cli.py)) take a path to a Markdown file (for example [`specs/example-app.md`](specs/example-app.md)), read `raw_spec` from disk in `run_plan` / `run_build`, and immediately snapshot a copy to `runs/<run-id>/spec.md`.
+Today, the CLI commands `atlas plan <spec.md>` and `atlas build <spec.md>` (or `atlas run <spec.md>`) ([`src/atlas/cli.py`](src/atlas/cli.py)) take a path to a Markdown file (for example [`specs/example-app.md`](specs/example-app.md)), read `raw_spec` from disk in `run_plan` / `run_build`, and immediately snapshot a copy to `runs/<run-id>/spec.md`.
 
 Because every downstream stage works solely from that `raw_spec` string and `ParsedSpec`, supporting a spec typed directly in a CLI prompt, web UI, or API only requires saving that text to a temporary/run `.md` file (or passing the string directly into `parse_spec(router, raw_spec)`). No changes to the `research`, `judge`, `build`, or `verify` stages are needed.
 
 ### Stage-by-Stage Breakdown
 
-| Stage | Module & Function | Role in `models.yaml` | Concurrency | Input | Validated Output | Artifacts Saved |
+| Stage | Module & Function | Role in config | Concurrency | Input | Validated Output | Artifacts Saved |
 | :--- | :--- | :--- | :--- | :--- | :--- | :--- |
 | **1. Parse** | [`parse_spec`](src/atlas/pipeline/parse.py) | `parser` | 1 call | Raw Markdown spec (`raw_spec`) | `ParsedSpec` (requirements DAG checked for cycles/unknown IDs) | `spec.md`, `spec.json` |
-| **2. Research** *(optional)* | [`research`](src/atlas/pipeline/research.py) | `researcher` | Parallel across `(requirement x deduplicated available model)` | `ParsedSpec` context + single `Requirement` | `ResearchNote` list + `ResearchFailure` list inside `ResearchReport` | `research.json` |
-| **3. Judge** *(optional)* | [`judge`](src/atlas/pipeline/judge.py) | `judge` | Parallel per requirement (`asyncio.gather`) | Project overview + target `Requirement` + its filtered research notes | 1 `ToolDecision` (2–3 options + pick) per requirement -> assembled `Plan` + SHA-256 hash | `plan.json`, `plan.md` |
-| **4. Build** | [`build_app`](src/atlas/pipeline/build.py) | `builder` | 1 call | `ParsedSpec` + `Plan` (or `raw_spec` directly if `--skip-research`) | `GeneratedApp` (relative path safety + unique paths validated) | `build.json`, files written via `materialize_files` to `app/<spec-name>/` |
-| **5. Verify** | [`verify_app`](src/atlas/pipeline/verify.py) + `check_requirement_coverage` | *(No LLM call)* | Subprocesses in stripped env | Files inside `app/<spec-name>/` + functional IDs | `CheckResult` list (compile, tests, lint/build, `spec-coverage`) | Recorded in `VerificationRound` |
-| **6. Fix Loop** *(up to `max_fix_rounds`)* | [`fix_app`](src/atlas/pipeline/build.py) | `fixer` | 1 call per failed round | `ParsedSpec`, optional `Plan`, failing checks, current file snapshot of `app/<spec-name>/` | `PatchResult` (`diagnosis`, `files`, `delete_files`) -> incremental `materialize_files` | Re-runs Step 5 after each patch |
-| **7. Reporting** | [`summarize_usage`](src/atlas/telemetry.py), [`render_run_report`](src/atlas/pipeline/render.py) | *(No LLM call)* | Always runs (`finally` block) | `router.call_log`, `VerificationReport` | `TokenUsageSummary`, Markdown report, run ledger line | `verification.json`, `tokens.json`, `report.md`, `manifest.json`, `usage/ledger.jsonl` |
+| **2. Research** *(optional)* | [`research`](src/atlas/pipeline/research.py) | `researcher` | Parallel across `(requirement x model)` bounded by `max_parallel` | `ParsedSpec` context + single `Requirement` | `ResearchNote` (with `clarifying_questions` & `e2e_scenarios`) + `ResearchFailure` | `research.json` |
+| **2b. Clarify** *(automatic when questions exist)* | [`clarify_with_user`](src/atlas/pipeline/clarify.py) | *(Human TTY / `--answers` / non-TTY no-block)* | Interactive or prefilled | `spec.open_questions` + `research.clarifying_questions` | `ClarificationReport` -> answered Q&As folded into `ParsedSpec.assumptions` | `clarifications.json`, updated `spec.json` |
+| **3. Judge** *(optional)* | [`judge`](src/atlas/pipeline/judge.py) | `judge` | Parallel per requirement (`asyncio.gather`) | Project overview + clarified `Requirement` + its filtered research notes | 1 `ToolDecision` (2–3 options + pick) per requirement -> assembled `Plan` + SHA-256 hash | `plan.json`, `plan.md` |
+| **3b. E2E Test Gen** *(when enabled)* | [`generate_e2e_tests`](src/atlas/pipeline/e2e.py) | `e2e` / `researcher` | 1 call | Clarified `ParsedSpec`, `ClarificationReport`, `ResearchReport`, optional `Plan` | `E2ETestSuite` (`product_interface` contract, `verifiable`/`unverifiable_reason`, pre-seeded test files) | `e2e_tests.json`; `PLAN.md` + `tests/` pre-seeded into `app/<spec-name>/` before local builds |
+| **4. Build** | [`build_app`](src/atlas/pipeline/build.py) / [`build_app_workspace`](src/atlas/pipeline/build.py) | `builder` | 1 session/call | Compact spec/contract + on-disk `PLAN.md`, `tests/`, & `.agents/skills/` index (`discovery_mode: progressive`) | `GeneratedApp` or `WorkspaceBuildResult` (path & git-escape guarded; E2E files re-verified afterward) | `build.json`, files in `app/<spec-name>/` |
+| **5. Verify** | [`verify_app`](src/atlas/pipeline/verify.py) + `spec-coverage` + `product-contract` + `e2e-product-tests` | *(No LLM call)* | Subprocesses in stripped env | Files inside `app/<spec-name>/` + functional IDs + expected E2E test paths | `CheckResult` list (compile, tests, lint/build, coverage, hygiene, E2E test integrity) | Recorded in `VerificationRound` |
+| **6. Fix Loop** *(up to `max_fix_rounds`)* | [`fix_app`](src/atlas/pipeline/build.py) | `fixer` | 1 call per failed round (supports `rotate` across models) | `ParsedSpec`, optional `Plan`, failing checks/review, `previous_diagnoses`, file snapshot | `PatchResult` (`diagnosis`, `files`, `delete_files`) -> incremental `materialize_files` | Re-runs Step 5 after each patch |
+| **7. Supervisor** *(optional, post-build)* | [`supervise_app`](src/atlas/pipeline/build.py) + [`merge_supervisor_reviews`](src/atlas/pipeline/build.py) | `supervisor` | Parallel across `backends.supervisor.reviewers` (`opus` + `neon`) | `ParsedSpec`, `Plan`, passing `VerificationRound`, read-only workspace / `current_files` | Unified `Review` (`approved`, `summary`, merged `issues` & `improvement_plan`, `reviewers`) | `supervisor_review.json`; rejections feed into Step 6 |
+| **8. Reporting** | [`summarize_usage`](src/atlas/telemetry.py), [`render_run_report`](src/atlas/pipeline/render.py) | *(No LLM call)* | Always runs (`finally` block) | `router.call_log`, `VerificationReport`, optional `Review` | `TokenUsageSummary` (with `cost_source` & `unpriced_calls`), Markdown report, ledger line | `verification.json`, `tokens.json`, `report.md`, `manifest.json`, `usage/ledger.jsonl` |
 
 #### Stack Verification Details (Step 5)
 
@@ -69,7 +79,9 @@ Because every downstream stage works solely from that `raw_spec` string and `Par
 
 - **Python:** `python -m compileall -f -q .` (`python-compile`), `python -B -m pytest` (`python-pytest`), and `ruff check --isolated --no-cache .` (`python-ruff` if `ruff` is available). If external dependencies are declared or `pytest` is absent, Atlas provisions an isolated temporary virtualenv via `uv` or `python -m venv`.
 - **Node.js:** `npm install --no-audit --no-fund` if dependencies exist without `node_modules`, followed by `npm test` (or `node --test` on `*.test.{js,mjs,cjs}`), plus optional `typecheck`, `build`, and `lint` scripts if defined in `package.json`.
-- **Requirement traceability (`spec-coverage`):** When `verification.require_requirement_tests: true` in `config/models.yaml`, `check_requirement_coverage` verifies that every functional requirement ID (e.g. `R001`) appears in at least one test file (such as a test name or comment).
+- **Requirement traceability (`spec-coverage`):** When `verification.require_requirement_tests: true`, `check_requirement_coverage` verifies that every functional requirement ID (e.g. `R001`) appears in at least one test file (such as a test name or comment).
+- **Standalone hygiene (`product-contract`):** When `verification.require_product_contract: true`, `check_product_contract` verifies that `app/<spec-name>/` has a `README.md`, a dependency file, runnable product tests, and no `import atlas`.
+- **End-to-end product tests (`e2e-product-tests`):** When `verification.require_e2e_tests: true` (or `--e2e-tests`), [`generate_e2e_tests`](src/atlas/pipeline/e2e.py) emits black-box end-product tests before the build starts and guarantees they are materialized onto disk; `check_e2e_tests` verifies they remain intact, contain real assertions, and cannot be deleted or skipped by the fixer.
 
 ---
 
@@ -79,7 +91,7 @@ Because every downstream stage works solely from that `raw_spec` string and `Par
 
 Every LLM stage routes through [`complete_json_model`](src/atlas/pipeline/util.py):
 
-1. Loads the stage's Markdown system prompt via `prompt(name)` from `src/atlas/prompts/` (`parse.md`, `research.md`, `judge.md`, `build.md`, `fix.md`).
+1. Loads the stage's Markdown system prompt via `prompt(name)` from `src/atlas/prompts/` (`parse.md`, `research.md`, `judge.md`, `e2e_tests.md`, `build.md`, `fix.md`, `supervisor.md`).
 2. Sends `system` and `user` prompts through `router.complete(...)` requesting structured JSON output.
 3. Extracts JSON even if wrapped in prose or fenced code blocks (`extract_json` / `extract_json_object`).
 4. Runs an optional stage `postprocess` hook (for example, `attach_metadata` in [`src/atlas/pipeline/research.py`](src/atlas/pipeline/research.py)) and validates against the stage's Pydantic schema (`StrictModel`).
@@ -90,7 +102,7 @@ Every LLM stage routes through [`complete_json_model`](src/atlas/pipeline/util.p
 [`ModelRouter`](src/atlas/router.py) reads [`config/models.yaml`](config/models.yaml) and coordinates all model calls:
 
 - **Concurrency Gate:** Bounds simultaneous in-flight LLM requests with an `asyncio.Semaphore` sized by `limits.max_parallel_calls` (`6` by default).
-- **Per-Role Limits & Timeouts:** Applies `limits.max_tokens_by_role` (`researcher: 12000`, `judge: 16000`, `builder: 32000`, `fixer: 16000`, fallback `max_tokens: 6000`) and `limits.timeout_seconds_by_role` via `max_tokens_for(role)` and `timeout_for(role)`.
+- **Per-Role Limits & Timeouts:** Applies `limits.max_tokens_by_role` (`config/models.yaml`: `researcher: 12000`, `judge: 16000`, `builder: 32000`, `fixer: 16000`; `config/harness.yaml`: `researcher: 24000`, `judge: 16000`, `e2e: 32000`, `builder: 32000`, `fixer: 24000`; fallback `max_tokens: 6000`) and `limits.timeout_seconds_by_role` via `max_tokens_for(role)` and `timeout_for(role)` (with `role == "e2e"` gracefully inheriting higher-limit roles when omitted).
 - **No Wasted Retries on Cut-Off Replies:** If a reply is truncated at the output token limit, Atlas raises `OutputTruncatedError` and stops immediately instead of burning tokens retrying the same prompt on fallback models with the same cap.
 - **Pre-Send Budget Guard:** Checks `limits.max_total_tokens` and `limits.max_cost_usd` inside `_check_budget()` immediately before each call is sent (so parallel queued calls respect spend as earlier ones complete).
 - **Provider Key Fallback & Skipping:** On HTTP 401/402, `_switch_to_fallback_key` checks `<PROVIDER>_API_KEY_FALLBACK` (for example `OPENROUTER_API_KEY_FALLBACK`) before `_mark_unavailable` skips that provider/model for the rest of the run and moves to `role_fallbacks`.
@@ -113,35 +125,12 @@ Generated apps are treated as build/deploy products rather than committed templa
 
 ---
 
-## 5. How to Add Skills (for `builder`, `fixer`, and Other Roles)
+## 5. How Skills Work (`builder` and `fixer`)
 
-Currently, all stage instructions live in static Markdown files under `src/atlas/prompts/` (`parse.md`, `research.md`, `judge.md`, `build.md`, `fix.md`); Atlas does not yet load an external `skills/` directory. Because every stage already passes explicit `system` and `user` strings through `complete_json_model`, you can add skills cleanly in three stages of complexity:
+[`src/atlas/skills.py`](src/atlas/skills.py) loads skills from configured sources (such as `~/Documents/skills` and `.agents/skills` in [`config/harness.yaml`](config/harness.yaml)), enforces a strict `skills.allowlist` (so unrelated domain skills are excluded by default), and scopes them by role via `skills.by_role`:
 
-### Option A: Markdown Prompt Skills (Recommended Today)
-
-Store reusable domain playbooks in a workspace `skills/` folder (e.g., `skills/python-fastapi/SKILL.md`, `skills/nextjs-app/SKILL.md`, `skills/dockerfile-prod/SKILL.md`) containing architecture conventions, preferred test patterns (such as tagging functional requirement IDs like `# R001` for `spec-coverage`), and `Dockerfile` guidelines.
-
-To wire them into `builder` and `fixer`:
-
-1. **Load skill Markdown files:** Add a helper (for example `load_skills(skill_names, skills_dir=Path("skills"))`) that reads each `skills/<name>/SKILL.md`.
-2. **Choose where skills are declared:**
-   - **Per role in `config/models.yaml`:** e.g. `skills: { builder: ["dockerfile-prod"], fixer: ["pytest-debugging"] }`.
-   - **Inside the spec / CLI:** parse an optional `skills: list[str]` field on `ParsedSpec` in [`src/atlas/schemas.py`](src/atlas/schemas.py), or add `--skill` in [`src/atlas/cli.py`](src/atlas/cli.py) and pass `skills` into `run_build` ([`src/atlas/runner.py`](src/atlas/runner.py)).
-3. **Inject into the role prompt:** In `build_app(...)` and `fix_app(...)` inside [`src/atlas/pipeline/build.py`](src/atlas/pipeline/build.py), append the loaded skill blocks to `system = prompt("build")` / `prompt("fix")` before calling `complete_json_model(...)`.
-
-### Option B: Stack-Aware / Progressive Skill Injection (Save Prompt Tokens)
-
-To avoid bloating every build prompt with unrelated instructions:
-
-- Let `parse_spec` or a lightweight rule inspect `ParsedSpec.constraints` and `Plan.decisions` (`decision.pick`), then load only matching skills (for example, inject `skills/react-vite/SKILL.md` only when Judge selects React/Vite).
-- Or expose only skill names and one-line descriptions to `judge`, then inject full `SKILL.md` bodies only into `builder` and `fixer`.
-
-### Option C: Executable Tool-Calling Skills (Future Multi-Turn Upgrade)
-
-Today `builder` and `fixer` return a full `GeneratedApp` or `PatchResult` JSON payload in one response. If future skills need models to run commands, inspect docs dynamically, or read/edit large repositories incrementally:
-
-- Extend `ModelRouter.complete` ([`src/atlas/router.py`](src/atlas/router.py)) to accept `tools=[...]` and run an async tool-call loop around `litellm.acompletion`, or
-- Promote `build_app` and `fix_app` into stateful graph nodes (e.g. LangGraph) while keeping the existing `ParsedSpec`, `Plan`, `GeneratedApp`, `PatchResult`, and `VerificationReport` Pydantic contracts intact.
+- **Progressive workspace symlinks & lean local prompts:** With `discovery_mode: progressive`, [`build_app_workspace`](src/atlas/pipeline/build.py) symlinks only `builder`'s allowlisted skills into `app/<spec-name>/.agents/skills/`, passes `format_role_skill_index()` (name + 1-line description + `.agents/skills/` path) instead of full Markdown bodies, pre-seeds `PLAN.md` and `tests/` E2E tests onto disk, and enforces `max_prompt_chars` so local models stay well within their `32K–64K` context window. Symlinks are removed in `finally`.
+- **Prompt injection for `builder` and `fixer`:** `load_role_skill_prompt(role, skills_cfg)` reads each allowed `SKILL.md` body and appends it to the role system prompt (for example giving the alternating OpenRouter `fixer` the `writing-clean-code` rules).
 
 ---
 
@@ -149,18 +138,23 @@ Today `builder` and `fixer` return a full `GeneratedApp` or `PatchResult` JSON p
 
 | Path | Responsibility |
 | :--- | :--- |
-| [`src/atlas/cli.py`](src/atlas/cli.py) | CLI entrypoint (`plan`, `build`, `verify`, `tokens`, `changed-specs`, `app-dir`, `validate-config`) |
-| [`src/atlas/runner.py`](src/atlas/runner.py) | Plain async pipeline orchestration (`run_plan`, `run_build`, `record_approval`) and artifact/ledger writing |
-| [`src/atlas/router.py`](src/atlas/router.py) | `ModelRouter`: LiteLLM wrapper, role/fallback routing, budgets, key fallback, timeouts, token caps, `call_log` |
-| [`src/atlas/schemas.py`](src/atlas/schemas.py) | Strict Pydantic v2 contracts across all stages and path-safety validation |
+| [`src/atlas/cli.py`](src/atlas/cli.py) | CLI entrypoint (`plan`, `build`/`run`, `verify`, `tokens`, `changed-specs`, `app-dir`, `validate-config`, `doctor`, `detect-local`), real-time `stderr` `[HH:MM:SS]` progress logging (`-q` / `--quiet`, `--verbose` with third-party HTTP/LLM noise isolated) |
+| [`src/atlas/runner.py`](src/atlas/runner.py) | Plain async pipeline orchestration (`run_plan`, `run_build`, `record_approval`), live stage/check progress logging, and artifact/ledger writing |
+| [`src/atlas/router.py`](src/atlas/router.py) | `ModelRouter`: LiteLLM & harness routing, multi-reviewer supervisor config, budgets, key fallback, timeouts, token caps, `call_log` |
+| [`src/atlas/schemas.py`](src/atlas/schemas.py) | Strict Pydantic v2 contracts (`ParsedSpec`, `Plan`, `GeneratedApp`, `WorkspaceBuildResult`, `PatchResult`, `SupervisorOutput`, `ReviewerVerdict`, `Review`) |
+| [`src/atlas/local_models.py`](src/atlas/local_models.py) | Ollama / LM Studio discovery, tool capability & `32K` (`min_context_tokens: 32768`) / `78%` RAM (`memory_budget_fraction: 0.78`) filtering, and tool-call smoke check |
+| [`src/atlas/skills.py`](src/atlas/skills.py) | Allowlisted `SKILL.md` discovery, role prompt injection, and temporary workspace symlink management |
+| [`src/atlas/harnesses/`](src/atlas/harnesses) | `AntigravityCLIAdapter` (`agy`), `AntigravitySDKAdapter` (local builder), read-only `ClaudeCodeAdapter` (`claude`), path/git guards, `run_doctor` |
 | [`src/atlas/pipeline/parse.py`](src/atlas/pipeline/parse.py) | `parse_spec` (`parser` -> `ParsedSpec`) |
-| [`src/atlas/pipeline/research.py`](src/atlas/pipeline/research.py) | Parallel per-requirement research (`researcher` -> `ResearchReport`) |
+| [`src/atlas/pipeline/research.py`](src/atlas/pipeline/research.py) | Parallel per-requirement research (`researcher` -> `ResearchReport` with `clarifying_questions` & `e2e_scenarios`) |
+| [`src/atlas/pipeline/clarify.py`](src/atlas/pipeline/clarify.py) | Collects spec/research clarifying questions, prompts interactively or loads `--answers`, folds answers into `ParsedSpec.assumptions` |
 | [`src/atlas/pipeline/judge.py`](src/atlas/pipeline/judge.py) | Parallel per-requirement option selection (`judge` -> `Plan`) |
-| [`src/atlas/pipeline/build.py`](src/atlas/pipeline/build.py) | `build_app` (`builder`), `fix_app` (`fixer`), `default_app_dir`, `materialize_files`, `snapshot_app_files` |
-| [`src/atlas/pipeline/verify.py`](src/atlas/pipeline/verify.py) | Stack detection, isolated Python/Node verification checks, `spec-coverage`, env scrubbing |
-| [`src/atlas/pipeline/util.py`](src/atlas/pipeline/util.py) | Prompt loader (`src/atlas/prompts/*.md`), JSON extraction, `complete_json_model` validation/repair loop |
-| [`src/atlas/pipeline/render.py`](src/atlas/pipeline/render.py) | Markdown rendering for `plan.md` and `report.md` |
-| [`src/atlas/telemetry.py`](src/atlas/telemetry.py) | Token/cost extraction, usage summaries (`tokens.json`), and JSONL ledger (`usage/ledger.jsonl`) |
-| [`config/models.yaml`](config/models.yaml) | Model roles, fallbacks, concurrency, token caps, timeouts, cost/token budgets, coverage toggle |
+| [`src/atlas/pipeline/e2e.py`](src/atlas/pipeline/e2e.py) | Pre-build black-box E2E product test suite & `product_interface` generator (`E2ETestSuite`) |
+| [`src/atlas/pipeline/build.py`](src/atlas/pipeline/build.py) | `build_app`, `build_app_workspace`, alternating `fix_app`, parallel `supervise_app` + `merge_supervisor_reviews`, `materialize_files` |
+| [`src/atlas/pipeline/verify.py`](src/atlas/pipeline/verify.py) | Stack detection, isolated Python/Node verification checks, `spec-coverage`, `product-contract`, `e2e-product-tests`, env scrubbing |
+| [`src/atlas/pipeline/util.py`](src/atlas/pipeline/util.py) | Prompt loader (`src/atlas/prompts/*.md`), JSON extraction, `complete_json_model` validation/repair loop, `role_target_label` |
+| [`src/atlas/pipeline/render.py`](src/atlas/pipeline/render.py) | Markdown rendering for `plan.md` and `report.md` (clarifications, E2E contract, and `## Supervisor review`) |
+| [`src/atlas/telemetry.py`](src/atlas/telemetry.py) | Token/cost extraction with honest `cost_source` & `auth_mode`, usage summaries (`tokens.json`), and JSONL ledger (`usage/ledger.jsonl`) |
+| [`config/models.yaml`](config/models.yaml) & [`config/harness.yaml`](config/harness.yaml) | Pure OpenRouter profile and hybrid local-first harness profile (with Dual Post-Build Supervisor) |
 | [`docs/decisions/0001-phase1-plain-python.md`](docs/decisions/0001-phase1-plain-python.md) | Architectural decision record explaining plain Python over LangGraph in Phase 1 |
 | [`.github/workflows/`](.github/workflows/spec-to-app.yml) | CI (`ci.yml`), spec-to-app build & PR reporting (`spec-to-app.yml`), and Docker/GHCR publishing (`cd.yml`) |

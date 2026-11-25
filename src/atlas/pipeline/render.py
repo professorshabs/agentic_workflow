@@ -1,10 +1,13 @@
 import re
 
 from atlas.schemas import (
+    ClarificationReport,
+    E2ETestSuite,
     GeneratedApp,
     ParsedSpec,
     Plan,
     ResearchFailure,
+    Review,
     TokenUsageSummary,
     VerificationReport,
     WorkspaceBuildResult,
@@ -18,12 +21,49 @@ def _clean_verify_flag(flag: str) -> str:
     return _VERIFY_PREFIX_RE.sub("", flag.strip()).strip()
 
 
+def _render_clarifications_section(clarifications: ClarificationReport | None) -> list[str]:
+    if clarifications is None or not clarifications.items:
+        return []
+    lines = ["", "## Clarifications", ""]
+    for item in clarifications.items:
+        tag = f" ({item.requirement_id})" if item.requirement_id else ""
+        ans = item.answer.strip() if item.answer.strip() else "Unanswered"
+        lines.append(f"- **Q{tag}:** {item.question}")
+        lines.append(f"  - **A:** {ans}")
+    return lines
+
+
+def _render_e2e_section(e2e_suite: E2ETestSuite | None) -> list[str]:
+    if e2e_suite is None:
+        return []
+    lines = [
+        "",
+        "## End-to-end product tests",
+        "",
+        e2e_suite.summary,
+        "",
+        f"- **Product interface:** `{e2e_suite.product_interface}`",
+    ]
+    if not e2e_suite.verifiable:
+        reason = e2e_suite.unverifiable_reason or "Not automatable offline"
+        lines.append(f"- **Verifiable offline:** No — {reason}")
+    if e2e_suite.scenarios:
+        lines.append("- **Scenarios:**")
+        lines.extend(f"  - {sc}" for sc in e2e_suite.scenarios)
+    if e2e_suite.files:
+        lines.append("- **Test files:**")
+        lines.extend(f"  - `{f.path}`" for f in e2e_suite.files)
+    return lines
+
+
 def render_plan(
     plan: Plan,
     *,
     run_id: str | None = None,
     plan_sha256: str | None = None,
     research_failures: list[ResearchFailure] | None = None,
+    clarifications: ClarificationReport | None = None,
+    e2e_suite: E2ETestSuite | None = None,
 ) -> str:
     spec = plan.spec
     req_titles = {req.id: req.title for req in spec.requirements}
@@ -69,6 +109,8 @@ def render_plan(
         if values:
             lines.extend(["", f"## {heading}"])
             lines.extend(f"- {value}" for value in values)
+
+    lines.extend(_render_clarifications_section(clarifications))
 
     lines.extend(["", "## Tool decisions"])
     for decision in plan.decisions:
@@ -123,6 +165,8 @@ def render_plan(
         lines.extend(["", "## Implementation tasks"])
         lines.extend(f"{i}. {task}" for i, task in enumerate(plan.tasks, 1))
 
+    lines.extend(_render_e2e_section(e2e_suite))
+
     lines.extend([
         "",
         "## Approval",
@@ -147,6 +191,9 @@ def render_run_report(
     written_files: list[str],
     app_dir: str | None = None,
     error: str | None = None,
+    supervisor_review: Review | None = None,
+    clarifications: ClarificationReport | None = None,
+    e2e_suite: E2ETestSuite | None = None,
 ) -> str:
     """Render a full Markdown build, verification, and token usage report."""
     stack_label = (
@@ -174,8 +221,12 @@ def render_run_report(
     if spec is not None:
         lines.extend(["", "## Specification summary", "", spec.summary])
 
+    lines.extend(_render_clarifications_section(clarifications))
+
     if generated_app is not None and generated_app.summary:
         lines.extend(["", "## Application summary", "", generated_app.summary])
+
+    lines.extend(_render_e2e_section(e2e_suite))
 
     if error:
         lines.extend(["", "## Error", "", f"```\n{error}\n```"])
@@ -215,6 +266,33 @@ def render_run_report(
                 if chk.stderr:
                     lines.extend(["", "```text", chk.stderr, "```"])
             lines.extend(["", "</details>"])
+
+    if supervisor_review is not None:
+        verdict_label = "APPROVED" if supervisor_review.approved else "CHANGES REQUESTED"
+        lines.extend(["", "## Supervisor review", "", f"- **Verdict:** {verdict_label}"])
+        if supervisor_review.reviewers:
+            lines.extend([
+                "",
+                "| Reviewer | Harness | Model | Verdict | Summary |",
+                "| :--- | :--- | :--- | :---: | :--- |",
+            ])
+            for verdict in supervisor_review.reviewers:
+                badge = "APPROVED" if verdict.approved else "CHANGES REQUESTED"
+                lines.append(
+                    f"| `{verdict.reviewer}` | `{verdict.harness}` | `{verdict.model}` "
+                    f"| {badge} | {verdict.summary} |"
+                )
+        else:
+            lines.append(f"- **Summary:** {supervisor_review.summary}")
+        if supervisor_review.issues:
+            lines.extend(["", "### Issues", ""])
+            lines.extend(f"- {item}" for item in supervisor_review.issues)
+        if supervisor_review.improvement_plan:
+            lines.extend(["", "### Improvement plan", ""])
+            lines.extend(
+                f"{idx}. {step}"
+                for idx, step in enumerate(supervisor_review.improvement_plan, 1)
+            )
 
     lines.extend(["", render_token_report_md(token_summary)])
 

@@ -52,7 +52,16 @@ _SAFE_BASE_ENV_PREFIXES = ("LC_", "XDG_")
 
 
 class HarnessError(RuntimeError):
-    """Base error raised by harness adapters."""
+    """Base error raised by harness adapters.
+
+    ``usage`` carries whatever token/cost telemetry the harness reported before it failed
+    (e.g. a Claude Code run that hit ``--max-budget-usd`` was still billed), so callers can
+    record the spend instead of logging the failed call as free.
+    """
+
+    def __init__(self, message: str = "", *, usage: dict[str, Any] | None = None) -> None:
+        super().__init__(message)
+        self.usage: dict[str, Any] = dict(usage or {})
 
 
 class HarnessAuthError(HarnessError):
@@ -179,6 +188,9 @@ def snapshot_file_hashes(app_dir: Path) -> dict[str, str]:
     root = app_dir.resolve()
     hashes: dict[str, str] = {}
     for path in sorted(root.rglob("*")):
+        rel = path.relative_to(root)
+        if any(part in _WORKSPACE_IGNORED_DIRS for part in rel.parts):
+            continue
         if path.name == ".gitkeep":
             continue
         if path.is_symlink():
@@ -187,9 +199,6 @@ def snapshot_file_hashes(app_dir: Path) -> dict[str, str]:
                 raise ValueError(f"Symlink escapes workspace directory: {path}")
             continue
         if not path.is_file():
-            continue
-        rel = path.relative_to(root)
-        if any(part in _WORKSPACE_IGNORED_DIRS for part in rel.parts):
             continue
         rel_str = _validate_relative_app_path(rel.as_posix())
         hashes[rel_str] = hashlib.sha256(path.read_bytes()).hexdigest()

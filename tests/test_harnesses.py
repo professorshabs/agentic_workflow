@@ -22,9 +22,10 @@ from atlas.harnesses.base import (
     snapshot_git_status,
 )
 from atlas.local_models import LocalModelCandidate, LocalResolutionResult
+from atlas.pipeline.build import merge_supervisor_reviews
 from atlas.router import ModelRouter
 from atlas.runner import run_build
-from atlas.schemas import CheckResult, WorkspaceBuildResult
+from atlas.schemas import CheckResult, ReviewerVerdict, WorkspaceBuildResult
 from atlas.telemetry import ledger_entry, render_token_report_md, summarize_usage
 
 
@@ -178,11 +179,13 @@ def test_scoped_subprocess_env_and_claude_billing_guard(monkeypatch):
 
 async def test_claude_code_billing_guard_and_strict_readonly_flags(monkeypatch, tmp_path):
     seen_calls: list[tuple[list[str], dict[str, str], Path | None]] = []
+    seen_stdin: list[str | None] = []
 
-    async def fake_run_cli(args, *, env, timeout_seconds, cwd=None):
+    async def fake_run_cli(args, *, env, timeout_seconds, cwd=None, input_text=None):
         if args[1] == "--version":
             return 0, "2.1.330 (Claude Code)", ""
         seen_calls.append((list(args), dict(env), cwd))
+        seen_stdin.append(input_text)
         return (
             0,
             json.dumps(
@@ -219,8 +222,11 @@ async def test_claude_code_billing_guard_and_strict_readonly_flags(monkeypatch, 
     assert "--max-turns" not in args_sub
     assert args_sub[args_sub.index("--tools") + 1] == ""
     assert "--json-schema" in args_sub
-    assert args_sub[args_sub.index("--max-budget-usd") + 1] == "1.50"
+    assert args_sub[args_sub.index("--max-budget-usd") + 1] == "1.5"
     assert "ANTHROPIC_API_KEY" not in env_sub
+    # The prompt travels on stdin, never in argv (argv entries are capped at 128 KiB on Linux).
+    assert seen_stdin[0] is not None and "USER REQUEST:\nusr" in seen_stdin[0]
+    assert not any("USER REQUEST" in a for a in args_sub)
     assert res_sub.cost_usd is None
     assert res_sub.cost_source == "subscription"
     assert res_sub.auth_mode == "subscription"
@@ -338,6 +344,17 @@ def test_workspace_guards_reject_symlink_escape_and_git_escape(tmp_path):
     )
     assert isinstance(res, WorkspaceBuildResult)
     assert res.created_files == ["main.py"]
+
+    # Ignored workspace dirs (such as Atlas's own .agents/skills symlinks) may target external
+    # skill directories without triggering the workspace-escape guard.
+    external_skill = tmp_path / "skills" / "demo-skill"
+    external_skill.mkdir(parents=True)
+    (external_skill / "SKILL.md").write_text("# Demo Skill\n", encoding="utf-8")
+    (app_dir / ".agents" / "skills").mkdir(parents=True)
+    (app_dir / ".agents" / "skills" / "demo-skill").symlink_to(external_skill)
+    hashes_with_skill = snapshot_file_hashes(app_dir)
+    assert "main.py" in hashes_with_skill
+    assert not any(k.startswith(".agents/") for k in hashes_with_skill)
 
     outside = tmp_path / "secret.txt"
     outside.write_text("nope", encoding="utf-8")
@@ -614,3 +631,429 @@ def test_atlas_run_alias_cli_help():
     )
     assert proc.returncode == 0
     assert "--local-model" in proc.stdout
+
+
+def test_dual_supervisor_config_validation(tmp_path):
+    repo_harness = Path(__file__).resolve().parents[1] / "config" / "harness.yaml"
+    real_router = ModelRouter(repo_harness)
+    assert [r["name"] for r in real_router.supervisor_reviewers()] == ["opus", "neon"]
+    assert real_router.backend_for("supervisor")["enabled"] is True
+
+    def _write_sup(body: str, name: str) -> Path:
+        p = tmp_path / f"{name}.yaml"
+        p.write_text(
+            f"""
+roles:
+  supervisor: [openrouter/google/gemini-4-neon]
+backends:
+  supervisor:
+{body}
+limits:
+  max_parallel_calls: 2
+  max_tokens: 1000
+  timeout_seconds: 30
+""",
+            encoding="utf-8",
+        )
+        return p
+
+    with pytest.raises(ValueError, match="non-empty list"):
+        ModelRouter(_write_sup("    enabled: true\n    reviewers: []", "empty"))
+
+    with pytest.raises(ValueError, match="duplicate name"):
+        ModelRouter(
+            _write_sup(
+                "    reviewers:\n"
+                "      - name: opus\n"
+                "        type: harness\n"
+                "        provider: claude_code\n"
+                "      - name: OPUS\n"
+                "        type: openrouter\n"
+                "        model: openrouter/google/gemini-4-neon",
+                "dup",
+            )
+        )
+
+    with pytest.raises(ValueError, match="subset of"):
+        ModelRouter(
+            _write_sup(
+                "    reviewers:\n"
+                "      - name: opus\n"
+                "        type: harness\n"
+                "        provider: claude_code\n"
+                "        tools: [Read, Bash]",
+                "bad_tool",
+            )
+        )
+
+    with pytest.raises(ValueError, match="strictly read-only"):
+        ModelRouter(
+            _write_sup(
+                "    reviewers:\n"
+                "      - name: opus\n"
+                "        type: harness\n"
+                "        provider: claude_code\n"
+                "        read_only: false",
+                "rw_claude",
+            )
+        )
+
+    with pytest.raises(ValueError, match="mode must be one of"):
+        ModelRouter(
+            _write_sup(
+                "    mode: majority\n"
+                "    reviewers:\n"
+                "      - name: neon\n"
+                "        type: openrouter\n"
+                "        model: openrouter/google/gemini-4-neon",
+                "bad_mode",
+            )
+        )
+
+
+def test_merge_supervisor_reviews_merges_and_deduplicates():
+    v_opus_ok = ReviewerVerdict(
+        reviewer="opus",
+        model="opus",
+        harness="claude_code",
+        approved=True,
+        summary="Tests pass",
+        requirement_notes={"R001": "Functional behavior verified"},
+    )
+    v_neon_ok = ReviewerVerdict(
+        reviewer="neon",
+        model="gemini-4-neon-high",
+        harness="agy",
+        approved=True,
+        summary="Clean edge cases",
+        requirement_notes={"R001": "Input validation verified"},
+    )
+    both_ok = merge_supervisor_reviews([v_opus_ok, v_neon_ok], mode="unanimous")
+    assert both_ok.approved is True
+    assert "[opus: APPROVED] Tests pass" in both_ok.summary
+    assert "[neon: APPROVED] Clean edge cases" in both_ok.summary
+    assert both_ok.requirement_notes["R001"] == (
+        "[opus] Functional behavior verified | [neon] Input validation verified"
+    )
+
+    v_opus_no = ReviewerVerdict(
+        reviewer="opus",
+        model="opus",
+        harness="claude_code",
+        approved=False,
+        summary="Missing error check",
+        issues=["Reject negative inputs in app.py", "Add CLI exit test"],
+        improvement_plan=["Validate negative inputs in app.py"],
+        requirement_notes={"R001": "Allows negative inputs"},
+    )
+    v_neon_no = ReviewerVerdict(
+        reviewer="neon",
+        model="openrouter/google/gemini-4-neon",
+        harness="openrouter",
+        approved=False,
+        summary="Edge cases incomplete",
+        issues=["reject negative inputs in app.py"],  # duplicates Opus with different case
+        improvement_plan=[],  # omitted plan should fall back to its issue
+        requirement_notes={"R001": "Missing boundary check"},
+    )
+    merged = merge_supervisor_reviews([v_opus_no, v_neon_ok], mode="unanimous")
+    assert merged.approved is False
+    assert "[opus] Reject negative inputs in app.py" in merged.issues
+
+    any_ok = merge_supervisor_reviews([v_opus_no, v_neon_ok], mode="any_approve")
+    assert any_ok.approved is True
+
+    both_no = merge_supervisor_reviews([v_opus_no, v_neon_no], mode="unanimous")
+    assert both_no.approved is False
+    assert both_no.issues == [
+        "[opus, neon] Reject negative inputs in app.py",
+        "[opus] Add CLI exit test",
+    ]
+    assert both_no.improvement_plan == [
+        "[opus] Validate negative inputs in app.py",
+        "[neon] reject negative inputs in app.py",
+    ]
+
+    with pytest.raises(ValueError, match="empty"):
+        merge_supervisor_reviews([])
+
+
+async def test_dual_post_build_supervisor_run_build_and_doctor(tmp_path, monkeypatch):
+    skills_dir = tmp_path / "skills"
+    (skills_dir / "writing-clean-code").mkdir(parents=True)
+    (skills_dir / "writing-clean-code" / "SKILL.md").write_text(
+        "---\nname: writing-clean-code\ndescription: Clean code rules\n---\n\nKeep code clean.\n",
+        encoding="utf-8",
+    )
+    cfg_path = tmp_path / "dual_harness.yaml"
+    cfg_path.write_text(
+        f"""
+roles:
+  parser: [openrouter/google/gemini-4-hydrogen]
+  researcher: [openrouter/google/gemini-4-neon]
+  judge: [openrouter/anthropic/claude-opus-5.5]
+  supervisor: [openrouter/google/gemini-4-neon]
+  builder: [local-auto]
+  fixer: [openrouter/anthropic/claude-sonnet-5.5]
+backends:
+  parser:
+    type: harness
+    provider: antigravity
+    model: gemini-4-hydrogen-high
+    fallback: router
+  supervisor:
+    enabled: true
+    mode: unanimous
+    reviewers:
+      - name: opus
+        type: harness
+        provider: claude_code
+        model: opus
+        tools: [Read, Grep, Glob]
+        auth: subscription
+        max_budget_usd: 1.50
+      - name: neon
+        type: harness
+        provider: antigravity
+        model: gemini-4-neon-high
+        fallback: router
+        router_model: openrouter/google/gemini-4-neon
+  builder:
+    type: local_harness
+    local_harness: antigravity_sdk
+    local_model: gpt-oss:20b
+  fixer:
+    type: openrouter
+    rotate:
+      - openrouter/anthropic/claude-sonnet-5.5
+      - openrouter/openai/gpt-6.2-sol
+skills:
+  sources: ["{skills_dir}"]
+  allowlist: [writing-clean-code]
+  by_role:
+    builder: [writing-clean-code]
+    fixer: [writing-clean-code]
+limits:
+  max_parallel_calls: 4
+  max_tokens: 2000
+  timeout_seconds: 60
+  attempts_per_model: 1
+  repair_attempts: 0
+  max_fix_rounds: 3
+  verify_timeout_seconds: 60
+verification:
+  require_requirement_tests: true
+  require_product_contract: true
+""",
+        encoding="utf-8",
+    )
+
+    spec_file = tmp_path / "spec.md"
+    spec_file.write_text("# Demo\nBuild add(a, b) handling non-negative ints.\n", encoding="utf-8")
+
+    agy_sup_calls = 0
+
+    async def fake_agy_structured(self, *, role, model, system, user, **kwargs):
+        nonlocal agy_sup_calls
+        if role == "parser":
+            payload = {
+                "summary": "Adder demo",
+                "requirements": [{"id": "R001", "title": "Add", "description": "Add ints."}],
+            }
+            return HarnessInvocationResult(
+                text=json.dumps(payload),
+                used_model=model,
+                harness="agy",
+                harness_version="1.5.15",
+                auth_mode="cached_login",
+            )
+        if role == "supervisor":
+            agy_sup_calls += 1
+            if agy_sup_calls == 1:
+                # Round 1: agy fails -> falls back to OpenRouter neon reviewer!
+                raise HarnessError("agy supervisor transient failure")
+            return HarnessInvocationResult(
+                text=json.dumps(
+                    {
+                        "approved": True,
+                        "summary": "Neon confirmed negative guard fixed",
+                        "issues": [],
+                        "improvement_plan": [],
+                        "requirement_notes": {"R001": "Negative input check verified"},
+                    }
+                ),
+                used_model=model,
+                harness="agy",
+                harness_version="1.5.15",
+                auth_mode="cached_login",
+            )
+        raise AssertionError(f"Unexpected agy role: {role}")
+
+    opus_calls = 0
+
+    async def fake_claude_structured(self, *, role, model, system, user, **kwargs):
+        nonlocal opus_calls
+        assert role == "supervisor"
+        opus_calls += 1
+        return HarnessInvocationResult(
+            text=json.dumps(
+                {
+                    "approved": True,
+                    "summary": "Opus sees working add",
+                    "issues": [],
+                    "improvement_plan": [],
+                    "requirement_notes": {"R001": "Basic test passes"},
+                }
+            ),
+            used_model=model,
+            harness="claude_code",
+            harness_version="2.1.330",
+            auth_mode="subscription",
+            cost_usd=None,
+            cost_source="subscription",
+        )
+
+    candidate = LocalModelCandidate(
+        provider="ollama",
+        name="gpt-oss:20b",
+        base_url="http://localhost:11434/v1",
+        parameter_size_b=20.0,
+        supports_tools=True,
+        tool_smoke_passed=True,
+    )
+
+    async def ready_local(**kwargs):
+        return LocalResolutionResult(selected=candidate, candidates=[candidate], reason="Ready")
+
+    async def fake_sdk_build(self, *, candidate, prompt_text, app_dir, **kwargs):
+        (app_dir / "README.md").write_text("# Demo\n", encoding="utf-8")
+        (app_dir / "requirements.txt").write_text("pytest\n", encoding="utf-8")
+        (app_dir / "app.py").write_text("def add(a, b):\n    return a + b\n", encoding="utf-8")
+        (app_dir / "test_app.py").write_text(
+            "# R001\nfrom app import add\n\ndef test_add():\n    assert add(2, 3) == 5\n",
+            encoding="utf-8",
+        )
+        return (
+            WorkspaceBuildResult(
+                summary="Local workspace build",
+                harness="antigravity_sdk",
+                harness_version="0.1.24",
+                model="ollama/gpt-oss:20b",
+                app_dir=str(app_dir),
+                stack="python",
+                created_files=["README.md", "app.py", "requirements.txt", "test_app.py"],
+                files_snapshot=["README.md", "app.py", "requirements.txt", "test_app.py"],
+            ),
+            HarnessInvocationResult(
+                text="Built files",
+                used_model="ollama/gpt-oss:20b",
+                harness="antigravity_sdk",
+                harness_version="0.1.24",
+                auth_mode="local",
+                cost_usd=0.0,
+                cost_source="local_free",
+            ),
+        )
+
+    neon_router_payloads: list[dict] = []
+    fix_user_payloads: list[dict] = []
+
+    async def fake_acompletion(*, model, messages, **kwargs):
+        user_payload = json.loads(messages[1]["content"])
+        if model == "openrouter/google/gemini-4-neon":
+            # OpenRouter Neon fallback must receive full file contents!
+            assert "app.py" in user_payload.get("current_files", {})
+            neon_router_payloads.append(user_payload)
+            content = json.dumps(
+                {
+                    "approved": False,
+                    "summary": "Missing negative input validation",
+                    "issues": ["Reject negative inputs in app.py"],
+                    "improvement_plan": ["Validate inputs before adding in app.py"],
+                    "requirement_notes": {"R001": "Needs negative guard"},
+                }
+            )
+        else:
+            assert model == "openrouter/anthropic/claude-sonnet-5.5"
+            fix_user_payloads.append(user_payload)
+            content = json.dumps(
+                {
+                    "diagnosis": "Added negative input check per dual supervisor plan",
+                    "files": [
+                        {
+                            "path": "app.py",
+                            "content": (
+                                "def add(a, b):\n"
+                                "    if a < 0 or b < 0:\n"
+                                "        raise ValueError('negative')\n"
+                                "    return a + b\n"
+                            ),
+                            "purpose": "Validate non-negative inputs",
+                        }
+                    ],
+                }
+            )
+        return SimpleNamespace(
+            choices=[SimpleNamespace(message=SimpleNamespace(content=content))],
+            usage=SimpleNamespace(prompt_tokens=60, completion_tokens=25, cost=0.001),
+        )
+
+    monkeypatch.setattr(AntigravityCLIAdapter, "run_structured", fake_agy_structured)
+    monkeypatch.setattr(ClaudeCodeAdapter, "run_structured", fake_claude_structured)
+    monkeypatch.setattr("atlas.pipeline.build.resolve_local_model", ready_local)
+    monkeypatch.setattr(
+        "atlas.pipeline.build.AntigravitySDKAdapter.run_workspace_task", fake_sdk_build
+    )
+    monkeypatch.setattr("atlas.router.litellm.acompletion", fake_acompletion)
+
+    async def fake_verify(path: Path):
+        return (
+            "python",
+            [CheckResult(name="python-pytest", command="pytest", passed=True, exit_code=0)],
+        )
+
+    app_dir = tmp_path / "out_app"
+    runs_root = tmp_path / "runs"
+    ledger = tmp_path / "usage" / "ledger.jsonl"
+
+    out_dir = await run_build(
+        spec_file,
+        runs_root,
+        app_dir,
+        config_path=cfg_path,
+        skip_research=True,
+        clean_app_dir=True,
+        verify_fn=fake_verify,
+        ledger_path=ledger,
+    )
+
+    assert len(neon_router_payloads) == 1
+    assert opus_calls == 2
+    assert agy_sup_calls == 2
+    assert len(fix_user_payloads) == 1
+    sup_err = fix_user_payloads[0]["failing_checks"][0]["stderr"]
+    assert "Issues:" in sup_err
+    assert "[neon] Reject negative inputs in app.py" in sup_err
+    assert "Improvement plan:" in sup_err
+    assert "[neon] Validate inputs before adding in app.py" in sup_err
+    assert "Requirement notes:" in sup_err
+    assert "R001: [opus] Basic test passes | [neon] Needs negative guard" in sup_err
+
+    manifest = json.loads((out_dir / "manifest.json").read_text(encoding="utf-8"))
+    assert manifest["status"] == "verified"
+    assert manifest["supervisor_approved"] is True
+    assert manifest["supervisor_reviewers"] == ["opus", "neon"]
+    assert manifest["fix_rounds"] == 1
+
+    review_json = json.loads((out_dir / "supervisor_review.json").read_text(encoding="utf-8"))
+    assert review_json["approved"] is True
+    assert [r["reviewer"] for r in review_json["reviewers"]] == ["opus", "neon"]
+
+    report_md = (out_dir / "report.md").read_text(encoding="utf-8")
+    assert "## Supervisor review" in report_md
+    assert "| `opus` |" in report_md
+    assert "| `neon` |" in report_md
+
+    doc = await run_doctor(ModelRouter(cfg_path))
+    providers = {chk["provider"] for chk in doc["checks"]}
+    assert {"antigravity", "claude_code", "openrouter", "local_model_daemon"}.issubset(providers)

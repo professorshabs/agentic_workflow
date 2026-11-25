@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import asyncio
+import json
 import logging
 import os
 import re
@@ -214,13 +215,25 @@ async def probe_lm_studio(
     *,
     timeout: float = 1.5,
 ) -> tuple[list[LocalModelCandidate], str | None]:
-    """Probe an LM Studio OpenAI-compatible `/v1/models` endpoint."""
+    """Probe LM Studio `/v1/models` and optional `/api/v0/models` metadata."""
     v1_url = _normalize_v1_url(base_url)
+    root = _strip_v1_root(v1_url)
+    v0_by_id: dict[str, dict[str, Any]] = {}
     try:
         async with httpx.AsyncClient(timeout=timeout) as client:
             resp = await client.get(f"{v1_url}/models")
             resp.raise_for_status()
             payload = resp.json()
+            try:
+                v0_resp = await client.get(f"{root}/api/v0/models")
+                if v0_resp.status_code == 200:
+                    v0_payload = v0_resp.json()
+                    v0_items = v0_payload.get("data") if isinstance(v0_payload, dict) else None
+                    for item in v0_items or []:
+                        if isinstance(item, dict) and item.get("id"):
+                            v0_by_id[str(item["id"]).strip()] = item
+            except Exception:
+                v0_by_id = {}
     except Exception as exc:
         return [], f"LM Studio unreachable at {v1_url}: {type(exc).__name__}: {exc}"
 
@@ -232,20 +245,43 @@ async def probe_lm_studio(
         name = str(entry.get("id") or "").strip()
         if not name or _is_excluded_model(name):
             continue
-        raw_ctx = entry.get("max_context_length") or entry.get("context_length")
-        ctx_len = (
-            int(raw_ctx) if isinstance(raw_ctx, int) and not isinstance(raw_ctx, bool) else None
+        v0 = v0_by_id.get(name) or {}
+        model_type = str(v0.get("type") or entry.get("type") or "").strip().lower()
+        if model_type == "embeddings":
+            continue
+        loaded = (
+            bool(entry.get("loaded", False))
+            or str(v0.get("state") or "").strip().lower() == "loaded"
         )
+        raw_loaded_ctx = v0.get("loaded_context_length") if loaded else None
+        if isinstance(raw_loaded_ctx, int) and not isinstance(raw_loaded_ctx, bool):
+            ctx_len: int | None = raw_loaded_ctx
+        else:
+            raw_ctx = (
+                entry.get("max_context_length")
+                or entry.get("context_length")
+                or v0.get("max_context_length")
+                or v0.get("context_length")
+            )
+            ctx_len = (
+                int(raw_ctx)
+                if isinstance(raw_ctx, int) and not isinstance(raw_ctx, bool)
+                else None
+            )
         raw_size = entry.get("size_bytes") or entry.get("size")
         size_bytes = (
             int(raw_size)
             if isinstance(raw_size, int) and not isinstance(raw_size, bool)
             else None
         )
-        raw_caps = entry.get("capabilities")
+        raw_caps = (
+            entry.get("capabilities")
+            if entry.get("capabilities") is not None
+            else v0.get("capabilities")
+        )
         supports_tools: bool | None = None
         if isinstance(raw_caps, list):
-            supports_tools = "tools" in {str(c).lower() for c in raw_caps}
+            supports_tools = bool({"tools", "tool_use"} & {str(c).lower() for c in raw_caps})
 
         candidates.append(
             LocalModelCandidate(
@@ -258,7 +294,7 @@ async def probe_lm_studio(
                 size_bytes=size_bytes,
                 context_length=ctx_len,
                 supports_tools=supports_tools,
-                loaded=bool(entry.get("loaded", False)),
+                loaded=loaded,
             )
         )
     return candidates, None
@@ -267,15 +303,15 @@ async def probe_lm_studio(
 async def run_tool_smoke_check(
     candidate: LocalModelCandidate,
     *,
-    timeout: float = 20.0,
+    timeout: float = 180.0,
 ) -> tuple[bool, str]:
     """Verify the local model responds cleanly to a minimal tool-capable chat request."""
     url = f"{candidate.base_url.rstrip('/')}/chat/completions"
     payload: dict[str, Any] = {
         "model": candidate.name,
         "messages": [
-            {"role": "system", "content": "Call the ping tool or reply with OK."},
-            {"role": "user", "content": "ping"},
+            {"role": "system", "content": "Call the ping tool exactly once."},
+            {"role": "user", "content": "Use the ping tool now."},
         ],
         "tools": [
             {
@@ -287,7 +323,8 @@ async def run_tool_smoke_check(
                 },
             }
         ],
-        "max_tokens": 64,
+        "tool_choice": "required",
+        "max_tokens": 256,
         "temperature": 0,
     }
     try:
@@ -305,17 +342,40 @@ async def run_tool_smoke_check(
     message = choices[0].get("message") if isinstance(choices[0], dict) else None
     if not isinstance(message, dict):
         return False, "Malformed message object in local response"
-    if message.get("tool_calls") or (
-        isinstance(message.get("content"), str) and message["content"].strip()
-    ):
-        return True, "ok"
-    return False, "Local model returned neither tool_calls nor non-empty content"
+    tool_calls = message.get("tool_calls")
+    if not isinstance(tool_calls, list):
+        return False, "Local model did not call the required ping tool"
+    for call in tool_calls:
+        if not isinstance(call, dict):
+            continue
+        function = call.get("function")
+        if not isinstance(function, dict) or function.get("name") != "ping":
+            continue
+        arguments = function.get("arguments")
+        if isinstance(arguments, str):
+            try:
+                arguments = json.loads(arguments)
+            except json.JSONDecodeError:
+                continue
+        if isinstance(arguments, dict):
+            return True, "ok"
+    return False, "Local model did not return a valid ping tool call"
 
 
 def _matches_model(candidate: LocalModelCandidate, model_name: str) -> bool:
     target = model_name.strip().lower()
     name = candidate.name.lower()
-    return name == target or (":" not in target and name == f"{target}:latest")
+    if name == target or (":" not in target and name == f"{target}:latest"):
+        return True
+    name_base = name.rsplit("/", 1)[-1]
+    target_base = target.rsplit("/", 1)[-1]
+    if "/" not in target and "/" in name:
+        return name_base == target or (":" not in target and name_base == f"{target}:latest")
+    if "/" in target and "/" not in name:
+        return name == target_base or (
+            ":" not in target_base and name == f"{target_base}:latest"
+        )
+    return False
 
 
 def _check_suitability(
@@ -358,6 +418,36 @@ def _check_suitability(
 
 
 SmokeCheckFn = Callable[[LocalModelCandidate], Awaitable[tuple[bool, str]]]
+RuntimeContextFn = Callable[[LocalModelCandidate], Awaitable[int | None]]
+
+
+async def ollama_runtime_context(
+    candidate: LocalModelCandidate, *, timeout: float = 1.5
+) -> int | None:
+    """Context window Ollama actually loaded `candidate` with (`/api/ps`), if it is loaded.
+
+    `/api/show` reports the model's trained maximum (often 128K), but Ollama serves
+    OpenAI-compatible requests with its server setting (4096 by default unless
+    `OLLAMA_CONTEXT_LENGTH` is set), and silently truncates anything longer.
+    """
+    root = _strip_v1_root(candidate.base_url)
+    try:
+        async with httpx.AsyncClient(timeout=timeout) as client:
+            resp = await client.get(f"{root}/api/ps")
+        if resp.status_code != 200:
+            return None
+        data = resp.json()
+    except Exception:
+        return None
+    models = data.get("models") if isinstance(data, dict) else None
+    for item in models or []:
+        if not isinstance(item, dict):
+            continue
+        if candidate.name in (str(item.get("name") or ""), str(item.get("model") or "")):
+            ctx = item.get("context_length")
+            if isinstance(ctx, int) and not isinstance(ctx, bool):
+                return ctx
+    return None
 
 
 async def resolve_local_model(
@@ -375,6 +465,7 @@ async def resolve_local_model(
     lm_studio_url: str = DEFAULT_LM_STUDIO_URL,
     probe_timeout: float = 1.5,
     smoke_check_fn: SmokeCheckFn | None = None,
+    runtime_context_fn: RuntimeContextFn | None = None,
 ) -> LocalResolutionResult:
     """Resolve an explicit or discovered local model checked for tools, context, and memory."""
     provider_urls: dict[str, str] = {}
@@ -409,7 +500,8 @@ async def resolve_local_model(
         detail = "; ".join(f"{k}: {v}" for k, v in errors.items())
         hint = (
             "Start Ollama with `OLLAMA_CONTEXT_LENGTH=64000 ollama serve` "
-            "(and `ollama pull gpt-oss:20b`) or start LM Studio with a 64K context window."
+            "(and `ollama pull gemma4:12b-mlx` / `gemma4:12b`) or start LM Studio "
+            "with a 32K–64K context window."
         )
         return LocalResolutionResult(
             candidates=[],
@@ -503,10 +595,25 @@ async def resolve_local_model(
             reason=f"Selected local {chosen.provider} model '{chosen.name}' (smoke check skipped).",
         )
 
+    context_fn = runtime_context_fn or ollama_runtime_context
     smoke_failures: list[str] = []
     for candidate in ordered:
         passed, msg = await smoke_fn(candidate)
         candidate.tool_smoke_passed = passed
+        if passed and candidate.provider == "ollama" and min_context_tokens:
+            # The smoke call loaded the model, so `/api/ps` now shows the real window.
+            runtime_ctx = await context_fn(candidate)
+            if runtime_ctx is not None:
+                candidate.context_length = runtime_ctx
+                if runtime_ctx < min_context_tokens:
+                    problem = (
+                        f"Ollama serves it with a {runtime_ctx}-token context "
+                        f"(< required {min_context_tokens}); restart with "
+                        f"`OLLAMA_CONTEXT_LENGTH={min_context_tokens} ollama serve`"
+                    )
+                    rejected[candidate.name] = problem
+                    smoke_failures.append(f"{candidate.name}: {problem}")
+                    continue
         if passed:
             return LocalResolutionResult(
                 selected=candidate,
@@ -525,5 +632,5 @@ async def resolve_local_model(
         candidates=all_candidates,
         rejected=rejected,
         errors=errors,
-        reason="Local model(s) failed tool readiness smoke check: " + "; ".join(smoke_failures),
+        reason="Local model(s) failed readiness checks: " + "; ".join(smoke_failures),
     )

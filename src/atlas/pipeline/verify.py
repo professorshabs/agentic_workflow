@@ -86,8 +86,8 @@ def _find_tool(name: str) -> str | None:
     return None
 
 
-def _verification_env() -> dict[str, str]:
-    """Build a subprocess environment without credentials from the Atlas run."""
+def credential_free_env() -> dict[str, str]:
+    """Copy of the process environment without credentials (API keys, tokens, CI secrets)."""
     env = os.environ.copy()
     for key in list(env):
         normalized = key.upper()
@@ -98,6 +98,9 @@ def _verification_env() -> dict[str, str]:
         ):
             env.pop(key, None)
     return env
+
+
+_verification_env = credential_free_env
 
 
 def _iter_source_files(app_dir: Path) -> list[Path]:
@@ -550,6 +553,79 @@ def check_product_contract(app_dir: Path) -> CheckResult:
         exit_code=0 if passed else 1,
         duration_ms=round((time.monotonic() - started) * 1000, 1),
         stdout=", ".join(stdout_parts),
+        stderr="\n".join(issues),
+    )
+
+
+_E2E_DEF_RE = re.compile(
+    r"(?:^\s*(?:async\s+)?def\s+test_|\b(?:test|it)\s*\()",
+    flags=re.MULTILINE,
+)
+_E2E_ASSERT_RE = re.compile(r"\b(?:assert|expect|raises)\b|assert\.", flags=re.MULTILINE)
+_E2E_SKIP_RE = re.compile(
+    r"@pytest\.mark\.skip\b|pytest\.skip\s*\(|(?:test|it)\.skip\s*\(",
+    flags=re.MULTILINE,
+)
+
+
+def check_e2e_tests(
+    app_dir: Path,
+    expected_files: list[str],
+    *,
+    verifiable: bool = True,
+    unverifiable_reason: str | None = None,
+) -> CheckResult:
+    """Verify researcher/QA-generated black-box E2E product tests remain intact and runnable."""
+    started = time.monotonic()
+    root = app_dir.resolve() if app_dir.is_dir() else app_dir
+    issues: list[str] = []
+    present: list[str] = []
+
+    if not verifiable and not expected_files:
+        reason = (unverifiable_reason or "Marked unverifiable offline").strip()
+        return CheckResult(
+            name="e2e-product-tests",
+            command="black-box E2E product test applicability check",
+            passed=True,
+            exit_code=0,
+            duration_ms=round((time.monotonic() - started) * 1000, 1),
+            stdout=f"unverifiable offline: {reason}",
+            stderr="",
+        )
+
+    if not expected_files:
+        issues.append("No E2E test files were generated.")
+
+    for rel in expected_files:
+        target = (root / rel).resolve()
+        if root not in target.parents:
+            issues.append(f"{rel}: path escapes app directory")
+            continue
+        if not target.is_file():
+            issues.append(f"Missing required E2E product test file: {rel}")
+            continue
+        try:
+            text = target.read_text(encoding="utf-8")
+        except (OSError, UnicodeDecodeError) as exc:
+            issues.append(f"{rel}: unreadable ({exc})")
+            continue
+        present.append(rel)
+        if not _E2E_DEF_RE.search(text):
+            issues.append(f"{rel}: contains no test definitions")
+        if not _E2E_ASSERT_RE.search(text):
+            issues.append(f"{rel}: contains no assertions")
+        if _E2E_SKIP_RE.search(text):
+            issues.append(f"{rel}: contains unconditional skip marker")
+
+    passed = not issues
+    cmd_files = ", ".join(expected_files) if expected_files else "none"
+    return CheckResult(
+        name="e2e-product-tests",
+        command=f"black-box E2E product test integrity ({cmd_files})",
+        passed=passed,
+        exit_code=0 if passed else 1,
+        duration_ms=round((time.monotonic() - started) * 1000, 1),
+        stdout=", ".join(present),
         stderr="\n".join(issues),
     )
 

@@ -23,11 +23,13 @@ Return ONLY JSON:
     "verification_flags": ["concise item to verify before approval (do not prefix with VERIFY:)"]
   }],
   "findings": ["string"],
-  "uncertainties": ["string"]
+  "uncertainties": ["string"],
+  "clarifying_questions": ["concise question for the user about ambiguous prompt/spec UX or behavior"],
+  "e2e_scenarios": ["concrete black-box end-product scenario (e.g. run CLI command X -> assert stdout Y and exit 0)"]
 }
 
 Keep output concise and dense:
 - Return 2-3 candidates where possible. Challenge overengineering.
 - Keep each list item to 1 short sentence or phrase.
-- Limit to at most 3 pros, 3 cons, and 2 evidence items per candidate, plus at most 3 findings and 3 uncertainties.
+- Limit to at most 3 pros, 3 cons, and 2 evidence items per candidate, plus at most 3 findings, 3 uncertainties, 2 high-impact clarifying_questions (only when genuine ambiguity exists around UX, CLI flags, output format, defaults, persistence, or edge cases), and 1-3 concrete black-box e2e_scenarios.
 - Prefer official documentation and primary sources. Never fabricate URLs, pricing, licensing terms, version numbers, benchmarks or source checks. If browsing or source verification is unavailable, explicitly mark the claim as unverified/model knowledge.

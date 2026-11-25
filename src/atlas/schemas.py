@@ -1,7 +1,13 @@
 import hashlib
+import re
 from typing import Literal
 
 from pydantic import BaseModel, ConfigDict, Field, field_validator, model_validator
+
+_TEST_FILE_PATH_RE = re.compile(
+    r"(^|/)(tests?|__tests__|specs?)/|(^|/)test_[^/]+$|_test\.[^/]+$|\.(test|spec)\.[^/]+$",
+    flags=re.IGNORECASE,
+)
 
 
 def _validate_relative_app_path(path: str) -> str:
@@ -112,6 +118,24 @@ class ResearchNote(StrictModel):
     candidates: list[CandidateTool] = Field(default_factory=list)
     findings: list[str] = Field(default_factory=list)
     uncertainties: list[str] = Field(default_factory=list)
+    clarifying_questions: list[str] = Field(default_factory=list)
+    e2e_scenarios: list[str] = Field(default_factory=list)
+
+
+class ClarificationItem(StrictModel):
+    """One clarifying question surfaced from the spec or research findings."""
+
+    question: str = Field(min_length=1)
+    answer: str = ""
+    source: Literal["spec", "research"] = "research"
+    requirement_id: str | None = None
+
+
+class ClarificationReport(StrictModel):
+    """Collected clarifying questions and any answers supplied by the user."""
+
+    items: list[ClarificationItem] = Field(default_factory=list)
+    interactive: bool = False
 
 
 class ResearchFailure(StrictModel):
@@ -184,13 +208,38 @@ class ApprovalRecord(StrictModel):
     notes: str | None = None
 
 
-class Review(StrictModel):
-    """Read-only Supervisor acceptance review across verification and requirements."""
+class SupervisorOutput(StrictModel):
+    """Structured per-reviewer acceptance verdict emitted by a post-build supervisor."""
 
     approved: bool
     summary: str = Field(min_length=1)
     issues: list[str] = Field(default_factory=list)
+    improvement_plan: list[str] = Field(default_factory=list)
     requirement_notes: dict[str, str] = Field(default_factory=dict)
+
+
+class ReviewerVerdict(StrictModel):
+    """Recorded verdict from one named supervisor reviewer."""
+
+    reviewer: str = Field(min_length=1)
+    model: str = Field(min_length=1)
+    harness: str = Field(min_length=1)
+    approved: bool
+    summary: str = Field(min_length=1)
+    issues: list[str] = Field(default_factory=list)
+    improvement_plan: list[str] = Field(default_factory=list)
+    requirement_notes: dict[str, str] = Field(default_factory=dict)
+
+
+class Review(StrictModel):
+    """Unified Supervisor acceptance review across verification and requirements."""
+
+    approved: bool
+    summary: str = Field(min_length=1)
+    issues: list[str] = Field(default_factory=list)
+    improvement_plan: list[str] = Field(default_factory=list)
+    requirement_notes: dict[str, str] = Field(default_factory=dict)
+    reviewers: list[ReviewerVerdict] = Field(default_factory=list)
 
 
 class GeneratedFile(StrictModel):
@@ -224,6 +273,36 @@ class GeneratedApp(StrictModel):
         paths = [f.path for f in self.files]
         if len(paths) != len(set(paths)):
             raise ValueError("Generated file paths must be unique")
+        return self
+
+
+class E2ETestSuite(StrictModel):
+    """Authoritative black-box end-to-end product tests generated before build."""
+
+    summary: str = Field(min_length=1)
+    product_interface: str = Field(min_length=1)
+    stack: Literal["python", "node", "mixed", "other"] = "other"
+    verifiable: bool = True
+    unverifiable_reason: str | None = None
+    files: list[GeneratedFile] = Field(default_factory=list)
+    scenarios: list[str] = Field(default_factory=list)
+
+    @model_validator(mode="after")
+    def validate_e2e_test_files(self) -> "E2ETestSuite":
+        if self.verifiable and not self.files:
+            raise ValueError("Verifiable E2ETestSuite must include at least one test file")
+        if not self.verifiable and not (self.unverifiable_reason or "").strip():
+            raise ValueError(
+                "Unverifiable E2ETestSuite must explain why in unverifiable_reason"
+            )
+        paths = [f.path for f in self.files]
+        if len(paths) != len(set(paths)):
+            raise ValueError("E2E test file paths must be unique")
+        non_test = [p for p in paths if not _TEST_FILE_PATH_RE.search(p)]
+        if non_test:
+            raise ValueError(
+                f"E2ETestSuite may only create test files, got non-test path(s): {non_test}"
+            )
         return self
 
 

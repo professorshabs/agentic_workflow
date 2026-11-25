@@ -10,7 +10,8 @@ The template currently includes:
 - A model-backed pipeline with optional research and planning stages.
 - Python and Node.js app generation, test execution, and a limited auto-fix loop.
 - Per-run token and estimated cost reports by stage, model, and call, plus a committed project ledger (`usage/ledger.jsonl`, `atlas tokens --all`) across runs.
-- A `spec-coverage` check that every functional requirement has a test mentioning its ID.
+- A `spec-coverage` check that every functional requirement has a test mentioning its ID, a `product-contract` check for standalone product hygiene, and researcher clarifying questions (`--clarify` / `--answers`) paired with authoritative black-box E2E product tests (`--e2e-tests`, dedicated `e2e` role/limits, `e2e-product-tests`).
+- A local-first hybrid harness profile ([`config/harness.yaml`](config/harness.yaml)) with `agy` parser/researcher/e2e, read-only `claude` judge, Antigravity SDK local builder (`ollama` / `lm_studio`), allowlisted skills, alternating OpenRouter fixer, live step-by-step `stderr` progress output (`-q` / `--quiet`, `--verbose`), `atlas doctor` / `atlas detect-local`, and a parallel Dual Post-Build Supervisor (Claude Opus + Gemini 4 Neon) that feeds unified improvement plans back into the fixer loop.
 - Per-role output limits and timeouts, with a clear error when a model's reply is cut off.
 - Optional token, cost, timeout, and fix-round limits.
 - GitHub Actions for spec-triggered generation, verification, report artifacts, pull requests, and repository quality checks.

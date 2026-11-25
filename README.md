@@ -1,9 +1,9 @@
 # Atlas — Spec-to-App GitHub Template
 
-3. Atlas is a small repository template for turning a Markdown specification into a runnable app. Its GitHub Actions pipeline builds the app into `app/<spec-name>/` (git-ignored so generated products stay out of Git), runs its tests and checks, tries a limited number of fixes, publishes the verified product as a workflow artifact and Docker image (`ghcr.io`), and opens a pull request with the token ledger (`usage/ledger.jsonl`) and report.
+Atlas is a small repository template and local-first harness orchestrator for turning a Markdown specification into a runnable, verified app. Its pipeline parses specs, researches options, pauses for clarifying questions, selects an engineering plan, generates black-box end-to-end product tests, builds into `app/<spec-name>/` (git-ignored so generated products stay out of Git), runs verification & fixes, runs an optional Dual Post-Build Supervisor audit, publishes artifacts/Docker images in CI, and records token telemetry in `usage/ledger.jsonl`.
 
 ```text
-spec -> build (app/<spec-name>/) -> test and verify -> artifact + Docker (GHCR) -> usage ledger PR
+spec -> parse -> research + clarify -> judge + E2E tests -> build (app/<spec-name>/) -> verify + fix -> dual supervisor -> report + ledger
 ```
 
 The current deliverable is the GitHub template and CLI. A hosted app or online framework is a later step; this repository does not include one.
@@ -28,8 +28,12 @@ Python 3.11 or newer is required. Node.js 20 is needed only when generating or v
 python -m venv .venv
 source .venv/bin/activate
 pip install -e ".[dev]"
+# Or add the optional local Antigravity SDK harness:
+# pip install -e ".[dev,harnesses]"
+# Equivalent pip requirements files are also provided:
+# pip install -r requirements-dev.txt -r requirements-harnesses.txt
 cp .env.example .env
-# Add a provider key and configure the matching model IDs in config/models.yaml.
+# Add a provider key and configure the matching model IDs in config/models.yaml (or config/harness.yaml).
 
 atlas validate-config
 atlas build specs/example-app.md --skip-research --clean
@@ -41,21 +45,48 @@ The sample config routes primary roles through OpenRouter (`openrouter/...`) wit
 
 | Command | What it does |
 | :--- | :--- |
-| `atlas build <spec.md>` | Parse the spec, optionally research and plan, generate the app under `app/<spec-name>/`, test and verify it, try fixes, and write run artifacts. |
-| `atlas build <spec.md> --skip-research --clean` | Skip research and planning stages and replace the contents of `app/<spec-name>/` with the generated app. |
-| `atlas plan <spec.md>` | Create a planning report without generating an app. |
+| `atlas build <spec.md>` (or `atlas run <spec.md>`) | Parse the spec, research options + clarify ambiguities (`--clarify` / `--answers`), plan, generate authoritative E2E product tests (`--e2e-tests`), build the app under `app/<spec-name>/`, verify & fix, run optional Supervisor review, and write run artifacts. Pass `--from-run <run-dir>` to resume straight from build/verify using a prior run's plan and E2E tests. Streams live `[HH:MM:SS]` stage, `k/N` requirement, and check progress to `stderr` (`-q` / `--quiet` to suppress, `--verbose` for debug logs). |
+| `atlas build <spec.md> --skip-research --clean` | Skip research and planning stages (still clarifying `spec.open_questions` and optional E2E tests) and replace the contents of `app/<spec-name>/` with the generated app. |
+| `atlas plan <spec.md>` | Create a planning report (including clarifying questions & optional E2E test plan) without generating an app, streaming live stage progress (`-q` / `--quiet` to suppress). |
 | `atlas verify --app-dir app/<spec-name>` | Run verification on an existing built app without making model calls. |
 | `atlas app-dir <spec.md>` | Print the default product output folder (`app/<spec-name>`) for a spec. |
 | `atlas tokens [runs/<run-id>]` | Show usage for a run; without a run path, show the newest run under `runs/`. |
 | `atlas tokens --all` | Show every recorded run from the project ledger `usage/ledger.jsonl`: totals by spec, model, and stage. |
 | `atlas changed-specs --before <sha> --after <sha>` | List specs added or changed between two commits (used by the workflow). |
-| `atlas validate-config` | Check the model roles, fallbacks, and configured limits. |
+| `atlas validate-config [--config <path>]` | Check the model roles, harness backends, fallbacks, skills allowlist, and configured limits. |
+| `atlas doctor [--config <path>] [--live]` | Check CLI binaries, auth status (`agy`, `claude`, `OPENROUTER_API_KEY`), Antigravity SDK, local model daemons, and allowlisted skills. |
+| `atlas detect-local [--config <path>]` | Probe Ollama and LM Studio, rank eligible local models by tool support, context, memory budget, and tool smoke check. |
 
 Verification currently supports Python and Node.js projects. Python checks include compilation and `pytest`, plus `ruff` when installed. Node checks run the package test script or Node's test runner, along with any declared `typecheck`, `build`, and `lint` scripts. A project with no tests fails verification. Other stacks need verification support added before Atlas can verify them automatically.
 
 `atlas build` also runs a `spec-coverage` check: every functional requirement the parser found (`R001`, `R002`, ...) must be mentioned in at least one test file, in the test's name or a comment next to it. A missing ID fails verification and goes to the fixer like any other failed check, so a generated suite cannot quietly skip a requirement. It is a text search, not proof that a test is meaningful, so still review the PR. Turn it off with `verification.require_requirement_tests: false` in `config/models.yaml`.
 
 Each role can have its own output limit and timeout (`limits.max_tokens_by_role`, `limits.timeout_seconds_by_role`). The builder returns the whole app in one reply, so it gets far more than the other roles. When a model stops at its limit, Atlas stops and reports which setting to raise instead of a JSON parse error. It does not try fallback models: they share the same limit and prompt, so each would be cut off and billed too.
+
+## Hybrid local-first harness mode (`config/harness.yaml`)
+
+Instead of calling every stage via OpenRouter APIs, [`config/harness.yaml`](config/harness.yaml) runs a hybrid local-first workflow on your machine:
+
+| Role | Backend / Harness | Behavior |
+| :--- | :--- | :--- |
+| **`parser`, `researcher`, & `e2e`** | Antigravity CLI (`agy`) | Structured `--json-schema` + `--disable-slash-commands` single-turn calls (`gemini-4-hydrogen-high` / `gemini-4-neon-high`, `600s` timeout & `32K` fallback cap for `e2e`) with automatic fallback to `ModelRouter`. |
+| **`judge`** | Claude Code (`claude`, read-only) | Claude Opus 5.5 evaluates researched options per requirement with zero write tools (`--tools ""`, subscription billing guard). |
+| **`builder`** | Antigravity Python SDK (`antigravity_sdk`) | **Local only** via LM Studio (`google/gemma-4-26b-a4b-qat` / `gemma-4-26b-a4b-it-qat-mlx-4bit`) or Ollama (`gemma4:12b-mlx` / `gemma4:12b`, `>= 32K` context, 78% RAM budget on 24 GB Macs, tool-calling, and live `ping` tool smoke check). |
+| **`fixer`** | OpenRouter via `ModelRouter` | Sequential `PatchResult` repairs alternating between `claude-sonnet-5.5` and `gpt-6.2-sol`, receiving previous diagnoses + `writing-clean-code`. |
+| **`supervisor`** | Dual Post-Build Panel (parallel) | Read-only Claude Opus (`claude_code`) + Gemini 4 Neon (`agy`, fallback OpenRouter) inspect the verified app independently and merge issues + an improvement plan back into the Fixer loop. |
+
+```bash
+ollama serve # Recommended: OLLAMA_CONTEXT_LENGTH=64000 ollama serve
+atlas doctor --config config/harness.yaml
+atlas detect-local --config config/harness.yaml
+atlas run specs/example-app.md --config config/harness.yaml
+```
+
+## Research clarifications, pre-seeded E2E tests & lean local prompts
+
+- **Clarifying questions (`clarify.py`):** Research surfaces `clarifying_questions` alongside `spec.open_questions`. In a terminal (`--clarify` or TTY auto), Atlas prompts you cleanly and folds answers into `spec.assumptions` before planning and building; in non-TTY/CI runs, pass `--answers answers.json` (never blocks by default) and review `runs/<run-id>/clarifications.json`.
+- **Authoritative black-box E2E tests (`e2e.py`):** When `verification.require_e2e_tests: true` (default in `config/harness.yaml`) or `--e2e-tests` is set, Atlas generates an external `product_interface` contract and runnable E2E suite (or sets `verifiable: false` with `unverifiable_reason` when offline testing is infeasible).
+- **Workspace-first pre-seeding & lean context:** Before the local Builder starts, Atlas writes `PLAN.md` and the authoritative `tests/` E2E files into `app/<spec-name>/`, symlinks only allowlisted skills (`discovery_mode: progressive`) into `.agents/skills/`, and sends a compact prompt capped at 12K chars so smaller local context windows stay focused. After the Builder exits, Atlas removes temporary skill symlinks, restores the authoritative E2E files, and enforces `spec-coverage`, `product-contract`, and `e2e-product-tests` in [`verify.py`](src/atlas/pipeline/verify.py).
 
 ## Token and cost reports
 
@@ -66,7 +97,10 @@ Every run writes an audit folder under `runs/<run-id>/`. The same summary appear
 - If a provider does not return token usage for a call, that call is marked as unreported. Its token count cannot be recovered from this report.
 - Replies that Atlas cannot use (empty, or cut off at the output limit) are still counted, because providers normally bill them. The report notes how many there were.
 - **Project ledger:** every `atlas build` and `atlas plan` appends one line to `usage/ledger.jsonl` (totals plus per-stage and per-model breakdown). The workflow commits it with the generated app, so the project's full token history stays in the repository after run folders and CI artifacts expire. `.gitattributes` merges it line by line. Use `--ledger <path>` to write elsewhere or `--no-ledger` to skip it.
-- `verification.json` stores each test/check result and any fix rounds. Verification runs do not make model calls; any fixes requested after failed checks do.
+- `clarifications.json` *(when open/research questions exist)* stores the clarifying questions and user answers folded into `spec.assumptions` before planning and building.
+- `e2e_tests.json` *(when `verification.require_e2e_tests: true` or `--e2e-tests`)* stores the independent black-box E2E product contract and test files (`verifiable: true` test files are pre-seeded into `app/<spec-name>/PLAN.md` + `tests/` before local builds start, or `verifiable: false` explains why offline E2E verification is unavailable).
+- `verification.json` stores each test/check result (including `e2e-product-tests` integrity checks) and any fix rounds. Verification runs do not make model calls; any fixes requested after failed checks do.
+- `supervisor_review.json` *(when `backends.supervisor.enabled: true`)* stores the unified post-build review verdict, merged issues, improvement plan, and individual reviewer verdicts (for example Claude Opus + Gemini 4 Neon in parallel).
 - `manifest.json` contains the run status, generated file list, and a compact usage summary.
 
 Use `atlas tokens runs/<run-id> --json` for the complete machine-readable breakdown of one run, and `atlas tokens --all` (or `--all --json`) for every run. The optional `max_total_tokens` and `max_cost_usd` settings in `config/models.yaml` stop a run before another model call once recorded usage reaches the configured limit. The check runs right before each call is sent, so parallel research and judge calls respect it; calls already in flight (at most `max_parallel_calls`) can still finish. Leaving them as `null` means no configured cap.
@@ -74,16 +108,18 @@ Use `atlas tokens runs/<run-id> --json` for the complete machine-readable breakd
 ## Main files
 
 - `specs/` — project specifications and the reusable spec guide.
+- `requirements.txt`, `requirements-dev.txt`, `requirements-harnesses.txt` — pip-compatible dependency manifests mirrored from [`pyproject.toml`](pyproject.toml).
 - `app/` — built products (`app/<spec-name>/`); git-ignored (`app/*`, keeping `!app/.gitkeep`) so generated apps are never pushed to Git, and instead uploaded as `atlas-product-<spec-name>` artifacts and published as Docker images.
-- `src/atlas/` — CLI, generation pipeline, verification, and token reporting.
-- `config/models.yaml` — model routing, fallbacks, per-role output limits and timeouts, optional budgets, and the requirement coverage switch.
-- `config/harness.yaml` — local-first harness profile (`agy` parser/researcher, read-only `claude` judge, Antigravity SDK local builder, OpenRouter fixer, allowlisted skills; check with `atlas doctor --config config/harness.yaml` and `atlas detect-local --config config/harness.yaml`).
+- `src/atlas/` — CLI, pipeline stages (`parse`, `research`, `clarify`, `judge`, `e2e`, `build`/`fix`/`supervise`, `verify`), harness adapters (`agy`, `antigravity_sdk`, `claude_code`), skills loader, local model discovery, and token telemetry.
+- `config/models.yaml` — pure cloud OpenRouter model routing, fallbacks, per-role output limits and timeouts, optional budgets, and verification switches.
+- `config/harness.yaml` — local-first harness profile (`agy` `parser`/`researcher`/`e2e` with OpenRouter fallback and raised reasoning-token limits, read-only `claude` judge, Dual Post-Build Supervisor panel pairing Claude Opus + Gemini 4 Neon, Antigravity SDK local builder via Ollama/LM Studio, alternating OpenRouter fixer, allowlisted skills, and pre-seeded E2E tests).
 - `usage/ledger.jsonl` — one line per run with its token totals; created by the first run and updated via PRs.
 - `.github/workflows/spec-to-app.yml` — spec-triggered build into `app/<spec-name>/`, verification, product/run artifact upload, `cd.yml` Docker publish, `usage/ledger.jsonl` PR, then `ci.yml` on that PR branch.
 - `.github/workflows/ci.yml` — Atlas quality checks and verification for generated app changes on pull requests (also called by `spec-to-app.yml`).
 - `.github/workflows/cd.yml` — reusable Docker build and push to GitHub Container Registry (`ghcr.io/<owner>/<repo>/<spec-name>`) triggered by `spec-to-app.yml` when verification passes.
 - `runs/` — local run artifacts; ignored by Git and retained as GitHub Actions artifacts for cloud runs.
-- [ARCHITECTURE.md](ARCHITECTURE.md) — plain async Python orchestration, end-to-end spec-to-app flow, model routing, and adding skills.
-- [HARNESS_PLAN.md](docs/HARNESS_PLAN.md) — hybrid local-first builder + CLI harness design, auth pre-flight (`atlas doctor`), honest telemetry, and skills allowlist.
+- [ARCHITECTURE.md](ARCHITECTURE.md) — plain async Python orchestration, end-to-end spec-to-app flow, model routing, and progressive skills.
+- [HARNESS_PLAN.md](docs/HARNESS_PLAN.md) — hybrid local-first builder + CLI harness design, auth pre-flight (`atlas doctor`), honest telemetry, dual post-build supervisor, and skills allowlist.
+- [TESTING_AND_DEPLOYING.md](docs/TESTING_AND_DEPLOYING.md) — step-by-step local validation, hybrid harness setup, and GitHub template deployment guide.
 
 See [ARCHITECTURE.md](ARCHITECTURE.md) for the full pipeline & skills breakdown, and [ROADMAP.md](ROADMAP.md) for template experiments and the later hosted-framework direction.

@@ -157,6 +157,28 @@ def load_role_skill_prompt(
     return "\n".join(sections).strip()
 
 
+def format_role_skill_index(
+    role: str,
+    skills_cfg: dict[str, Any],
+    *,
+    extra_skills: list[str] | None = None,
+) -> str:
+    """Return a compact progressive-disclosure skill index pointing to `.agents/skills/`."""
+    resolved = resolve_role_skills(role, skills_cfg, extra_skills=extra_skills)
+    if not resolved:
+        return ""
+
+    lines = [
+        "## Active Skills (read on demand from `.agents/skills/`)",
+        "",
+    ]
+    for meta in resolved:
+        skill_key = Path(meta.path).parent.name
+        desc = f": {meta.description}" if meta.description else ""
+        lines.append(f"- `{meta.name}`{desc} — read `.agents/skills/{skill_key}/SKILL.md`")
+    return "\n".join(lines)
+
+
 def sync_workspace_skills(workspace_root: Path, skills_cfg: dict[str, Any]) -> list[Path]:
     """Expose allowlisted skills into `<workspace_root>/.agents/skills/` via symlinks."""
     sources = list(skills_cfg.get("sources") or [])

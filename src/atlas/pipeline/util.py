@@ -19,6 +19,28 @@ def prompt(name: str) -> str:
     return resources.files("atlas.prompts").joinpath(f"{name}.md").read_text(encoding="utf-8")
 
 
+def role_target_label(
+    router: ModelRouter, role: str, fallback_model: str | None = None
+) -> str:
+    """Return the human-readable backend/model target that will execute `role`."""
+    backend_fn = getattr(router, "backend_for", None)
+    backend = backend_fn(role) if callable(backend_fn) else {}
+    btype = str(backend.get("type") or "openrouter")
+    if btype == "harness":
+        provider = backend.get("provider", "harness")
+        target = backend.get("model") or fallback_model or role
+        return f"{provider}/{target}"
+    if btype == "local_harness":
+        local_model = backend.get("local_model")
+        return f"local/{local_model}" if local_model else "local/auto-detect"
+    if fallback_model:
+        return fallback_model
+    try:
+        return ", ".join(router.models_for(role))
+    except ValueError:
+        return btype
+
+
 def extract_json(text: str) -> Any:
     """Parse JSON from plain output, fenced code blocks, or prose-wrapped JSON objects."""
     cleaned = text.strip()
@@ -72,6 +94,7 @@ async def complete_json_model(
     user: str,
     schema: type[T],
     postprocess: Callable[[dict[str, Any], str], dict[str, Any]] | None = None,
+    use_harness: bool = True,
 ) -> tuple[str, T]:
     """Call a model, extract a JSON object, validate against Pydantic, with repair retry."""
     max_repairs = router.repair_attempts
@@ -82,12 +105,22 @@ async def complete_json_model(
         backend_fn = getattr(router, "backend_for", None)
         complete_structured = getattr(router, "complete_structured", None)
         if (
-            callable(backend_fn)
+            use_harness
+            and callable(backend_fn)
             and backend_fn(role).get("type") == "harness"
             and callable(complete_structured)
         ):
             used_model, raw_output = await complete_structured(
                 model, system, current_user, role=role, json_schema=schema.model_json_schema()
+            )
+        elif not use_harness and callable(complete_structured):
+            used_model, raw_output = await complete_structured(
+                model,
+                system,
+                current_user,
+                role=role,
+                json_schema=schema.model_json_schema(),
+                use_harness=False,
             )
         else:
             used_model, raw_output = await router.complete(model, system, current_user, role=role)

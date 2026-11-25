@@ -56,16 +56,25 @@ async def _run_cli(
     env: dict[str, str],
     timeout_seconds: float,
     cwd: Path | None = None,
+    input_text: str | None = None,
 ) -> tuple[int, str, str]:
-    proc = await asyncio.create_subprocess_exec(
-        *args,
-        cwd=str(cwd) if cwd is not None else None,
-        env=env,
-        stdout=asyncio.subprocess.PIPE,
-        stderr=asyncio.subprocess.PIPE,
-    )
     try:
-        stdout_b, stderr_b = await asyncio.wait_for(proc.communicate(), timeout=timeout_seconds)
+        proc = await asyncio.create_subprocess_exec(
+            *args,
+            cwd=str(cwd) if cwd is not None else None,
+            env=env,
+            stdin=asyncio.subprocess.PIPE if input_text is not None else asyncio.subprocess.DEVNULL,
+            stdout=asyncio.subprocess.PIPE,
+            stderr=asyncio.subprocess.PIPE,
+        )
+    except OSError as exc:
+        # Missing/non-executable binary, or E2BIG when an argument is too long.
+        raise HarnessUnavailableError(f"Could not start Claude Code CLI: {exc}") from exc
+    stdin_bytes = input_text.encode("utf-8") if input_text is not None else None
+    try:
+        stdout_b, stderr_b = await asyncio.wait_for(
+            proc.communicate(stdin_bytes), timeout=timeout_seconds
+        )
     except TimeoutError:
         proc.kill()
         await proc.wait()
@@ -79,38 +88,63 @@ async def _run_cli(
     )
 
 
-def _extract_claude_text_and_usage(
-    stdout: str, *, auth_mode: AuthMode
-) -> tuple[str, dict[str, Any]]:
+def _as_count(value: Any) -> int:
+    if isinstance(value, bool):
+        return 0
+    try:
+        return max(0, int(value or 0))
+    except (TypeError, ValueError):
+        return 0
+
+
+def _parse_envelope(stdout: str) -> dict[str, Any] | None:
     raw = stdout.strip()
     if not raw:
-        return "", {}
+        return None
     try:
         parsed = json.loads(raw)
     except json.JSONDecodeError:
-        return raw, {}
+        return None
+    return parsed if isinstance(parsed, dict) else None
 
-    if not isinstance(parsed, dict):
-        return json.dumps(parsed), {}
 
-    text = ""
-    if parsed.get("structured_output") is not None:
-        so = parsed["structured_output"]
-        text = so if isinstance(so, str) else json.dumps(so)
-    elif parsed.get("result") is not None:
-        res = parsed["result"]
-        text = res if isinstance(res, str) else json.dumps(res)
-    else:
-        text = raw
+def _claude_usage(parsed: dict[str, Any], *, auth_mode: AuthMode) -> dict[str, Any]:
+    """Normalise Claude Code token usage and cost from a `--output-format json` result.
 
-    raw_usage = parsed.get("usage")
-    usage: dict[str, Any] = raw_usage if isinstance(raw_usage, dict) else {}
-    prompt_tokens = int(usage.get("input_tokens") or usage.get("prompt_tokens") or 0)
-    cached_tokens = int(usage.get("cache_read_input_tokens") or usage.get("cached_tokens") or 0)
-    completion_tokens = int(usage.get("output_tokens") or usage.get("completion_tokens") or 0)
-    total_tokens = int(usage.get("total_tokens") or (prompt_tokens + completion_tokens))
-    usage_reported = bool(usage)
+    ``modelUsage`` is preferred: it covers every model the run billed (including Claude
+    Code's background Haiku calls and sub-agents), whereas top-level ``usage`` covers only
+    the main loop and is zeroed on some error results (e.g. ``error_max_budget_usd``).
+    Anthropic reports ``input_tokens`` *excluding* cache reads and writes, so prompt tokens
+    are the sum of all three, matching LiteLLM's convention that ``cached_tokens`` is a
+    subset of ``prompt_tokens``.
+    """
+    input_tokens = cache_read = cache_write = output = thinking = 0
+    reported = False
+    model_usage = parsed.get("modelUsage")
+    if isinstance(model_usage, dict):
+        for entry in model_usage.values():
+            if not isinstance(entry, dict):
+                continue
+            reported = True
+            input_tokens += _as_count(entry.get("inputTokens"))
+            cache_read += _as_count(entry.get("cacheReadInputTokens"))
+            cache_write += _as_count(entry.get("cacheCreationInputTokens"))
+            output += _as_count(entry.get("outputTokens"))
+            thinking += _as_count(entry.get("thinkingTokens"))
+    if not reported:
+        raw_usage = parsed.get("usage")
+        usage: dict[str, Any] = raw_usage if isinstance(raw_usage, dict) else {}
+        if usage:
+            reported = True
+            input_tokens = _as_count(usage.get("input_tokens"))
+            cache_read = _as_count(usage.get("cache_read_input_tokens"))
+            cache_write = _as_count(usage.get("cache_creation_input_tokens"))
+            output = _as_count(usage.get("output_tokens"))
+            details = usage.get("output_tokens_details")
+            if isinstance(details, dict):
+                thinking = _as_count(details.get("thinking_tokens"))
 
+    prompt_tokens = input_tokens + cache_read + cache_write
     raw_cost = parsed.get("total_cost_usd")
     cost_usd: float | None = None
     cost_source: CostSource = "unavailable"
@@ -122,16 +156,82 @@ def _extract_claude_text_and_usage(
         # Flat-rate Pro/Max subscription or OAuth token: keep `cost_usd` None rather than zeroing.
         cost_source = "subscription"
 
-    return text, {
+    return {
         "prompt_tokens": prompt_tokens,
-        "completion_tokens": completion_tokens,
-        "cached_tokens": cached_tokens,
-        "reasoning_tokens": 0,
-        "total_tokens": total_tokens,
+        "completion_tokens": output,
+        "cached_tokens": cache_read,
+        "reasoning_tokens": thinking,
+        "total_tokens": prompt_tokens + output,
         "cost_usd": cost_usd,
         "cost_source": cost_source,
-        "usage_reported": usage_reported,
+        "usage_reported": reported,
     }
+
+
+def _extract_claude_text_and_usage(
+    stdout: str, *, auth_mode: AuthMode
+) -> tuple[str, dict[str, Any]]:
+    raw = stdout.strip()
+    if not raw:
+        return "", {}
+    parsed = _parse_envelope(raw)
+    if parsed is None:
+        try:
+            return json.dumps(json.loads(raw)), {}
+        except json.JSONDecodeError:
+            return raw, {}
+
+    if parsed.get("structured_output") is not None:
+        so = parsed["structured_output"]
+        text = so if isinstance(so, str) else json.dumps(so)
+    elif parsed.get("result") is not None:
+        res = parsed["result"]
+        text = res if isinstance(res, str) else json.dumps(res)
+    else:
+        text = raw
+    return text, _claude_usage(parsed, auth_mode=auth_mode)
+
+
+def _claude_failure(
+    *, role: str, rc: int, stdout: str, stderr: str, auth_mode: AuthMode
+) -> HarnessError:
+    """Turn a failed `claude -p` run into a typed error that keeps its billed usage.
+
+    On failure the CLI exits non-zero, leaves stderr empty, and prints the JSON result with
+    ``is_error``, ``api_error_status``/``api_error_type`` and either ``result`` (the error
+    text) or ``errors`` (e.g. ``error_max_budget_usd``). Classify from those fields, never
+    from the raw JSON blob, whose UUIDs can contain strings such as ``401``.
+    """
+    parsed = _parse_envelope(stdout)
+    usage: dict[str, Any] = {}
+    if parsed is None:
+        msg = stderr.strip() or stdout.strip() or f"claude exited with code {rc}"
+        is_auth = any(marker in msg.lower() for marker in _AUTH_ERROR_MARKERS)
+    else:
+        usage = _claude_usage(parsed, auth_mode=auth_mode)
+        errors = parsed.get("errors")
+        parts = [str(parsed.get("result") or "").strip(), stderr.strip()]
+        if isinstance(errors, list):
+            parts.extend(str(e) for e in errors)
+        subtype = str(parsed.get("subtype") or "")
+        if subtype and subtype != "success":
+            parts.append(f"subtype={subtype}")
+        msg = "; ".join(p for p in parts if p) or f"claude exited with code {rc}"
+        status = parsed.get("api_error_status")
+        error_type = str(parsed.get("api_error_type") or "")
+        is_auth = status in (401, 403) or error_type in (
+            "authentication_error",
+            "permission_error",
+        )
+        if not is_auth and parsed.get("api_error_status") is None and not parsed.get("errors"):
+            is_auth = any(marker in msg.lower() for marker in _AUTH_ERROR_MARKERS)
+    if is_auth:
+        return HarnessAuthError(
+            f"Claude Code authentication required for role '{role}': {msg}. "
+            "Run `claude auth login` or set `auth: api` with `ANTHROPIC_API_KEY`.",
+            usage=usage,
+        )
+    return HarnessError(f"Claude Code failed for role '{role}' (exit={rc}): {msg}", usage=usage)
 
 
 class ClaudeCodeAdapter(HarnessAdapter):
@@ -161,7 +261,7 @@ class ClaudeCodeAdapter(HarnessAdapter):
                 details="`claude` CLI binary not found on PATH.",
                 login_hint=(
                     "Install with `npm install -g @anthropic-ai/claude-code` then run "
-                    "`claude login` (Pro/Max+), or configure Judge on `agy` "
+                    "`claude auth login` (Pro/Max+), or configure Judge on `agy` "
                     "(`claude-opus-5-5-high`)."
                 ),
             )
@@ -191,21 +291,56 @@ class ClaudeCodeAdapter(HarnessAdapter):
                 ),
             )
 
-        rc, out, err = await _run_cli([binary, "auth", "status"], env=env, timeout_seconds=10.0)
+        try:
+            # Prints JSON (`loggedIn`, `authMethod`, ...); exits 0 if logged in, 1 if not.
+            rc, out, err = await _run_cli(
+                [binary, "auth", "status"], env=env, timeout_seconds=15.0
+            )
+        except HarnessError as exc:
+            rc, out, err = 1, "", str(exc)
         combined = f"{out}\n{err}".strip()
-        if rc == 0:
+        status_json = _parse_envelope(out)
+        auth_method = ""
+        if status_json is not None and "loggedIn" in status_json:
+            logged_in = rc == 0 and status_json.get("loggedIn") is True
+            auth_method = str(status_json.get("authMethod") or "")
+        else:
             lowered = combined.lower()
-            logged_out = "not logged" in lowered or '"loggedin":false' in lowered.replace(" ", "")
-            if not logged_out:
+            logged_in = rc == 0 and not (
+                "not logged" in lowered or '"loggedin":false' in lowered.replace(" ", "")
+            )
+        if logged_in:
+            if auth_method == "api_key":
+                # Something other than ANTHROPIC_API_KEY (stripped above), e.g. an
+                # `apiKeyHelper` setting, would bill these runs to the API, not the plan.
                 return AuthStatus(
                     provider=self.provider,
                     available=True,
                     authenticated=True,
-                    auth_mode=auth_mode,
+                    auth_mode="api_key",
                     binary_path=binary,
                     version=version,
-                    details=combined or f"Claude Code authenticated ({auth_mode}).",
+                    details=(
+                        "Claude Code is signed in with an API key (authMethod=api_key) even "
+                        f"though `auth: {auth or 'subscription'}` is configured; runs will be "
+                        "billed per token."
+                    ),
+                    login_hint="Run `claude auth login` with your Pro/Max account, or set "
+                    "`auth: api` to accept API billing.",
                 )
+            return AuthStatus(
+                provider=self.provider,
+                available=True,
+                authenticated=True,
+                auth_mode=auth_mode,
+                binary_path=binary,
+                version=version,
+                details=(
+                    f"Claude Code signed in (authMethod={auth_method})."
+                    if auth_method
+                    else combined or f"Claude Code authenticated ({auth_mode})."
+                ),
+            )
 
         if env.get("CLAUDE_CODE_OAUTH_TOKEN"):
             return AuthStatus(
@@ -226,7 +361,9 @@ class ClaudeCodeAdapter(HarnessAdapter):
             binary_path=binary,
             version=version,
             details=combined or "Claude Code CLI is not signed in.",
-            login_hint="Run `claude login` (Pro/Max+), or export `CLAUDE_CODE_OAUTH_TOKEN`.",
+            login_hint=(
+                "Run `claude auth login` (Pro/Max+), or export `CLAUDE_CODE_OAUTH_TOKEN`."
+            ),
         )
 
     async def run_structured(
@@ -265,10 +402,12 @@ class ClaudeCodeAdapter(HarnessAdapter):
         auth_mode = _resolved_auth_mode(auth, env)
         version = await self._version(binary, env)
         prompt_text = f"SYSTEM INSTRUCTIONS:\n{system.strip()}\n\nUSER REQUEST:\n{user.strip()}"
+        # The prompt goes in on stdin (`claude -p` with no positional prompt reads it, up to
+        # 10 MB): judge/supervisor prompts embed app code and can exceed the per-argument
+        # argv limit (128 KiB on Linux).
         args = [
             binary,
             "-p",
-            prompt_text,
             "--model",
             model,
             "--output-format",
@@ -279,24 +418,24 @@ class ClaudeCodeAdapter(HarnessAdapter):
         if json_schema is not None:
             args.extend(["--json-schema", json.dumps(json_schema)])
         if max_budget_usd is not None:
-            args.extend(["--max-budget-usd", f"{max_budget_usd:.2f}"])
+            # `g` keeps small caps exact (`.2f` would turn 0.004 into "0.00").
+            args.extend(["--max-budget-usd", format(max_budget_usd, "g")])
 
         started = time.monotonic()
-        rc, out, err = await _run_cli(args, env=env, timeout_seconds=timeout_seconds, cwd=cwd)
+        rc, out, err = await _run_cli(
+            args, env=env, timeout_seconds=timeout_seconds, cwd=cwd, input_text=prompt_text
+        )
         elapsed_ms = round((time.monotonic() - started) * 1000, 1)
 
-        if rc != 0:
-            msg = err.strip() or out.strip() or f"claude exited with code {rc}"
-            if any(marker in msg.lower() for marker in _AUTH_ERROR_MARKERS):
-                raise HarnessAuthError(
-                    f"Claude Code authentication required for role '{role}': {msg}. "
-                    "Run `claude login` or set `auth: api` with `ANTHROPIC_API_KEY`."
-                )
-            raise HarnessError(f"Claude Code failed for role '{role}' (exit={rc}): {msg}")
+        envelope = _parse_envelope(out)
+        if rc != 0 or (envelope is not None and envelope.get("is_error") is True):
+            raise _claude_failure(role=role, rc=rc, stdout=out, stderr=err, auth_mode=auth_mode)
 
         text, usage = _extract_claude_text_and_usage(out, auth_mode=auth_mode)
         if not text.strip():
-            raise HarnessError(f"Claude Code returned empty output for role '{role}'.")
+            raise HarnessError(
+                f"Claude Code returned empty output for role '{role}'.", usage=usage
+            )
 
         return HarnessInvocationResult(
             text=text.strip(),

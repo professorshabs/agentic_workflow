@@ -1,3 +1,5 @@
+import inspect
+
 import httpx
 
 from atlas.local_models import (
@@ -6,6 +8,7 @@ from atlas.local_models import (
     probe_lm_studio,
     probe_ollama,
     resolve_local_model,
+    run_tool_smoke_check,
 )
 
 
@@ -189,3 +192,140 @@ async def test_resolve_local_model_filters_tools_context_memory_preferred_and_sm
     offline_res = await resolve_local_model()
     assert offline_res.selected is None
     assert "OLLAMA_CONTEXT_LENGTH=64000 ollama serve" in offline_res.reason
+
+
+async def test_resolve_local_model_prefers_lm_studio_gemma4_26b_then_ollama_12b(monkeypatch):
+    ram_24g = 24 * 1024**3
+    gemma_lms_26b = LocalModelCandidate(
+        provider="lm_studio",
+        name="lmstudio-community/gemma-4-26B-A4B-it-QAT-MLX-4bit",
+        base_url="http://localhost:1234/v1",
+        parameter_size_b=26.0,
+        size_bytes=15 * 1024**3,
+        context_length=32768,
+        supports_tools=True,
+    )
+    gemma_12b_mlx = LocalModelCandidate(
+        provider="ollama",
+        name="gemma4:12b-mlx",
+        base_url="http://localhost:11434/v1",
+        parameter_size_b=12.0,
+        size_bytes=7 * 1024**3,
+        context_length=65536,
+        supports_tools=True,
+    )
+    gemma_12b = LocalModelCandidate(
+        provider="ollama",
+        name="gemma4:12b",
+        base_url="http://localhost:11434/v1",
+        parameter_size_b=12.0,
+        size_bytes=7 * 1024**3,
+        context_length=65536,
+        supports_tools=True,
+    )
+
+    preferred = [
+        "gemma-4-26b-a4b-it-qat-mlx-4bit",
+        "gemma4:12b-mlx",
+        "gemma4:12b",
+    ]
+
+    async def fake_ollama(*args, **kwargs):
+        return [gemma_12b.model_copy(), gemma_12b_mlx.model_copy()], None
+
+    async def fake_lms(*args, **kwargs):
+        return [gemma_lms_26b.model_copy()], None
+
+    async def smoke(cand: LocalModelCandidate) -> tuple[bool, str]:
+        return True, "ok"
+
+    monkeypatch.setattr("atlas.local_models.probe_ollama", fake_ollama)
+    monkeypatch.setattr("atlas.local_models.probe_lm_studio", fake_lms)
+
+    res_both = await resolve_local_model(
+        preferred=preferred,
+        min_context_tokens=32768,
+        memory_budget_fraction=0.78,
+        total_memory_bytes=ram_24g,
+        smoke_check_fn=smoke,
+    )
+    assert res_both.selected is not None
+    assert res_both.selected.name == "lmstudio-community/gemma-4-26B-A4B-it-QAT-MLX-4bit"
+
+    async def lms_offline(*args, **kwargs):
+        return [], "LM Studio offline"
+
+    monkeypatch.setattr("atlas.local_models.probe_lm_studio", lms_offline)
+    res_ollama = await resolve_local_model(
+        preferred=preferred,
+        min_context_tokens=32768,
+        memory_budget_fraction=0.78,
+        total_memory_bytes=ram_24g,
+        smoke_check_fn=smoke,
+    )
+    assert res_ollama.selected is not None
+    assert res_ollama.selected.name == "gemma4:12b-mlx"
+
+
+async def test_probe_lm_studio_merges_v0_loaded_context_and_tool_use_metadata(monkeypatch):
+    def handler(request: httpx.Request) -> httpx.Response:
+        url = str(request.url)
+        if url.endswith("/v1/models"):
+            return httpx.Response(
+                200,
+                json={
+                    "data": [
+                        {"id": "google/gemma-4-26b-a4b-qat"},
+                        {"id": "google/gemma-4-12b-qat"},
+                        {"id": "custom-vector-model"},
+                    ]
+                },
+            )
+        if url.endswith("/api/v0/models"):
+            return httpx.Response(
+                200,
+                json={
+                    "data": [
+                        {
+                            "id": "google/gemma-4-26b-a4b-qat",
+                            "type": "vlm",
+                            "state": "loaded",
+                            "max_context_length": 262144,
+                            "loaded_context_length": 32768,
+                            "capabilities": ["tool_use"],
+                        },
+                        {
+                            "id": "google/gemma-4-12b-qat",
+                            "type": "vlm",
+                            "state": "not-loaded",
+                            "max_context_length": 262144,
+                            "capabilities": ["tool_use"],
+                        },
+                        {
+                            "id": "custom-vector-model",
+                            "type": "embeddings",
+                            "state": "not-loaded",
+                            "max_context_length": 2048,
+                        },
+                    ]
+                },
+            )
+        raise AssertionError(f"Unexpected URL: {url}")
+
+    transport = httpx.MockTransport(handler)
+    real_async_client = httpx.AsyncClient
+    monkeypatch.setattr(
+        "atlas.local_models.httpx.AsyncClient",
+        lambda **kw: real_async_client(transport=transport, **kw),
+    )
+
+    cands, err = await probe_lm_studio("http://localhost:1234/v1")
+    assert err is None
+    assert [c.name for c in cands] == ["google/gemma-4-26b-a4b-qat", "google/gemma-4-12b-qat"]
+    assert cands[0].loaded is True
+    assert cands[0].context_length == 32768
+    assert cands[0].supports_tools is True
+    assert cands[1].loaded is False
+    assert cands[1].context_length == 262144
+    assert cands[1].supports_tools is True
+    assert inspect.signature(run_tool_smoke_check).parameters["timeout"].default == 180.0

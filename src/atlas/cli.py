@@ -12,6 +12,7 @@ from atlas.changes import changed_specs
 from atlas.harnesses import run_doctor
 from atlas.local_models import DEFAULT_LM_STUDIO_URL, DEFAULT_OLLAMA_URL, resolve_local_model
 from atlas.pipeline.build import default_app_dir
+from atlas.pipeline.clarify import load_answers_file
 from atlas.pipeline.verify import verify_app
 from atlas.router import ModelRouter
 from atlas.runner import run_build, run_plan
@@ -66,6 +67,27 @@ def _add_ledger_args(p: argparse.ArgumentParser) -> None:
     p.add_argument("--no-ledger", action="store_true", help="do not write to the ledger")
 
 
+def _add_clarify_and_e2e_args(p: argparse.ArgumentParser) -> None:
+    p.add_argument(
+        "--clarify",
+        action=argparse.BooleanOptionalAction,
+        default=None,
+        help="prompt interactively for researcher/spec clarifying questions (default: TTY auto)",
+    )
+    p.add_argument(
+        "--answers",
+        type=Path,
+        default=None,
+        help="JSON file mapping clarifying question text or 1-based index to answers",
+    )
+    p.add_argument(
+        "--e2e-tests",
+        action=argparse.BooleanOptionalAction,
+        default=None,
+        help="generate authoritative black-box E2E product tests before build",
+    )
+
+
 def main() -> None:
     load_dotenv()
     parser = argparse.ArgumentParser(prog="atlas")
@@ -77,7 +99,11 @@ def main() -> None:
     plan_parser.add_argument("--out", type=Path, default=Path("runs"))
     plan_parser.add_argument("--config", type=Path, default=None)
     plan_parser.add_argument("--verbose", action="store_true")
+    plan_parser.add_argument(
+        "-q", "--quiet", action="store_true", help="suppress step-by-step progress output"
+    )
     _add_ledger_args(plan_parser)
+    _add_clarify_and_e2e_args(plan_parser)
 
     build_parser = sub.add_parser(
         "build",
@@ -103,8 +129,18 @@ def main() -> None:
         default=None,
         help="override explicit local model for workspace builder",
     )
+    build_parser.add_argument(
+        "--from-run",
+        type=Path,
+        default=None,
+        help="reuse parsed spec, clarifications, plan, and E2E tests from an earlier run dir",
+    )
     build_parser.add_argument("--verbose", action="store_true")
+    build_parser.add_argument(
+        "-q", "--quiet", action="store_true", help="suppress step-by-step progress output"
+    )
     _add_ledger_args(build_parser)
+    _add_clarify_and_e2e_args(build_parser)
 
     verify_parser = sub.add_parser(
         "verify", help="detect stack and run test/lint/build verification checks"
@@ -154,23 +190,60 @@ def main() -> None:
     detect_parser.add_argument("--json", action="store_true")
 
     args = parser.parse_args()
-    logging.basicConfig(
-        level=logging.DEBUG if getattr(args, "verbose", False) else logging.INFO,
-        format="%(levelname)s %(name)s: %(message)s",
-    )
-    if not getattr(args, "verbose", False):
-        # LiteLLM logs every request at INFO; keep the terminal to Atlas's own messages.
-        for name in ("LiteLLM", "LiteLLM Router", "LiteLLM Proxy", "litellm", "httpx"):
-            logging.getLogger(name).setLevel(logging.WARNING)
+    verbose = bool(getattr(args, "verbose", False))
+    quiet = bool(getattr(args, "quiet", False))
+    if verbose:
+        log_level = logging.DEBUG
+        log_format = "%(asctime)s %(levelname)s %(name)s: %(message)s"
+    elif quiet:
+        log_level = logging.WARNING
+        log_format = "[%(asctime)s] %(levelname)s: %(message)s"
+    else:
+        log_level = logging.INFO
+        log_format = "[%(asctime)s] %(message)s"
+    logging.basicConfig(level=log_level, format=log_format, datefmt="%H:%M:%S")
+    logging.getLogger("atlas").setLevel(log_level)
+    for handler in logging.getLogger().handlers:
+        if getattr(handler, "_atlas_cli", False) or (
+            type(handler) is logging.StreamHandler
+            and getattr(handler, "stream", None) is sys.stderr
+        ):
+            handler._atlas_cli = True  # type: ignore[attr-defined]
+            handler.setLevel(log_level)
+            handler.setFormatter(logging.Formatter(log_format, datefmt="%H:%M:%S"))
+    # LiteLLM attaches StreamHandlers writing to sys.stdout; clear them so logs only go
+    # through root stderr, and mute third-party HTTP/LLM INFO chatter unless --verbose.
+    for name in (
+        "LiteLLM",
+        "LiteLLM Router",
+        "LiteLLM Proxy",
+        "litellm",
+        "httpx",
+        "httpcore",
+        "openai",
+        "anthropic",
+    ):
+        third_party = logging.getLogger(name)
+        if name.lower().startswith("litellm"):
+            third_party.handlers.clear()
+            third_party.propagate = True
+        third_party.setLevel(logging.DEBUG if verbose else logging.WARNING)
 
     try:
         if args.cmd == "plan":
+            interactive_clarify = (
+                sys.stdin.isatty() if args.clarify is None else bool(args.clarify)
+            )
+            clarification_answers = load_answers_file(args.answers) if args.answers else None
             out = asyncio.run(
                 run_plan(
                     args.spec,
                     args.out,
                     args.config,
                     ledger_path=None if args.no_ledger else args.ledger,
+                    interactive_clarify=interactive_clarify,
+                    clarification_answers=clarification_answers,
+                    generate_e2e=args.e2e_tests,
                 )
             )
             summary = _load_token_summary(out)
@@ -184,6 +257,10 @@ def main() -> None:
             app_dir = (
                 args.app_dir if args.app_dir is not None else default_app_dir(args.spec)
             )
+            interactive_clarify = (
+                sys.stdin.isatty() if args.clarify is None else bool(args.clarify)
+            )
+            clarification_answers = load_answers_file(args.answers) if args.answers else None
             out = asyncio.run(
                 run_build(
                     args.spec,
@@ -196,6 +273,10 @@ def main() -> None:
                     report_out=args.report_out,
                     ledger_path=None if args.no_ledger else args.ledger,
                     local_model=args.local_model,
+                    interactive_clarify=interactive_clarify,
+                    clarification_answers=clarification_answers,
+                    generate_e2e=args.e2e_tests,
+                    from_run=args.from_run,
                 )
             )
             manifest = json.loads((out / "manifest.json").read_text(encoding="utf-8"))

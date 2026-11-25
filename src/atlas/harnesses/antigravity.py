@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import asyncio
+import contextlib
 import importlib
 import importlib.metadata
 import importlib.util
@@ -11,10 +12,12 @@ import os
 import shutil
 import tempfile
 import time
+from collections.abc import Iterator
 from pathlib import Path
 from typing import Any
 
 from atlas.local_models import LocalModelCandidate
+from atlas.pipeline.verify import credential_free_env
 from atlas.schemas import AuthMode, CostSource, WorkspaceBuildResult
 
 from .base import (
@@ -42,8 +45,41 @@ _AUTH_ERROR_MARKERS = (
 )
 
 
-def _antigravity_env() -> dict[str, str]:
-    return scoped_subprocess_env(("GEMINI_", "GOOGLE_", "ANTIGRAVITY_"), {"NO_COLOR"})
+_AGY_API_KEY_NAMES = {"GEMINI_API_KEY", "GOOGLE_API_KEY", "ANTIGRAVITY_API_KEY"}
+
+
+@contextlib.contextmanager
+def _credentials_hidden_from_children() -> Iterator[None]:
+    """Hide credentials from processes the Antigravity SDK starts.
+
+    The SDK launches its local harness with a copy of ``os.environ`` (its ``env`` option can
+    only add variables), and the local model's ``run_command`` tool runs inside that harness.
+    Without this, every key Atlas loaded from `.env` (OpenRouter, Anthropic, Gemini, GitHub)
+    would be readable by the model and could end up in the generated app.
+    """
+    keep = credential_free_env()
+    hidden = {key: value for key, value in os.environ.items() if key not in keep}
+    for key in hidden:
+        os.environ.pop(key, None)
+    try:
+        yield
+    finally:
+        os.environ.update(hidden)
+
+
+def _antigravity_env(auth: str | None = None) -> dict[str, str]:
+    """Scope agy's environment to Google credentials, with a billing guard.
+
+    Atlas (and LiteLLM on import) load `.env` into the process, so a `GEMINI_API_KEY` kept
+    there for other tools would otherwise reach `agy` and get every call logged as
+    `api_key`. Like the Claude guard, API keys are passed only with `auth: api`; otherwise
+    `agy` runs on its cached interactive login.
+    """
+    normalized = (auth or "subscription").strip().lower()
+    drop = set() if normalized == "api" else set(_AGY_API_KEY_NAMES)
+    return scoped_subprocess_env(
+        ("GEMINI_", "GOOGLE_", "ANTIGRAVITY_"), {"NO_COLOR"}, drop_names=drop
+    )
 
 
 def _agy_auth_mode(env: dict[str, str]) -> AuthMode:
@@ -59,13 +95,20 @@ async def _run_agy(
     timeout_seconds: float,
     cwd: Path | None = None,
 ) -> tuple[int, str, str]:
-    proc = await asyncio.create_subprocess_exec(
-        *args,
-        cwd=str(cwd) if cwd is not None else None,
-        env=env,
-        stdout=asyncio.subprocess.PIPE,
-        stderr=asyncio.subprocess.PIPE,
-    )
+    try:
+        proc = await asyncio.create_subprocess_exec(
+            *args,
+            cwd=str(cwd) if cwd is not None else None,
+            env=env,
+            stdin=asyncio.subprocess.DEVNULL,
+            stdout=asyncio.subprocess.PIPE,
+            stderr=asyncio.subprocess.PIPE,
+        )
+    except OSError as exc:
+        # Missing/non-executable binary, or E2BIG: `agy -p` takes the prompt as one argv
+        # entry, which Linux caps at 128 KiB. Raising HarnessError lets `fallback: router`
+        # take over instead of crashing the stage.
+        raise HarnessUnavailableError(f"Could not start Antigravity CLI: {exc}") from exc
     try:
         stdout_b, stderr_b = await asyncio.wait_for(proc.communicate(), timeout=timeout_seconds)
     except TimeoutError:
@@ -81,6 +124,144 @@ async def _run_agy(
     )
 
 
+def _as_count(value: Any) -> int:
+    if isinstance(value, bool):
+        return 0
+    try:
+        return max(0, int(value or 0))
+    except (TypeError, ValueError):
+        return 0
+
+
+def _first_count(usage: dict[str, Any], *keys: str) -> int:
+    for key in keys:
+        if usage.get(key) is not None:
+            return _as_count(usage.get(key))
+    return 0
+
+
+def _parse_json_dict(stdout: str) -> dict[str, Any] | None:
+    raw = stdout.strip()
+    if not raw:
+        return None
+    try:
+        parsed = json.loads(raw)
+    except json.JSONDecodeError:
+        return None
+    return parsed if isinstance(parsed, dict) else None
+
+
+def _agy_usage(parsed: dict[str, Any]) -> dict[str, Any]:
+    """Map the agy envelope's ``usage`` onto Atlas telemetry fields.
+
+    Documented keys: ``input_tokens`` (includes ``cache_read_tokens``), ``output_tokens``
+    (includes ``thinking_tokens``), ``total_tokens`` (= input + output). agy reports no
+    cost. Older/alternate key spellings are accepted as fallbacks.
+    """
+    raw_usage = parsed.get("usage")
+    usage: dict[str, Any] = raw_usage if isinstance(raw_usage, dict) else {}
+    prompt_tokens = _first_count(
+        usage, "input_tokens", "prompt_tokens", "input", "prompt_token_count"
+    )
+    completion_tokens = _first_count(
+        usage, "output_tokens", "completion_tokens", "output", "candidates_token_count"
+    )
+    cached_tokens = _first_count(
+        usage,
+        "cache_read_tokens",
+        "cached_tokens",
+        "cache_read",
+        "cached_content_token_count",
+        "cache_read_input_tokens",
+    )
+    reasoning_tokens = _first_count(
+        usage, "thinking_tokens", "reasoning_tokens", "thinking", "thoughts_token_count"
+    )
+    total_tokens = _first_count(usage, "total_tokens", "total", "total_token_count") or (
+        prompt_tokens + completion_tokens
+    )
+
+    # agy does not emit cost; report real cost only if explicitly included, else None/unavailable.
+    raw_cost = parsed.get("cost_usd")
+    if raw_cost is None:
+        raw_cost = usage.get("cost")
+    cost_usd: float | None = None
+    cost_source: CostSource = "unavailable"
+    if isinstance(raw_cost, (int, float)) and not isinstance(raw_cost, bool):
+        cost_usd = round(float(raw_cost), 6)
+        cost_source = "reported"
+    return {
+        "prompt_tokens": prompt_tokens,
+        "completion_tokens": completion_tokens,
+        "cached_tokens": cached_tokens,
+        "reasoning_tokens": reasoning_tokens,
+        "total_tokens": total_tokens,
+        "cost_usd": cost_usd,
+        "cost_source": cost_source,
+        "usage_reported": bool(usage),
+    }
+
+
+def _compact_agy_clauses(stderr: str, detail: str) -> str:
+    clauses: list[str] = []
+    for raw_line in stderr.splitlines():
+        line = raw_line.strip()
+        if not line:
+            continue
+        if line.startswith("AGY_ERROR:"):
+            payload_raw = line[len("AGY_ERROR:") :].strip()
+            try:
+                err_obj = json.loads(payload_raw)
+            except json.JSONDecodeError:
+                err_obj = None
+            if isinstance(err_obj, dict):
+                short = str(err_obj.get("short_error") or "").strip()
+                status = str(err_obj.get("status") or "").strip()
+                if short:
+                    if status and status.lower() not in short.lower():
+                        short = f"{short} [{status}]"
+                    clauses.append(short)
+                    continue
+        for prefix in ("[agy] ", "error: "):
+            if line.lower().startswith(prefix):
+                line = line[len(prefix) :].strip()
+        if line:
+            clauses.append(line)
+
+    if detail.strip():
+        clauses.append(detail.strip())
+
+    kept: list[str] = []
+    for candidate in clauses:
+        low = candidate.lower()
+        if any(low in existing.lower() for existing in kept):
+            continue
+        kept = [existing for existing in kept if existing.lower() not in low]
+        kept.append(candidate)
+    return "; ".join(kept)
+
+
+def _agy_failure(
+    *, role: str, rc: int, stdout: str, stderr: str, action: str = "failed"
+) -> HarnessError:
+    parsed = _parse_json_dict(stdout)
+    usage = _agy_usage(parsed) if parsed is not None else {}
+    if parsed is not None:
+        detail = str(parsed.get("error") or parsed.get("message") or parsed.get("status") or "")
+    else:
+        detail = stdout.strip()
+    msg = _compact_agy_clauses(stderr, detail) or f"agy exited with code {rc}"
+    if any(marker in msg.lower() for marker in _AUTH_ERROR_MARKERS):
+        return HarnessAuthError(
+            f"Antigravity authentication required for role '{role}': {msg}. "
+            "Run `agy` to sign in or set `GEMINI_API_KEY`.",
+            usage=usage,
+        )
+    return HarnessError(
+        f"Antigravity CLI {action} for role '{role}' (exit={rc}): {msg}", usage=usage
+    )
+
+
 def _parse_agy_output(stdout: str, *, requested_model: str) -> tuple[str, dict[str, Any]]:
     raw = stdout.strip()
     if not raw:
@@ -93,13 +274,14 @@ def _parse_agy_output(stdout: str, *, requested_model: str) -> tuple[str, dict[s
     if not isinstance(parsed, dict):
         return json.dumps(parsed), {}
 
+    usage = _agy_usage(parsed)
     # Check explicit `status` in agy JSON envelope: exit code 0 still occurs on soft-denies.
     raw_status = parsed.get("status")
     if isinstance(raw_status, str) and raw_status.strip().upper() != "SUCCESS":
         err_msg = str(parsed.get("error") or parsed.get("message") or raw_status)
         if any(marker in err_msg.lower() for marker in _AUTH_ERROR_MARKERS):
-            raise HarnessAuthError(f"Antigravity authentication required: {err_msg}")
-        raise HarnessError(f"Antigravity CLI status={raw_status}: {err_msg}")
+            raise HarnessAuthError(f"Antigravity authentication required: {err_msg}", usage=usage)
+        raise HarnessError(f"Antigravity CLI status={raw_status}: {err_msg}", usage=usage)
 
     text = raw
     if parsed.get("structured_output") is not None:
@@ -112,65 +294,8 @@ def _parse_agy_output(stdout: str, *, requested_model: str) -> tuple[str, dict[s
                 text = val if isinstance(val, str) else json.dumps(val)
                 break
 
-    raw_usage = parsed.get("usage")
-    usage: dict[str, Any] = raw_usage if isinstance(raw_usage, dict) else {}
-    prompt_tokens = int(
-        usage.get("input")
-        or usage.get("prompt_tokens")
-        or usage.get("input_tokens")
-        or usage.get("prompt_token_count")
-        or 0
-    )
-    completion_tokens = int(
-        usage.get("output")
-        or usage.get("completion_tokens")
-        or usage.get("output_tokens")
-        or usage.get("candidates_token_count")
-        or 0
-    )
-    cached_tokens = int(
-        usage.get("cache_read")
-        or usage.get("cached_tokens")
-        or usage.get("cached_content_token_count")
-        or usage.get("cache_read_input_tokens")
-        or 0
-    )
-    reasoning_tokens = int(
-        usage.get("thinking")
-        or usage.get("reasoning_tokens")
-        or usage.get("thoughts_token_count")
-        or 0
-    )
-    total_tokens = int(
-        usage.get("total")
-        or usage.get("total_tokens")
-        or usage.get("total_token_count")
-        or (prompt_tokens + completion_tokens)
-    )
-    usage_reported = bool(usage)
-
-    # agy does not emit cost; report real cost only if explicitly included, else None/unavailable.
-    raw_cost = parsed.get("cost_usd")
-    if raw_cost is None:
-        raw_cost = usage.get("cost")
-    cost_usd: float | None = None
-    cost_source: CostSource = "unavailable"
-    if isinstance(raw_cost, (int, float)) and not isinstance(raw_cost, bool):
-        cost_usd = round(float(raw_cost), 6)
-        cost_source = "reported"
-
     used_model = str(parsed.get("model") or requested_model)
-    return text, {
-        "used_model": used_model,
-        "prompt_tokens": prompt_tokens,
-        "completion_tokens": completion_tokens,
-        "cached_tokens": cached_tokens,
-        "reasoning_tokens": reasoning_tokens,
-        "total_tokens": total_tokens,
-        "cost_usd": cost_usd,
-        "cost_source": cost_source,
-        "usage_reported": usage_reported,
-    }
+    return text, {"used_model": used_model, **usage}
 
 
 class AntigravityCLIAdapter(HarnessAdapter):
@@ -193,7 +318,6 @@ class AntigravityCLIAdapter(HarnessAdapter):
         return None
 
     async def check_auth(self, auth: str | None = None) -> AuthStatus:
-        del auth
         binary = self._find_binary()
         if not binary:
             return AuthStatus(
@@ -205,9 +329,12 @@ class AntigravityCLIAdapter(HarnessAdapter):
             )
 
         version = await self._version(binary)
-        env = _antigravity_env()
+        env = _antigravity_env(auth)
         auth_mode = _agy_auth_mode(env)
-        rc, out, err = await _run_agy([binary, "models"], env=env, timeout_seconds=15.0)
+        try:
+            rc, out, err = await _run_agy([binary, "models"], env=env, timeout_seconds=15.0)
+        except HarnessError as exc:
+            rc, out, err = 1, "", str(exc)
         combined = f"{out}\n{err}".strip()
         if rc == 0 and out.strip():
             return AuthStatus(
@@ -220,26 +347,21 @@ class AntigravityCLIAdapter(HarnessAdapter):
                 details="Antigravity CLI authenticated (`agy models` succeeded).",
             )
 
-        if auth_mode == "api_key":
-            return AuthStatus(
-                provider=self.provider,
-                available=True,
-                authenticated=True,
-                auth_mode="api_key",
-                binary_path=binary,
-                version=version,
-                details=f"Antigravity API key env present (`agy models` rc={rc}).",
-            )
-
         return AuthStatus(
             provider=self.provider,
             available=True,
             authenticated=False,
-            auth_mode="cached_login",
+            auth_mode=auth_mode,
             binary_path=binary,
             version=version,
             details=combined or f"`agy models` exited with code {rc}",
-            login_hint="Run `agy` interactively to authenticate, or export `GEMINI_API_KEY`.",
+            login_hint=(
+                "Check the Antigravity API key and CLI connectivity; `agy models` did not "
+                "succeed."
+                if auth_mode == "api_key"
+                else "Run `agy` interactively to sign in, or set `auth: api` on this backend "
+                "to pass `GEMINI_API_KEY`."
+            ),
         )
 
     async def run_structured(
@@ -256,14 +378,28 @@ class AntigravityCLIAdapter(HarnessAdapter):
         tools: list[str] | None = None,
         cwd: Path | None = None,
     ) -> HarnessInvocationResult:
-        del auth, max_budget_usd, tools
+        del max_budget_usd, tools
         binary = self._find_binary()
         if not binary:
             raise HarnessUnavailableError("Antigravity CLI (`agy`) is not installed on PATH.")
 
         version = await self._version(binary)
-        env = _antigravity_env()
-        prompt_text = f"SYSTEM INSTRUCTIONS:\n{system.strip()}\n\nUSER REQUEST:\n{user.strip()}"
+        env = _antigravity_env(auth)
+        constraint = (
+            "EXECUTION CONSTRAINT: Respond directly in a single turn with ONLY the requested "
+            "JSON object. Do NOT call any tools, read or write files, run shell commands, "
+            "search the web, or spawn subagents.\n\n"
+            if cwd is None
+            else (
+                "EXECUTION CONSTRAINT: You are in strictly read-only review mode. Do NOT "
+                "create, edit, or delete files, run mutating commands, or spawn subagents; "
+                "return ONLY the requested JSON object.\n\n"
+            )
+        )
+        prompt_text = (
+            f"SYSTEM INSTRUCTIONS:\n{constraint}{system.strip()}\n\n"
+            f"USER REQUEST:\n{user.strip()}"
+        )
         args = [
             binary,
             "-p",
@@ -271,6 +407,7 @@ class AntigravityCLIAdapter(HarnessAdapter):
             "--model",
             model,
             "--sandbox",
+            "--disable-slash-commands",
             "--output-format",
             "json",
             "--print-timeout",
@@ -290,19 +427,14 @@ class AntigravityCLIAdapter(HarnessAdapter):
         elapsed_ms = round((time.monotonic() - started) * 1000, 1)
 
         if rc != 0:
-            msg = err.strip() or out.strip() or f"agy exited with code {rc}"
-            if any(marker in msg.lower() for marker in _AUTH_ERROR_MARKERS):
-                raise HarnessAuthError(
-                    f"Antigravity authentication required for role '{role}': {msg}. "
-                    "Run `agy` to sign in or set `GEMINI_API_KEY`."
-                )
-            raise HarnessError(f"Antigravity CLI failed for role '{role}' (exit={rc}): {msg}")
+            raise _agy_failure(role=role, rc=rc, stdout=out, stderr=err)
 
         text, meta = _parse_agy_output(out, requested_model=model)
         if not text.strip():
             raise HarnessError(
                 f"Antigravity CLI returned empty output for role '{role}' "
-                "(check non-TTY stdout support or set `fallback: router`)."
+                "(check non-TTY stdout support or set `fallback: router`).",
+                usage={k: v for k, v in meta.items() if k != "used_model"},
             )
 
         used_model = str(meta.pop("used_model", model))
@@ -361,18 +493,14 @@ class AntigravityCLIAdapter(HarnessAdapter):
         elapsed_ms = round((time.monotonic() - started) * 1000, 1)
 
         if rc != 0:
-            msg = err.strip() or out.strip() or f"agy exited with code {rc}"
-            if any(marker in msg.lower() for marker in _AUTH_ERROR_MARKERS):
-                raise HarnessAuthError(
-                    f"Antigravity authentication required for role '{role}': {msg}."
-                )
-            raise HarnessError(f"Antigravity CLI build failed for role '{role}' (exit={rc}): {msg}")
+            raise _agy_failure(role=role, rc=rc, stdout=out, stderr=err, action="build failed")
 
         text, meta = _parse_agy_output(out, requested_model=model)
         escaped_paths = find_git_changes_outside_app(resolved_app_dir, before_git)
         if escaped_paths:
             raise HarnessError(
-                f"Harness modified files outside '{app_dir}': {', '.join(escaped_paths)}"
+                f"Harness modified files outside '{app_dir}': {', '.join(escaped_paths)}",
+                usage={k: v for k, v in meta.items() if k != "used_model"},
             )
 
         used_model = str(meta.pop("used_model", model))
@@ -404,7 +532,12 @@ class AntigravitySDKAdapter:
     harness = "antigravity_sdk"
 
     def package_version(self) -> str | None:
-        if importlib.util.find_spec("google.antigravity") is None:
+        try:
+            # find_spec raises (rather than returning None) when the parent
+            # ``google`` namespace package itself is not installed.
+            if importlib.util.find_spec("google.antigravity") is None:
+                return None
+        except (ImportError, ValueError):
             return None
         try:
             return importlib.metadata.version("google-antigravity")
@@ -476,14 +609,15 @@ class AntigravitySDKAdapter:
         usage_meta: Any = None
         try:
             os.chdir(resolved_app_dir)
-            async with Agent(cfg) as agent:
-                response = await asyncio.wait_for(
-                    agent.chat(prompt_text), timeout=timeout_seconds
-                )
-                response_text = await asyncio.wait_for(
-                    response.text(), timeout=timeout_seconds
-                )
-                usage_meta = getattr(response, "usage_metadata", None)
+            with _credentials_hidden_from_children():
+                async with Agent(cfg) as agent:
+                    response = await asyncio.wait_for(
+                        agent.chat(prompt_text), timeout=timeout_seconds
+                    )
+                    response_text = await asyncio.wait_for(
+                        response.text(), timeout=timeout_seconds
+                    )
+                    usage_meta = getattr(response, "usage_metadata", None)
         except TimeoutError:
             raise HarnessError(
                 f"Antigravity SDK local build timed out after {timeout_seconds:.0f}s "

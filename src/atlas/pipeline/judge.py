@@ -1,5 +1,7 @@
 import asyncio
 import json
+import logging
+import time
 from typing import Any
 
 from atlas.router import ModelRouter
@@ -14,6 +16,8 @@ from atlas.schemas import (
 )
 
 from .util import complete_json_model, prompt
+
+logger = logging.getLogger("atlas.pipeline.judge")
 
 
 def _compact(value: Any) -> str:
@@ -72,7 +76,12 @@ async def judge(
     for failure in failures:
         failures_by_req.setdefault(failure.requirement_id, []).append(failure)
 
+    total = len(spec.requirements)
+    completed = 0
+
     async def judge_one(req: Requirement) -> JudgeOutput:
+        nonlocal completed
+        started = time.monotonic()
         req_notes = notes_by_req.get(req.id, [])
         req_failures = failures_by_req.get(req.id, [])
         research_payload = {
@@ -105,14 +114,36 @@ async def judge(
             first["requirement_id"] = req.id
             return data
 
-        _, judged = await complete_json_model(
-            router,
-            model=model,
-            role="judge",
-            system=system,
-            user=user,
-            schema=JudgeOutput,
-            postprocess=validate_single_decision,
+        try:
+            used_model, judged = await complete_json_model(
+                router,
+                model=model,
+                role="judge",
+                system=system,
+                user=user,
+                schema=JudgeOutput,
+                postprocess=validate_single_decision,
+            )
+        except Exception as exc:
+            completed += 1
+            logger.info(
+                "[judge] %d/%d FAILED: %s (%s, %.1fs)",
+                completed,
+                total,
+                req.id,
+                type(exc).__name__,
+                time.monotonic() - started,
+            )
+            raise
+        completed += 1
+        logger.info(
+            "[judge] %d/%d done: %s -> %s (%s, %.1fs)",
+            completed,
+            total,
+            req.id,
+            judged.decisions[0].pick[:60],
+            used_model,
+            time.monotonic() - started,
         )
         return judged
 

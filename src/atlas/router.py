@@ -43,6 +43,44 @@ _ALLOWED_LOCAL_HARNESSES = {"antigravity_sdk"}
 _ALLOWED_LOCAL_PROVIDERS = {"ollama", "lm_studio"}
 _ALLOWED_AUTH_MODES = {"subscription", "oauth_token", "api"}
 _ALLOWED_SUPERVISOR_TOOLS = {"Read", "Grep", "Glob"}
+_ALLOWED_SUPERVISOR_MODES = {"unanimous", "any_approve"}
+_ALLOWED_SUPERVISOR_TYPES = {"harness", "openrouter", "litellm"}
+
+
+def _validate_harness_fields(label: str, cfg: dict[str, Any]) -> None:
+    prov = cfg.get("provider")
+    if prov not in _ALLOWED_HARNESS_PROVIDERS:
+        raise ValueError(
+            f"{label}.provider must be one of {sorted(_ALLOWED_HARNESS_PROVIDERS)}"
+        )
+    if prov == "claude_code" and cfg.get("read_only") is False:
+        raise ValueError(f"{label}: claude_code backend is strictly read-only")
+    if prov == "claude_code" and cfg.get("tools") is not None:
+        tools = cfg["tools"]
+        if not isinstance(tools, list) or any(
+            t not in _ALLOWED_SUPERVISOR_TOOLS for t in tools
+        ):
+            raise ValueError(
+                f"{label}.tools must be a subset of {sorted(_ALLOWED_SUPERVISOR_TOOLS)}"
+            )
+    auth_val = cfg.get("auth")
+    if auth_val is not None and auth_val not in _ALLOWED_AUTH_MODES:
+        raise ValueError(f"{label}.auth must be one of {sorted(_ALLOWED_AUTH_MODES)}")
+    fb_mode = cfg.get("fallback")
+    if fb_mode is not None and fb_mode != "router":
+        raise ValueError(f"{label}.fallback must be 'router' or null")
+    if cfg.get("max_parallel") is not None and int(cfg["max_parallel"]) < 1:
+        raise ValueError(f"{label}.max_parallel must be >= 1")
+    if cfg.get("max_budget_usd") is not None and float(cfg["max_budget_usd"]) <= 0:
+        raise ValueError(f"{label}.max_budget_usd must be > 0")
+    if cfg.get("timeout_seconds") is not None and (
+        isinstance(cfg["timeout_seconds"], bool) or float(cfg["timeout_seconds"]) <= 0
+    ):
+        raise ValueError(f"{label}.timeout_seconds must be > 0")
+    if cfg.get("router_model") is not None and (
+        not isinstance(cfg["router_model"], str) or not cfg["router_model"].strip()
+    ):
+        raise ValueError(f"{label}.router_model must be a non-empty string")
 
 
 def _status_code(exc: BaseException) -> int | None:
@@ -184,6 +222,57 @@ class ModelRouter:
             for role, bcfg in backends.items():
                 if not isinstance(bcfg, dict):
                     raise ValueError(f"backends['{role}'] must be a mapping")
+                if role == "supervisor" and "reviewers" in bcfg:
+                    mode_val = bcfg.get("mode")
+                    if mode_val is not None and mode_val not in _ALLOWED_SUPERVISOR_MODES:
+                        raise ValueError(
+                            f"backends['supervisor'].mode must be one of "
+                            f"{sorted(_ALLOWED_SUPERVISOR_MODES)}"
+                        )
+                    reviewers = bcfg["reviewers"]
+                    if not isinstance(reviewers, list) or not reviewers:
+                        raise ValueError(
+                            "backends['supervisor'].reviewers must be a non-empty list"
+                        )
+                    seen_names: set[str] = set()
+                    for idx, rcfg in enumerate(reviewers):
+                        rlabel = f"backends['supervisor'].reviewers[{idx}]"
+                        if not isinstance(rcfg, dict):
+                            raise ValueError(f"{rlabel} must be a mapping")
+                        rtype = str(rcfg.get("type", "openrouter")).strip()
+                        if rtype not in _ALLOWED_SUPERVISOR_TYPES:
+                            raise ValueError(
+                                f"{rlabel}.type '{rtype}' must be one of "
+                                f"{sorted(_ALLOWED_SUPERVISOR_TYPES)}"
+                            )
+                        if rtype == "harness":
+                            _validate_harness_fields(rlabel, rcfg)
+                        else:
+                            rmodel = rcfg.get("model")
+                            if not isinstance(rmodel, str) or not rmodel.strip():
+                                raise ValueError(
+                                    f"{rlabel}.model must be a non-empty string"
+                                )
+                            if rcfg.get("timeout_seconds") is not None and (
+                                isinstance(rcfg["timeout_seconds"], bool)
+                                or float(rcfg["timeout_seconds"]) <= 0
+                            ):
+                                raise ValueError(f"{rlabel}.timeout_seconds must be > 0")
+                        rname = str(
+                            rcfg.get("name")
+                            or rcfg.get("provider")
+                            or rcfg.get("model")
+                            or ""
+                        ).strip()
+                        if not rname:
+                            raise ValueError(f"{rlabel}.name must not be empty")
+                        key = rname.lower()
+                        if key in seen_names:
+                            raise ValueError(
+                                f"backends['supervisor'].reviewers has duplicate name: '{rname}'"
+                            )
+                        seen_names.add(key)
+                    continue
                 btype = str(bcfg.get("type", "openrouter")).strip()
                 if btype not in _ALLOWED_BACKEND_TYPES:
                     raise ValueError(
@@ -191,42 +280,7 @@ class ModelRouter:
                         f"{sorted(_ALLOWED_BACKEND_TYPES)}"
                     )
                 if btype == "harness":
-                    prov = bcfg.get("provider")
-                    if prov not in _ALLOWED_HARNESS_PROVIDERS:
-                        raise ValueError(
-                            f"backends['{role}'].provider must be one of "
-                            f"{sorted(_ALLOWED_HARNESS_PROVIDERS)}"
-                        )
-                    if prov == "claude_code" and bcfg.get("read_only") is False:
-                        raise ValueError(
-                            f"backends['{role}']: claude_code backend is strictly read-only"
-                        )
-                    if prov == "claude_code" and bcfg.get("tools") is not None:
-                        tools = bcfg["tools"]
-                        if not isinstance(tools, list) or any(
-                            t not in _ALLOWED_SUPERVISOR_TOOLS for t in tools
-                        ):
-                            raise ValueError(
-                                f"backends['{role}'].tools must be a subset of "
-                                f"{sorted(_ALLOWED_SUPERVISOR_TOOLS)}"
-                            )
-                    auth_val = bcfg.get("auth")
-                    if auth_val is not None and auth_val not in _ALLOWED_AUTH_MODES:
-                        raise ValueError(
-                            f"backends['{role}'].auth must be one of {sorted(_ALLOWED_AUTH_MODES)}"
-                        )
-                    fb_mode = bcfg.get("fallback")
-                    if fb_mode is not None and fb_mode != "router":
-                        raise ValueError(
-                            f"backends['{role}'].fallback must be 'router' or null"
-                        )
-                    if bcfg.get("max_parallel") is not None and int(bcfg["max_parallel"]) < 1:
-                        raise ValueError(f"backends['{role}'].max_parallel must be >= 1")
-                    if (
-                        bcfg.get("max_budget_usd") is not None
-                        and float(bcfg["max_budget_usd"]) <= 0
-                    ):
-                        raise ValueError(f"backends['{role}'].max_budget_usd must be > 0")
+                    _validate_harness_fields(f"backends['{role}']", bcfg)
                 elif btype == "local_harness":
                     lh = bcfg.get("local_harness", "antigravity_sdk")
                     if lh not in _ALLOWED_LOCAL_HARNESSES:
@@ -337,11 +391,20 @@ class ModelRouter:
         """Fail verification when `app/<spec-name>/` is not self-contained."""
         return bool((self.cfg.get("verification") or {}).get("require_product_contract", False))
 
+    @property
+    def require_e2e_tests(self) -> bool:
+        """Generate authoritative black-box E2E product tests before building."""
+        return bool((self.cfg.get("verification") or {}).get("require_e2e_tests", False))
+
     def max_tokens_for(self, role: str | None) -> int:
         """Output token limit for a role: limits.max_tokens_by_role, else limits.max_tokens."""
         by_role = self.cfg["limits"].get("max_tokens_by_role") or {}
         if role is not None and role in by_role:
             return int(by_role[role])
+        if role == "e2e":
+            for fallback_role in ("builder", "fixer", "judge", "researcher"):
+                if fallback_role in by_role:
+                    return int(by_role[fallback_role])
         return int(self.cfg["limits"]["max_tokens"])
 
     def timeout_for(self, role: str | None) -> float:
@@ -349,6 +412,10 @@ class ModelRouter:
         by_role = self.cfg["limits"].get("timeout_seconds_by_role") or {}
         if role is not None and role in by_role:
             return float(by_role[role])
+        if role == "e2e":
+            for fallback_role in ("fixer", "judge", "researcher"):
+                if fallback_role in by_role:
+                    return float(by_role[fallback_role])
         return float(self.cfg["limits"].get("timeout_seconds", 90))
 
     def models_for(self, role: str, *, fallback_role: str | None = None) -> list[str]:
@@ -428,6 +495,31 @@ class ModelRouter:
         if role is not None and isinstance(backends.get(role), dict):
             return dict(backends[role])
         return {"type": "openrouter"}
+
+    def supervisor_reviewers(self) -> list[dict[str, Any]]:
+        """Return normalized supervisor reviewer configs (multi-reviewer or flat single)."""
+        cfg = self.backend_for("supervisor")
+        raw_reviewers = cfg.get("reviewers")
+        if isinstance(raw_reviewers, list) and raw_reviewers:
+            normalized: list[dict[str, Any]] = []
+            for idx, entry in enumerate(raw_reviewers):
+                item = dict(entry)
+                item["name"] = str(
+                    item.get("name")
+                    or item.get("provider")
+                    or item.get("model")
+                    or f"reviewer-{idx + 1}"
+                ).strip()
+                normalized.append(item)
+            return normalized
+        single = dict(cfg)
+        single["name"] = str(
+            single.get("name")
+            or single.get("provider")
+            or single.get("model")
+            or "supervisor"
+        ).strip()
+        return [single]
 
     def skills_config(self) -> dict[str, Any]:
         """Return parsed `skills` configuration mapping, or empty dict when omitted."""
@@ -535,6 +627,9 @@ class ModelRouter:
         except TokenBudgetExceededError:
             raise
         except Exception as exc:
+            # A failed run may still have been billed (e.g. Claude Code stopped by
+            # --max-budget-usd); adapters attach what the harness reported.
+            failed_usage: dict[str, Any] = dict(getattr(exc, "usage", None) or {})
             self.record_harness_call(
                 role=role or "unknown",
                 requested_model=target_model,
@@ -542,9 +637,14 @@ class ModelRouter:
                 harness=provider,
                 harness_version=None,
                 elapsed_ms=round((time.monotonic() - started) * 1000, 1),
-                cost_usd=None,
-                cost_source="unavailable",
-                usage_reported=False,
+                prompt_tokens=int(failed_usage.get("prompt_tokens") or 0),
+                completion_tokens=int(failed_usage.get("completion_tokens") or 0),
+                cached_tokens=int(failed_usage.get("cached_tokens") or 0),
+                reasoning_tokens=int(failed_usage.get("reasoning_tokens") or 0),
+                total_tokens=int(failed_usage.get("total_tokens") or 0),
+                cost_usd=failed_usage.get("cost_usd"),
+                cost_source=str(failed_usage.get("cost_source") or "unavailable"),
+                usage_reported=bool(failed_usage.get("usage_reported")),
                 error=f"{type(exc).__name__}: {exc}",
             )
             if isinstance(exc, HarnessError) and backend.get("fallback") == "router":
@@ -564,10 +664,11 @@ class ModelRouter:
         *,
         role: str | None = None,
         json_schema: dict[str, Any] | None = None,
+        use_harness: bool = True,
     ) -> tuple[str, str]:
         """Dispatch structured JSON request with optional JSON Schema enforcement for harnesses."""
         backend = self.backend_for(role)
-        if backend.get("type") == "harness":
+        if use_harness and backend.get("type") == "harness":
             return await self._complete_with_harness(
                 backend, model, system, user, role=role, json_schema=json_schema
             )

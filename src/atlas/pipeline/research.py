@@ -1,5 +1,6 @@
 import asyncio
 import logging
+import time
 from typing import Any
 
 from atlas.router import ModelRouter
@@ -18,29 +19,6 @@ async def research(router: ModelRouter, spec: ParsedSpec) -> ResearchReport:
         f"Assumptions: {spec.assumptions}\n"
     )
 
-    async def one(req: Requirement, model: str) -> ResearchNote:
-        user = (
-            f"{context}\nRequirement {req.id}: {req.title}\n{req.description}\n"
-            f"Acceptance criteria: {req.acceptance_criteria}\n"
-            "Return structured JSON matching the research schema."
-        )
-
-        def attach_metadata(data: dict[str, Any], used_model: str) -> dict[str, Any]:
-            data["requirement_id"] = req.id
-            data["model"] = used_model
-            return data
-
-        _, note = await complete_json_model(
-            router,
-            model=model,
-            role="researcher",
-            system=system,
-            user=user,
-            schema=ResearchNote,
-            postprocess=attach_metadata,
-        )
-        return note
-
     # When a provider is down (e.g. no credit), several researcher models can fall back to the
     # same model. Asking one model the same question three times only triples the tokens.
     configured = router.models_for("researcher")
@@ -56,6 +34,56 @@ async def research(router: ModelRouter, spec: ParsedSpec) -> ResearchReport:
     targets: list[tuple[Requirement, str]] = [
         (req, model) for req in spec.requirements for model in models
     ]
+    total = len(targets)
+    completed = 0
+
+    async def one(req: Requirement, model: str) -> ResearchNote:
+        nonlocal completed
+        started = time.monotonic()
+        user = (
+            f"{context}\nRequirement {req.id}: {req.title}\n{req.description}\n"
+            f"Acceptance criteria: {req.acceptance_criteria}\n"
+            "Return structured JSON matching the research schema."
+        )
+
+        def attach_metadata(data: dict[str, Any], used_model: str) -> dict[str, Any]:
+            data["requirement_id"] = req.id
+            data["model"] = used_model
+            return data
+
+        try:
+            used_model, note = await complete_json_model(
+                router,
+                model=model,
+                role="researcher",
+                system=system,
+                user=user,
+                schema=ResearchNote,
+                postprocess=attach_metadata,
+            )
+        except Exception as exc:
+            completed += 1
+            logger.info(
+                "[research] %d/%d FAILED: %s (%s, %.1fs)",
+                completed,
+                total,
+                req.id,
+                type(exc).__name__,
+                time.monotonic() - started,
+            )
+            raise
+        completed += 1
+        logger.info(
+            "[research] %d/%d done: %s — %s (%s, %.1fs)",
+            completed,
+            total,
+            req.id,
+            req.title[:50],
+            used_model,
+            time.monotonic() - started,
+        )
+        return note
+
     results = await asyncio.gather(
         *(one(req, model) for req, model in targets),
         return_exceptions=True,

@@ -1,6 +1,7 @@
 # Hybrid local-first harness profile for macOS builds:
 #   - Parser & Researcher: Google Antigravity CLI (`agy`, fallback to `ModelRouter`)
-#   - Judge (& optional Supervisor): Claude Code (`claude`, strictly read-only)
+#   - Judge: Claude Code (`claude`, Opus 5.5, strictly read-only)
+#   - Dual Post-Build Supervisor: Claude Opus (`claude_code`) + Gemini 4 Neon (`agy`, fallback OpenRouter)
 #   - Builder: Local model only via Antigravity Python SDK (`LocalOpenAIAgentConfig.lightweight()`)
 #   - Fixer: Alternating OpenRouter models via `ModelRouter`
 #
@@ -13,6 +14,8 @@ roles:
   parser: [openrouter/google/gemini-4-hydrogen]
   researcher: [openrouter/google/gemini-4-neon]
   judge: [openrouter/anthropic/claude-opus-5.5]
+  e2e: [openrouter/google/gemini-4-neon]
+  supervisor: [openrouter/google/gemini-4-neon]
   builder: [openrouter/google/gemini-4-hydrogen]
   fixer: [openrouter/anthropic/claude-sonnet-5.5]
 
@@ -20,6 +23,8 @@ role_fallbacks:
   parser: [gemini/gemini-4-hydrogen]
   researcher: [gemini/gemini-4-neon]
   judge: [openrouter/anthropic/claude-opus-5]
+  e2e: [openrouter/google/gemini-4-hydrogen, gemini/gemini-4-neon]
+  supervisor: [gemini/gemini-4-neon]
   fixer: [openrouter/openai/gpt-6.2-sol, openrouter/google/gemini-4-hydrogen]
 
 fallbacks: []
@@ -36,7 +41,7 @@ backends:
     type: harness
     provider: antigravity
     model: gemini-4-neon-high
-    timeout_seconds: 300
+    timeout_seconds: 420
     max_parallel: 3
     fallback: router
 
@@ -49,15 +54,35 @@ backends:
     max_budget_usd: 1.50
     timeout_seconds: 300
 
-  supervisor:
-    enabled: false
+  e2e:
     type: harness
-    provider: claude_code
-    model: opus
-    tools: [Read, Grep, Glob]
-    auth: subscription
-    max_budget_usd: 1.50
-    timeout_seconds: 300
+    provider: antigravity
+    model: gemini-4-neon-high
+    timeout_seconds: 600
+    fallback: router
+
+  supervisor:
+    enabled: true
+    mode: unanimous                   # unanimous | any_approve
+    reviewers:
+      - name: opus
+        type: harness
+        provider: claude_code
+        model: opus
+        tools: [Read, Grep, Glob]
+        auth: subscription
+        max_budget_usd: 1.50
+        timeout_seconds: 300
+        # Add `fallback: router` + `router_model: openrouter/anthropic/claude-opus-5.5`
+        # if `claude` CLI is unavailable on PATH.
+      - name: neon
+        type: harness
+        provider: antigravity
+        model: gemini-4-neon-high
+        timeout_seconds: 300
+        fallback: router
+        router_model: openrouter/google/gemini-4-neon
+        # Or set `type: openrouter` + `model: openrouter/google/gemini-4-neon` directly.
 
   builder:
     type: local_harness
@@ -65,11 +90,11 @@ backends:
     local_providers:
       ollama: http://localhost:11434/v1
       lm_studio: http://localhost:1234/v1
-    local_model: gpt-oss:20b
-    preferred: [gpt-oss:20b, gemma4:26b]
+    local_model: null
+    preferred: [google/gemma-4-26b-a4b-qat, gemma-4-26b-a4b-it-qat-mlx-4bit, gemma4:12b-mlx, gemma4:12b]
     require_tools: true
-    min_context_tokens: 64000
-    memory_budget_fraction: 0.70
+    min_context_tokens: 32768
+    memory_budget_fraction: 0.78
     require_tool_smoke_check: true
     timeout_seconds: 1800
     sandbox: true
@@ -97,13 +122,16 @@ limits:
   max_parallel_calls: 6
   max_tokens: 6000
   max_tokens_by_role:
-    researcher: 12000
+    researcher: 24000
     judge: 16000
-    fixer: 16000
+    e2e: 32000
+    builder: 32000
+    fixer: 24000
   timeout_seconds: 90
   timeout_seconds_by_role:
-    researcher: 180
+    researcher: 240
     judge: 300
+    e2e: 300
     builder: 1800
     fixer: 300
   attempts_per_model: 2
@@ -119,3 +147,4 @@ limits_extra:
 verification:
   require_requirement_tests: true
   require_product_contract: true
+  require_e2e_tests: true

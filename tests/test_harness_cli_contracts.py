@@ -762,7 +762,11 @@ def _fake_sdk(monkeypatch: pytest.MonkeyPatch, agent_cls: type) -> None:
     modules = {
         "google.antigravity": SimpleNamespace(Agent=agent_cls, LocalOpenAIAgentConfig=FakeConfig),
         "google.antigravity.hooks": SimpleNamespace(
-            policy=SimpleNamespace(workspace_only=lambda paths: [], auto=lambda: None)
+            policy=SimpleNamespace(
+                workspace_only=lambda paths: [],
+                deny=lambda *a, **kw: None,
+                allow_all=lambda: None,
+            )
         ),
     }
     real_import = __import__("importlib").import_module
@@ -844,12 +848,68 @@ def test_installed_antigravity_sdk_matches_what_the_adapter_calls():
     sdk_types = importlib.import_module("google.antigravity.types")
 
     assert "workspaces" in inspect.signature(policy.workspace_only).parameters
-    assert callable(policy.auto)
+    assert callable(policy.allow_all)
+    assert callable(policy.deny)
     fields = set(sdk.LocalOpenAIAgentConfig.model_fields)
-    assert {"model", "base_url", "workspaces", "policies", "skills_paths"} <= fields
+    assert {"model", "base_url", "workspaces", "policies", "skills_paths", "save_dir"} <= fields
     assert callable(sdk.LocalOpenAIAgentConfig.lightweight)
     lightweight_tools = {t.name for t in sdk.BuiltinTools.minimal()}
     assert {"RUN_COMMAND", "VIEW_FILE", "CREATE_FILE", "EDIT_FILE"} <= lightweight_tools
+    rules = [
+        *policy.workspace_only(["/tmp/ws"]),
+        policy.deny("run_command", when=lambda args: False, name="workspace_cwd"),
+        policy.allow_all(),
+    ]
+    if hasattr(policy, "_to_policy_config_proto"):
+        proto, dyn = policy._to_policy_config_proto(rules)
+        assert proto.auto_config.enabled is False
+        assert proto.workspace_containment != 2  # WORKSPACE_CONTAINMENT_DISABLED
+        assert len(dyn) == 1
+    else:
+        policy.enforce(rules)
+    cfg = sdk.LocalOpenAIAgentConfig(
+        model="gemma4:12b",
+        base_url="http://localhost:11434/v1",
+        workspaces=["/tmp/ws"],
+        policies=rules,
+        capabilities=sdk_types.CapabilitiesConfig(
+            run_command_config=sdk_types.RunCommandConfig(
+                enable_daemons=False,
+                timeout_seconds=60.0,
+                enable_sandbox=True,
+            )
+        ),
+    ).lightweight()
+    assert cfg.capabilities.run_command_config.enable_sandbox is True
+    assert {t.name for t in cfg.capabilities.enabled_tools} == {
+        "RUN_COMMAND",
+        "VIEW_FILE",
+        "CREATE_FILE",
+        "EDIT_FILE",
+    }
+    # Default local builder: file tools only, shell denied by a static rule.
+    no_shell = [
+        *policy.workspace_only(["/tmp/ws"]),
+        policy.deny("run_command", name="no_shell"),
+        policy.allow_all(),
+    ]
+    if hasattr(policy, "_to_policy_config_proto"):
+        proto, dyn = policy._to_policy_config_proto(no_shell)
+        assert proto.auto_config.enabled is False and dyn == {}
+    file_only = sdk.LocalOpenAIAgentConfig(
+        model="gemma4:12b",
+        base_url="http://localhost:11434/v1",
+        workspaces=["/tmp/ws"],
+        policies=no_shell,
+        capabilities=sdk_types.CapabilitiesConfig(
+            disabled_tools=[sdk_types.BuiltinTools.RUN_COMMAND]
+        ),
+    ).lightweight()
+    assert {t.name for t in file_only.capabilities.enabled_tools} == {
+        "VIEW_FILE",
+        "CREATE_FILE",
+        "EDIT_FILE",
+    }
     assert hasattr(sdk.Agent, "__aenter__") and callable(sdk.Agent.chat)
     assert inspect.iscoroutinefunction(sdk_types.ChatResponse.text)
     assert isinstance(inspect.getattr_static(sdk_types.ChatResponse, "usage_metadata"), property)

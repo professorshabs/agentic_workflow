@@ -8,6 +8,7 @@ import importlib
 import importlib.metadata
 import importlib.util
 import json
+import logging
 import os
 import shutil
 import tempfile
@@ -553,6 +554,37 @@ async def _cancel_quietly(task: asyncio.Future[Any], grace_seconds: float = 10.0
         await asyncio.wait_for(task, timeout=grace_seconds)
 
 
+logger = logging.getLogger("atlas.harnesses.antigravity")
+
+
+def _is_command_outside_workspace(
+    resolved_app_dir: Path,
+    args: Any,
+    *,
+    require_sandbox: bool = False,
+) -> bool:
+    """Return True when a `run_command` invocation sets a `Cwd` outside `resolved_app_dir`."""
+    if not isinstance(args, dict):
+        return True
+    if require_sandbox and args.get("BypassSandbox"):
+        return True
+    raw_cwd = args.get("Cwd")
+    if raw_cwd is None:
+        return False
+    if not isinstance(raw_cwd, str) or not raw_cwd.strip():
+        return True
+    cwd_path = Path(raw_cwd)
+    try:
+        resolved_cwd = (
+            cwd_path.resolve()
+            if cwd_path.is_absolute()
+            else (resolved_app_dir / cwd_path).resolve()
+        )
+    except OSError:
+        return True
+    return resolved_cwd != resolved_app_dir and resolved_app_dir not in resolved_cwd.parents
+
+
 class AntigravitySDKAdapter:
     """Google Antigravity Python SDK adapter for local Ollama / LM Studio execution."""
 
@@ -598,6 +630,8 @@ class AntigravitySDKAdapter:
         prompt_text: str,
         app_dir: Path,
         timeout_seconds: float = 600.0,
+        sandbox: bool = True,
+        allow_shell: bool = False,
         skill_dirs: list[Path] | None = None,
         stall_seconds: float | None = None,
         stall_poll_seconds: float = 10.0,
@@ -607,7 +641,53 @@ class AntigravitySDKAdapter:
         Gives up after `timeout_seconds` overall, or earlier when `stall_seconds` is set and
         no file in the workspace changes for that long (a small model stuck in a loop), so
         the caller can hand the build to a stronger model quickly.
+
+        The agent gets file tools only unless `allow_shell` is set. Its run records (the SDK's
+        SQLite trajectory) are deleted when it changes files, and kept, with their folder
+        logged, when it fails or writes nothing, so the attempt can be examined afterwards.
         """
+        records_dir = tempfile.mkdtemp(prefix="atlas-sdk-")
+        keep_records = True
+        try:
+            build, call = await self._run_workspace_task(
+                candidate=candidate,
+                prompt_text=prompt_text,
+                app_dir=app_dir,
+                timeout_seconds=timeout_seconds,
+                sandbox=sandbox,
+                allow_shell=allow_shell,
+                skill_dirs=skill_dirs,
+                stall_seconds=stall_seconds,
+                stall_poll_seconds=stall_poll_seconds,
+                records_dir=records_dir,
+            )
+            keep_records = not (build.created_files or build.modified_files or build.deleted_files)
+            return build, call
+        finally:
+            records = Path(records_dir)
+            if keep_records and records.is_dir() and any(records.iterdir()):
+                logger.warning(
+                    "[build] Kept the local agent's records of this attempt in %s "
+                    "(SQLite trajectory; delete the folder when done).",
+                    records_dir,
+                )
+            else:
+                shutil.rmtree(records_dir, ignore_errors=True)
+
+    async def _run_workspace_task(
+        self,
+        *,
+        candidate: LocalModelCandidate,
+        prompt_text: str,
+        app_dir: Path,
+        timeout_seconds: float,
+        sandbox: bool,
+        allow_shell: bool,
+        skill_dirs: list[Path] | None,
+        stall_seconds: float | None,
+        stall_poll_seconds: float,
+        records_dir: str,
+    ) -> tuple[WorkspaceBuildResult, HarnessInvocationResult]:
         version = self.package_version()
         if version is None:
             raise HarnessUnavailableError(
@@ -624,10 +704,36 @@ class AntigravitySDKAdapter:
         before_hashes = snapshot_file_hashes(resolved_app_dir)
         before_git = snapshot_git_status(resolved_app_dir)
 
-        policies = [
-            *hooks.policy.workspace_only([str(resolved_app_dir)]),
-            hooks.policy.auto(),
-        ]
+        # No `policy.auto()`: with a local model it sends a "policy guardian" prompt to that
+        # same model before every shell command (minutes each), and it does not allow file
+        # tools, so they fail closed. `workspace_only` + `allow_all` allows file tools inside
+        # the product folder only. Shell commands are off unless `allow_shell` is set.
+        workspace_rules = hooks.policy.workspace_only([str(resolved_app_dir)])
+        if allow_shell:
+            require_sandbox = bool(sandbox)
+            deny_reason = (
+                f"Commands must run sandboxed with Cwd inside '{resolved_app_dir}'."
+                if require_sandbox
+                else f"Commands must execute with Cwd inside '{resolved_app_dir}'."
+            )
+            shell_rule = hooks.policy.deny(
+                "run_command",
+                when=lambda args: _is_command_outside_workspace(
+                    resolved_app_dir, args, require_sandbox=require_sandbox
+                ),
+                name="workspace_cwd",
+                reason=deny_reason,
+            )
+        else:
+            shell_rule = hooks.policy.deny(
+                "run_command",
+                name="no_shell",
+                reason=(
+                    "Shell commands are turned off for the local builder. Use the file tools; "
+                    "Atlas runs the tests after you finish."
+                ),
+            )
+        policies = [*workspace_rules, shell_rule, hooks.policy.allow_all()]
         config_kwargs: dict[str, Any] = {
             "model": candidate.name,
             "base_url": candidate.base_url,
@@ -636,8 +742,33 @@ class AntigravitySDKAdapter:
         }
         if skill_dirs:
             config_kwargs["skills_paths"] = [str(p.resolve()) for p in skill_dirs]
+        sdk_types = getattr(sdk, "types", None)
+        if (
+            not allow_shell
+            and sdk_types is not None
+            and hasattr(sdk_types, "CapabilitiesConfig")
+            and hasattr(sdk_types, "BuiltinTools")
+        ):
+            # Hide the shell tool so the model never spends a turn on it; `.lightweight()`
+            # keeps its other minimal tools (view, create, edit file).
+            config_kwargs["capabilities"] = sdk_types.CapabilitiesConfig(
+                disabled_tools=[sdk_types.BuiltinTools.RUN_COMMAND]
+            )
+        elif (
+            allow_shell
+            and sdk_types is not None
+            and hasattr(sdk_types, "CapabilitiesConfig")
+            and hasattr(sdk_types, "RunCommandConfig")
+        ):
+            cmd_timeout = min(max(float(timeout_seconds), 5.0), 120.0)
+            config_kwargs["capabilities"] = sdk_types.CapabilitiesConfig(
+                run_command_config=sdk_types.RunCommandConfig(
+                    enable_daemons=False,
+                    timeout_seconds=cmd_timeout,
+                    enable_sandbox=bool(sandbox),
+                )
+            )
 
-        cfg = LocalOpenAIAgentConfig(**config_kwargs).lightweight()
         started = time.monotonic()
         prev_cwd = Path.cwd()
         response_text = ""
@@ -645,6 +776,8 @@ class AntigravitySDKAdapter:
         try:
             os.chdir(resolved_app_dir)
             with _credentials_hidden_from_children():
+                config_kwargs["save_dir"] = records_dir
+                cfg = LocalOpenAIAgentConfig(**config_kwargs).lightweight()
                 async with Agent(cfg) as agent:
 
                     async def _converse() -> tuple[str, Any]:

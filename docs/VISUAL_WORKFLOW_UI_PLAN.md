@@ -53,8 +53,8 @@ flowchart LR
     Runner -->|"Typed stage/progress/check events"| Bus
     Bus -->|"Ordered append"| JSONL["runs/&lt;run-id&gt;/events.jsonl"]
     Bus -->|"Fan-out / replay by seq"| SSE["GET /api/events (SSE)"]
-    UISrv -->|"GET / & GET /api/state"| Browser["Browser Workflow UI (DAG + Inspector + Logs)"]
-    SSE -->|"Live events + final client snapshot"| Browser
+    UISrv -->|"GET / & GET /api/info"| Browser["Browser Workflow UI (DAG + Inspector + Logs)"]
+    SSE -->|"Live events + final event: end"| Browser
     ArtifactAPI["GET /api/artifact/&lt;name&gt; (allowlisted)"] -->|"Read-only artifacts"| UISrv
 ```
 
@@ -263,10 +263,10 @@ Progress payloads carry stable correlation fields such as `requirement_id`, `rou
 | Method & Path | Response Type | Purpose & Safety |
 | :--- | :--- | :--- |
 | `GET /` | `text/html; charset=utf-8` | Serves self-contained `src/atlas/ui/static/index.html` dashboard. |
-| `GET /api/state` | `application/json` | Materialized state snapshot plus `as_of_seq` cursor (also loads `events.jsonl` / supported legacy artifacts in replay mode). |
-| `GET /api/events?after=<seq>` | `text/event-stream` | Live Server-Sent Events stream with `Last-Event-ID` catch-up, bounded subscriber queues, and 15s keepalive heartbeats. Reconnect replay fills any queue gap. |
-| `GET /api/artifact/<name>` | `application/json` or `text/markdown` | Strict allowlist only: `manifest.json`, `spec.json`, `research.json`, `clarifications.json`, `plan.json`, `plan.md`, `e2e_tests.json`, `build.json` summary, `verification.json`, `supervisor_review.json`, `tokens.json`, `report.md`. Rejects traversal and never serves `.env` or files outside the selected run. Full generated files use a separate read-only route with relative-path validation under the manifest's `app_dir`, explicit file selection, and a response-size cap. |
-| `GET /api/app-file/<relative-path>` | `text/plain` or safe text type | Reads only an explicitly selected file under the run manifest's `app_dir`; rejects traversal/symlink escape and caps response size. No directory listing or write route. |
+| `GET /api/info` | `application/json` | Run metadata, mode (`live` / `replay`), run ID, spec path, and UI version info. |
+| `GET /api/events?after=<seq>` | `text/event-stream` | Ordered Server-Sent Events stream from `seq` 1 (or `Last-Event-ID`), bounded subscriber queues, 15s keepalive heartbeats, and `event: end` on finish. |
+| `GET /api/artifact/<name>` | `application/json` or `text/markdown` | Strict allowlist only: `manifest.json`, `spec.json`, `research.json`, `clarifications.json`, `plan.json`, `plan.md`, `e2e_tests.json`, `build.json`, `verification.json`, `supervisor_review.json`, `tokens.json`, `report.md`, `events.jsonl`. Rejects traversal/non-regular files, redacts secrets, and caps payload size. |
+| `GET /api/app-file/<relative-path>` *(deferred)* | — | Deferred past v1 (see Review table at top); generated file inspection uses `build.json` / workspace snapshots in v1. |
 
 ---
 

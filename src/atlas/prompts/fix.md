@@ -9,6 +9,9 @@ Rules:
 4. Ensure at least one file is added/updated or deleted.
 5. If the `spec-coverage` check failed, add real tests for the listed requirement IDs and put each
    ID in the test name or a comment next to the test (for example `# R002`).
+6. You cannot execute shell commands; every fix must be returned directly as text file contents in `files`. Include only files that actually change, and do not attempt to hand-encode large binary image/media blobs inside JSON.
+7. Never modify or delete any path listed in `protected_files` (authoritative black-box E2E product tests); fix the application code so those tests pass instead.
+8. Paths in `partial_files` exist but were shown cut short or not at all (too large, or not text). Never return a full replacement for them: you would erase the part you cannot see. Change other files instead.
 
 Return ONLY JSON matching this exact schema:
 {

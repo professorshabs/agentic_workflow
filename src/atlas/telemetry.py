@@ -4,6 +4,8 @@ from __future__ import annotations
 
 import json
 import os
+import re
+from collections.abc import Mapping
 from pathlib import Path
 from typing import Any
 
@@ -98,6 +100,105 @@ def extract_usage_metrics(response: Any) -> dict[str, Any]:
 
 
 _VALID_COST_SOURCES = {"reported", "estimated", "subscription", "local_free", "unavailable"}
+
+# ---------------------------------------------------------------------------
+# API-equivalent cost: what a call would cost at pay-per-token API prices
+# ---------------------------------------------------------------------------
+
+_EFFORT_SUFFIX_RE = re.compile(r"-(?:minimal|low|medium|high|xhigh|max)$")
+
+
+def _price_names(model: str) -> list[str]:
+    """`openrouter/google/gemini-4-neon-high` -> itself, `gemini-4-neon-high`, `gemini-4-neon`."""
+    name = model.strip().lower()
+    base = name.rsplit("/", 1)[-1]
+    plain = _EFFORT_SUFFIX_RE.sub("", base)
+    return list(dict.fromkeys(n for n in (name, base, plain, plain.replace(".", "-")) if n))
+
+
+def _litellm_price(names: list[str]) -> dict[str, float] | None:
+    try:
+        table = litellm.model_cost
+    except Exception:  # pragma: no cover - defensive: LiteLLM without a price map
+        return None
+    for name in names:
+        for key in (name, f"gemini/{name}", f"openrouter/google/{name}", f"anthropic/{name}",
+                    f"openrouter/anthropic/{name}"):
+            entry = table.get(key)
+            if not isinstance(entry, dict):
+                continue
+            inp = _as_float(entry.get("input_cost_per_token"))
+            out = _as_float(entry.get("output_cost_per_token"))
+            if inp is None or out is None:
+                continue
+            cache = _as_float(entry.get("cache_read_input_token_cost"))
+            return {"input": inp, "output": out, "cache_read": cache if cache is not None else inp}
+    return None
+
+
+def price_per_token(
+    model: str, prices: Mapping[str, Mapping[str, Any]] | None = None
+) -> dict[str, float] | None:
+    """USD per token (input, output, cache_read) from the config's `pricing` (per 1M tokens),
+    else LiteLLM's built-in price map; None when the model is in neither."""
+    names = _price_names(model)
+    table = {str(k).strip().lower(): v for k, v in (prices or {}).items()}
+    for name in names:
+        row = table.get(name)
+        if isinstance(row, Mapping):
+            inp = _as_float(row.get("input"))
+            out = _as_float(row.get("output"))
+            if inp is None or out is None:
+                continue
+            cache = _as_float(row.get("cache_read"))
+            return {
+                "input": inp / 1_000_000,
+                "output": out / 1_000_000,
+                "cache_read": (cache if cache is not None else inp) / 1_000_000,
+            }
+    return _litellm_price(names)
+
+
+def api_equivalent_cost(
+    entry: Mapping[str, Any], prices: Mapping[str, Mapping[str, Any]] | None = None
+) -> tuple[float | None, str | None]:
+    """Estimate one call's cost at pay-per-token API prices, and say where it came from.
+
+    `billed` (the call was billed: its real cost), `local` (free, on this machine), `harness`
+    (the harness's own API-price figure, e.g. Claude Code on a subscription) or `price_list`
+    (tokens x price per token). Cached prompt tokens use the cache-read price, and thinking
+    tokens counted outside `completion_tokens` are priced as output.
+    """
+    cost = _as_float(entry.get("cost_usd"))
+    source = str(entry.get("cost_source") or "").strip().lower()
+    if cost is not None and source in ("reported", "estimated"):
+        return round(cost, 6), "billed"
+    if source == "local_free":
+        return 0.0, "local"
+    own = _as_float(entry.get("api_cost_usd"))
+    if own is not None and own >= 0:
+        return round(own, 6), "harness"
+    prompt = _as_int(entry.get("prompt_tokens"))
+    completion = _as_int(entry.get("completion_tokens"))
+    total = _as_int(entry.get("total_tokens"))
+    if prompt + completion + total <= 0:
+        return None, None
+    price = None
+    for model in (entry.get("used_model"), entry.get("requested_model")):
+        if model:
+            price = price_per_token(str(model), prices)
+            if price is not None:
+                break
+    if price is None:
+        return None, None
+    cached = min(_as_int(entry.get("cached_tokens")), prompt)
+    output = max(completion, total - prompt)
+    estimate = (
+        (prompt - cached) * price["input"]
+        + cached * price["cache_read"]
+        + output * price["output"]
+    )
+    return round(estimate, 6), "price_list"
 _VALID_AUTH_MODES = {"subscription", "oauth_token", "api_key", "cached_login", "local", "unknown"}
 
 
@@ -143,6 +244,8 @@ def _normalize_call(raw: dict[str, Any]) -> ModelCallRecord:
         total_tokens=total_tokens,
         cost_usd=cost_usd,
         cost_source=cost_source,  # type: ignore[arg-type]
+        api_cost_usd=_as_float(raw.get("api_cost_usd")),
+        api_cost_source=str(raw["api_cost_source"]) if raw.get("api_cost_source") else None,
         usage_reported=usage_reported,
         timestamp=raw.get("timestamp"),
         error=str(raw["error"]) if raw.get("error") else None,
@@ -159,6 +262,7 @@ def _aggregate_buckets(
     buckets: list[UsageBucket] = []
     for name, items in grouped.items():
         costs = [r.cost_usd for r in items if r.cost_usd is not None]
+        api_costs = [r.api_cost_usd for r in items if r.api_cost_usd is not None]
         buckets.append(
             UsageBucket(
                 name=name,
@@ -169,6 +273,7 @@ def _aggregate_buckets(
                 reasoning_tokens=sum(r.reasoning_tokens for r in items),
                 total_tokens=sum(r.total_tokens for r in items),
                 cost_usd=round(sum(costs), 6) if costs else None,
+                api_cost_usd=round(sum(api_costs), 6) if api_costs else None,
                 elapsed_ms=round(sum(r.elapsed_ms for r in items), 1),
             )
         )
@@ -179,6 +284,7 @@ def summarize_usage(call_log: list[dict[str, Any]]) -> TokenUsageSummary:
     """Aggregate token, cost, and latency metrics across model calls."""
     records = [_normalize_call(entry) for entry in call_log]
     costs = [r.cost_usd for r in records if r.cost_usd is not None]
+    api_costs = [r.api_cost_usd for r in records if r.api_cost_usd is not None]
     return TokenUsageSummary(
         total_calls=len(records),
         prompt_tokens=sum(r.prompt_tokens for r in records),
@@ -191,6 +297,8 @@ def summarize_usage(call_log: list[dict[str, Any]]) -> TokenUsageSummary:
         unreported_usage_calls=sum(1 for r in records if not r.usage_reported),
         unpriced_calls=sum(1 for r in records if r.cost_usd is None),
         failed_calls=sum(1 for r in records if r.error),
+        api_cost_usd=round(sum(api_costs), 6) if api_costs else None,
+        api_unestimated_calls=sum(1 for r in records if r.api_cost_usd is None),
         by_stage=_aggregate_buckets(records, lambda r: r.role),
         by_model=_aggregate_buckets(records, lambda r: r.used_model),
         calls=records,
@@ -215,6 +323,7 @@ def render_token_report_md(summary: TokenUsageSummary) -> str:
         f"| Reasoning tokens | {summary.reasoning_tokens:,} |",
         f"| **Total tokens** | **{summary.total_tokens:,}** |",
         f"| Estimated cost (USD) | {_fmt_cost(summary.cost_usd)} |",
+        f"| API-equivalent cost (estimate, USD) | {_fmt_cost(summary.api_cost_usd)} |",
         f"| Total LLM latency | {summary.elapsed_ms:,.1f} ms |",
     ]
 
@@ -223,14 +332,15 @@ def render_token_report_md(summary: TokenUsageSummary) -> str:
             "",
             "### By stage",
             "",
-            "| Stage | Calls | Prompt | Completion | Total | Est. Cost | Time |",
-            "| :--- | ---: | ---: | ---: | ---: | ---: | ---: |",
+            "| Stage | Calls | Prompt | Completion | Total | Est. Cost | API est. | Time |",
+            "| :--- | ---: | ---: | ---: | ---: | ---: | ---: | ---: |",
         ])
         for bucket in summary.by_stage:
             lines.append(
                 f"| `{bucket.name}` | {bucket.calls} | {bucket.prompt_tokens:,} | "
                 f"{bucket.completion_tokens:,} | {bucket.total_tokens:,} | "
-                f"{_fmt_cost(bucket.cost_usd)} | {bucket.elapsed_ms:,.1f} ms |"
+                f"{_fmt_cost(bucket.cost_usd)} | {_fmt_cost(bucket.api_cost_usd)} | "
+                f"{bucket.elapsed_ms:,.1f} ms |"
             )
 
     if summary.by_model:
@@ -238,14 +348,14 @@ def render_token_report_md(summary: TokenUsageSummary) -> str:
             "",
             "### By model",
             "",
-            "| Model | Calls | Prompt | Completion | Total | Est. Cost |",
-            "| :--- | ---: | ---: | ---: | ---: | ---: |",
+            "| Model | Calls | Prompt | Completion | Total | Est. Cost | API est. |",
+            "| :--- | ---: | ---: | ---: | ---: | ---: | ---: |",
         ])
         for bucket in summary.by_model:
             lines.append(
                 f"| `{bucket.name}` | {bucket.calls} | {bucket.prompt_tokens:,} | "
                 f"{bucket.completion_tokens:,} | {bucket.total_tokens:,} | "
-                f"{_fmt_cost(bucket.cost_usd)} |"
+                f"{_fmt_cost(bucket.cost_usd)} | {_fmt_cost(bucket.api_cost_usd)} |"
             )
 
     if summary.failed_calls > 0:
@@ -267,6 +377,20 @@ def render_token_report_md(summary: TokenUsageSummary) -> str:
             "",
             f"> Note: {summary.unpriced_calls} call(s) had unavailable or subscription-billed "
             "USD cost, so reported USD totals are partial.",
+        ])
+
+    if summary.api_cost_usd is not None:
+        missing = (
+            f" {summary.api_unestimated_calls} call(s) had no price, so it is a lower bound."
+            if summary.api_unestimated_calls
+            else ""
+        )
+        lines.extend([
+            "",
+            "> API-equivalent cost is an estimate of what this run would cost on pay-per-token "
+            "APIs: billed calls at their real cost, Claude Code calls at Claude Code's own "
+            "figure, other subscription calls at tokens x list price (config `pricing`, else "
+            f"LiteLLM's price map). It is not a charge.{missing}",
         ])
 
     return "\n".join(lines)
@@ -319,6 +443,7 @@ def ledger_entry(
         "reasoning_tokens": summary.reasoning_tokens,
         "total_tokens": summary.total_tokens,
         "cost_usd": summary.cost_usd,
+        "api_cost_usd": summary.api_cost_usd,
         "unreported_usage_calls": summary.unreported_usage_calls,
         "unpriced_calls": summary.unpriced_calls,
         "failed_calls": summary.failed_calls,

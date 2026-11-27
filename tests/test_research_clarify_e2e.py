@@ -561,14 +561,16 @@ verification:
         self, *, candidate, prompt_text, app_dir, timeout_seconds=600.0, skill_dirs=None
     ):
         seen_prompts.append(prompt_text)
-        # PLAN.md and authoritative E2E test file must ALREADY exist before Builder runs!
-        assert (app_dir / "PLAN.md").is_file()
+        # The brief and the authoritative E2E test file must ALREADY exist before the local
+        # builder runs; the full PLAN.md is kept away from the small model until it is done.
+        assert (app_dir / "BUILD_BRIEF.md").is_file()
+        assert not (app_dir / "PLAN.md").exists()
         assert (app_dir / "tests" / "test_e2e_product.py").is_file()
         assert skill_dirs == [app_dir.resolve() / ".agents" / "skills"]
         # Lean prompt: no full skill body or full E2E source inline!
         assert "UNIQUE_BODY_MARKER_NEVER_IN_PROMPT" not in prompt_text
         assert "EXPECTED_TAMPER_CHECK_TOKEN" not in prompt_text
-        assert "PLAN.md" in prompt_text
+        assert "BUILD_BRIEF.md" in prompt_text and "PLAN.md" not in prompt_text
         assert "tests/test_e2e_product.py" in prompt_text
         assert ".agents/skills/writing-clean-code/SKILL.md" in prompt_text
 
@@ -797,3 +799,183 @@ async def test_harness_yaml_e2e_role_limits_and_compact_e2e_prompt():
     assert "Check scenario for R001" in user_prompt
     assert "chosen-lib" in user_prompt
     assert len(user_prompt) < 15_000
+
+
+def test_e2e_sanitizer_and_sha256_integrity_guard(tmp_path):
+    from atlas.pipeline.build import materialize_files
+    from atlas.pipeline.e2e import sanitize_e2e_suite_files
+    from atlas.pipeline.verify import e2e_file_hashes
+
+    dirty = (
+        "import re\n\n"
+        "def test_case():\n"
+        "    assert re.search('abc', 'ABC', flags=re.I)\n"
+    )
+    suite = E2ETestSuite(
+        summary="Regex flag cleanup",
+        product_interface="app",
+        stack="python",
+        verifiable=True,
+        scenarios=["case"],
+        files=[GeneratedFile(path="tests/test_e2e_product.py", content=dirty)],
+    )
+    cleaned = sanitize_e2e_suite_files(suite)
+    assert "re.IGNORECASE" in cleaned.files[0].content
+    assert "re.I)" not in cleaned.files[0].content
+
+    app_dir = tmp_path / "app"
+    (app_dir / "tests").mkdir(parents=True)
+    target = app_dir / "tests" / "test_e2e_product.py"
+    target.write_text(cleaned.files[0].content, encoding="utf-8")
+
+    hashes = e2e_file_hashes(cleaned.files)
+    ok = check_e2e_tests(app_dir, ["tests/test_e2e_product.py"], expected_hashes=hashes)
+    assert ok.passed
+
+    target.write_text("def test_case():\n    assert True\n", encoding="utf-8")
+    tampered = check_e2e_tests(app_dir, ["tests/test_e2e_product.py"], expected_hashes=hashes)
+    assert not tampered.passed
+    assert "sha256 mismatch" in tampered.stderr
+
+    no_newline_suite = E2ETestSuite(
+        summary="No final newline",
+        product_interface="app",
+        stack="python",
+        verifiable=True,
+        scenarios=["preserve test integrity"],
+        files=[
+            GeneratedFile(
+                path="tests/test_no_newline.py",
+                content="def test_case():\n    assert True",
+            )
+        ],
+    )
+    no_newline_hashes = e2e_file_hashes(no_newline_suite.files)
+    materialize_files(app_dir, no_newline_suite.files)
+    intact = check_e2e_tests(
+        app_dir,
+        ["tests/test_no_newline.py"],
+        expected_hashes=no_newline_hashes,
+    )
+    assert intact.passed
+    missing_digest = check_e2e_tests(
+        app_dir,
+        ["tests/test_no_newline.py"],
+        expected_hashes={},
+    )
+    assert not missing_digest.passed
+    assert "no authoritative SHA-256" in missing_digest.stderr
+
+
+@pytest.mark.asyncio
+async def test_fix_loop_ignores_protected_e2e_patches_and_restores_suite(tmp_path, monkeypatch):
+    from atlas import runner as runner_mod
+    from atlas.schemas import CheckResult, GeneratedApp, PatchResult, Plan, ToolDecision
+
+    spec_file = tmp_path / "spec.md"
+    spec_file.write_text("# Demo\nA demo app\n", encoding="utf-8")
+    spec = ParsedSpec(
+        summary="Demo",
+        requirements=[Requirement(id="R001", title="Do", description="Do thing")],
+    )
+    e2e_content = "def test_r001_product():\n    assert True\n"
+    e2e_suite = E2ETestSuite(
+        summary="E2E suite",
+        product_interface="app",
+        stack="python",
+        verifiable=True,
+        scenarios=["check"],
+        files=[GeneratedFile(path="tests/test_e2e_product.py", content=e2e_content)],
+    )
+    from_run = tmp_path / "from_run"
+    from_run.mkdir()
+    (from_run / "spec.json").write_text(spec.model_dump_json(indent=2), encoding="utf-8")
+    (from_run / "plan.json").write_text(
+        Plan(
+            spec=spec,
+            decisions=[
+                ToolDecision(
+                    requirement_id="R001",
+                    options=[{"name": "stdlib"}, {"name": "alt"}],
+                    pick="stdlib",
+                    rationale="Standard library",
+                )
+            ],
+            risks=[],
+            tasks=["t"],
+        ).model_dump_json(indent=2),
+        encoding="utf-8",
+    )
+    (from_run / "e2e_tests.json").write_text(e2e_suite.model_dump_json(indent=2), encoding="utf-8")
+
+    cfg = tmp_path / "models.yaml"
+    cfg.write_text(
+        """
+roles:
+  parser: [openrouter/m]
+  researcher: [openrouter/m]
+  judge: [openrouter/m]
+  builder: [openrouter/m]
+  fixer: [openrouter/m]
+limits:
+  max_parallel_calls: 2
+  max_tokens: 1000
+  timeout_seconds: 10
+  max_fix_rounds: 1
+verification:
+  require_requirement_tests: false
+  require_product_contract: false
+  require_e2e_tests: true
+""".strip()
+        + "\n",
+        encoding="utf-8",
+    )
+
+    async def fake_build(*args, **kwargs):
+        return GeneratedApp(
+            summary="Built",
+            stack="python",
+            files=[GeneratedFile(path="app.py", content="ok = False\n", purpose="app")],
+        )
+
+    async def fake_verify(app_dir: Path):
+        ok = "ok = True" in (app_dir / "app.py").read_text(encoding="utf-8")
+        return (
+            "python",
+            [CheckResult(name="pytest", command="pytest", passed=ok, exit_code=0 if ok else 1)],
+        )
+
+    seen_protected: list[list[str] | None] = []
+
+    async def sneaky_fix(*args, protected_files=None, **kwargs):
+        seen_protected.append(protected_files)
+        return PatchResult(
+            diagnosis="Tried editing E2E test alongside app.py",
+            files=[
+                GeneratedFile(path="app.py", content="ok = True\n", purpose="fix app"),
+                GeneratedFile(
+                    path="tests/test_e2e_product.py",
+                    content="def test_weakened():\n    assert 1 == 1\n",
+                    purpose="weaken test",
+                ),
+            ],
+            delete_files=["tests/test_e2e_product.py"],
+        )
+
+    monkeypatch.setattr(runner_mod, "build_app", fake_build)
+    monkeypatch.setattr(runner_mod, "fix_app", sneaky_fix)
+
+    app_dir = tmp_path / "out_app"
+    out_dir = await run_build(
+        spec_file,
+        tmp_path / "runs",
+        app_dir,
+        config_path=cfg,
+        from_run=from_run,
+        verify_fn=fake_verify,
+        ledger_path=tmp_path / "usage" / "ledger.jsonl",
+    )
+    assert seen_protected == [["tests/test_e2e_product.py"]]
+    assert (app_dir / "tests" / "test_e2e_product.py").read_text(encoding="utf-8") == e2e_content
+    manifest = json.loads((out_dir / "manifest.json").read_text(encoding="utf-8"))
+    assert manifest["status"] == "verified"

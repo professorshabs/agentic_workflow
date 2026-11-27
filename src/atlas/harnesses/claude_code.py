@@ -151,16 +151,21 @@ def _claude_usage(parsed: dict[str, Any], *, auth_mode: AuthMode) -> dict[str, A
                 thinking = _as_count(details.get("thinking_tokens"))
 
     prompt_tokens = input_tokens + cache_read + cache_write
-    raw_cost = parsed.get("total_cost_usd")
+    raw = parsed.get("total_cost_usd")
+    raw_cost = float(raw) if isinstance(raw, (int, float)) and not isinstance(raw, bool) else None
     cost_usd: float | None = None
+    api_cost_usd: float | None = None
     cost_source: CostSource = "unavailable"
     if auth_mode == "api_key":
-        if isinstance(raw_cost, (int, float)) and not isinstance(raw_cost, bool):
-            cost_usd = round(float(raw_cost), 6)
+        if raw_cost is not None:
+            cost_usd = round(raw_cost, 6)
             cost_source = "reported"
     else:
         # Flat-rate Pro/Max subscription or OAuth token: keep `cost_usd` None rather than zeroing.
+        # Claude Code still prices the tokens at API rates; keep that only as an estimate.
         cost_source = "subscription"
+        if raw_cost is not None:
+            api_cost_usd = round(raw_cost, 6)
 
     return {
         "prompt_tokens": prompt_tokens,
@@ -170,6 +175,7 @@ def _claude_usage(parsed: dict[str, Any], *, auth_mode: AuthMode) -> dict[str, A
         "total_tokens": prompt_tokens + output,
         "cost_usd": cost_usd,
         "cost_source": cost_source,
+        "api_cost_usd": api_cost_usd,
         "usage_reported": reported,
     }
 

@@ -13,10 +13,20 @@ WORKFLOW_DIR = REPO_ROOT / ".github" / "workflows"
 
 
 def test_prompts_and_template_files_exist_and_load():
-    for name in ("parse", "research", "judge", "build", "fix"):
+    for name in (
+        "parse",
+        "research",
+        "judge",
+        "e2e_tests",
+        "build",
+        "build_workspace",
+        "fix",
+        "supervisor",
+    ):
         text = prompt(name)
         assert len(text.strip()) > 40
 
+    assert "protected_files" in prompt("fix")
     assert (REPO_ROOT / "specs" / "TEMPLATE.md").is_file()
     assert (REPO_ROOT / "specs" / "example-app.md").is_file()
     assert (REPO_ROOT / ".github" / "PULL_REQUEST_TEMPLATE.md").is_file()

@@ -94,9 +94,13 @@ atlas run specs/example-app.md --config config/harness.yaml --quiet
 
 ```bash
 atlas verify --app-dir app/example-app
+# Also enforce the standalone product contract (README, dependency manifest, no Atlas imports):
+atlas verify --app-dir app/example-app --product-contract
+# Also enforce requirement coverage and E2E test SHA-256 integrity from a recorded run:
+atlas verify --app-dir app/example-app --product-contract --from-run runs/<run-id>
 ```
 
-This runs the product's own tests (for example, `app/example-app/tests/`) alongside the configured compile, lint, build, and spec-coverage checks. To run the product's test command directly, use the product's own instructions from its directory, such as `cd app/example-app && pytest`.
+Bare `atlas verify` runs the product's own tests alongside compile, lint, and build checks; `--product-contract` adds `product-contract`, and `--from-run` adds `spec-coverage` and `e2e-product-tests` integrity verification. With `--from-run` and no `--app-dir`, Atlas verifies the product folder that run built (its `app_dir`), so `atlas verify --from-run runs/<run-id>` is enough. To run the product's test command directly, use its own instructions from its directory, such as `cd app/example-app && pytest`.
 
 ### 3c. Inspect token usage and estimated cost
 

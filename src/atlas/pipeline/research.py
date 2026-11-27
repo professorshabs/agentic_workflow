@@ -23,15 +23,28 @@ async def research(router: ModelRouter, spec: ParsedSpec) -> ResearchReport:
     # When a provider is down (e.g. no credit), several researcher models can fall back to the
     # same model. Asking one model the same question three times only triples the tokens.
     configured = router.models_for("researcher")
-    models = list(dict.fromkeys(router.first_available(m, "researcher") for m in configured))
-    if len(models) < len(configured):
-        logger.warning(
-            "Research: %d configured researcher models resolve to %d available model(s) %s; "
-            "running each once per requirement.",
-            len(configured),
-            len(models),
-            models,
-        )
+    researcher_backend = router.backend_for("researcher")
+    if researcher_backend.get("type") == "harness":
+        harness_model = str(researcher_backend.get("model") or configured[0])
+        models = [harness_model]
+        if len(configured) > 1:
+            logger.info(
+                "Research: researcher backend is harness (%s, model=%s); "
+                "running once per requirement instead of repeating %d role models.",
+                researcher_backend.get("provider") or "harness",
+                harness_model,
+                len(configured),
+            )
+    else:
+        models = list(dict.fromkeys(router.first_available(m, "researcher") for m in configured))
+        if len(models) < len(configured):
+            logger.warning(
+                "Research: %d configured researcher models resolve to %d available model(s) %s; "
+                "running each once per requirement.",
+                len(configured),
+                len(models),
+                models,
+            )
     targets: list[tuple[Requirement, str]] = [
         (req, model) for req in spec.requirements for model in models
     ]

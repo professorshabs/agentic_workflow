@@ -12,6 +12,7 @@ Decision rules:
 - Set `"approved": true` if the implementation and tests genuinely satisfy all requirements cleanly. Do not reject for minor cosmetic nitpicks or stylistic preferences.
 - Set `"approved": false` whenever real bugs, missing edge cases, weak or missing tests, or spec/constraint gaps remain.
 - When rejecting (or noting non-blocking follow-ups), provide concrete, file-specific `issues` and an ordered, actionable `improvement_plan` so the Fixer can resolve them cleanly.
+- Keep `improvement_plan` actionable via file edits (the Fixer applies JSON file patches without a shell and cannot run scripts or hand-encode binary assets).
 
 Return ONLY JSON matching this exact schema:
 {

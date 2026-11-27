@@ -9,9 +9,11 @@ import re
 import shutil
 import time
 from pathlib import Path
-from typing import Any
+from typing import Any, Literal
 
-from atlas.events import publish
+from pydantic import ValidationError
+
+from atlas.events import publish, redact
 from atlas.harnesses import (
     AntigravitySDKAdapter,
     HarnessError,
@@ -40,10 +42,19 @@ from atlas.schemas import (
     VerificationRound,
     WorkspaceBuildResult,
 )
-from atlas.skills import format_role_skill_index, load_role_skill_prompt, sync_workspace_skills
+from atlas.skills import (
+    SkillMetadata,
+    detect_used_skills,
+    format_role_skill_index,
+    load_role_skill_prompt,
+    resolve_role_skills,
+    snapshot_skill_atimes,
+    sync_workspace_skills,
+)
 
 from .render import render_build_brief
 from .util import complete_json_model, extract_json_object, prompt, role_target_label
+from .verify import normalize_rel_path
 
 logger = logging.getLogger("atlas.pipeline.build")
 
@@ -61,6 +72,85 @@ _SNAPSHOT_IGNORED_DIRS = {
     "dist",
     "build",
 }
+_SNAPSHOT_IGNORED_FILES = {".gitkeep", ".ignore", "PLAN.md", "BUILD_BRIEF.md"}
+_SNAPSHOT_SECRET_DIRS = {
+    ".aws",
+    ".ssh",
+    "certs",
+    "certificates",
+    "credentials",
+    "private",
+    "secrets",
+}
+_SNAPSHOT_SECRET_NAMES = {
+    ".env",
+    ".envrc",
+    ".netrc",
+    ".npmrc",
+    ".pypirc",
+    "aws_credentials",
+    "credentials",
+    "credentials.json",
+    "id_ed25519",
+    "id_rsa",
+    "secrets.json",
+}
+_SNAPSHOT_SAFE_ENV_EXAMPLES = {".env.example", ".env.sample", ".env.template", ".env.dist"}
+_SNAPSHOT_SECRET_SUFFIXES = (
+    ".cer",
+    ".crt",
+    ".der",
+    ".jks",
+    ".key",
+    ".keystore",
+    ".p12",
+    ".pfx",
+    ".pem",
+    ".tfstate",
+    ".token",
+)
+_SNAPSHOT_TRUNCATION_MARKER = "\n... [truncated]"
+
+
+def _is_sensitive_snapshot_path(rel: Path) -> bool:
+    """Avoid copying common credential/config files into model prompts."""
+    parts = {part.casefold() for part in rel.parts}
+    name = rel.name.casefold()
+    if parts & _SNAPSHOT_SECRET_DIRS:
+        return True
+    if name in _SNAPSHOT_SAFE_ENV_EXAMPLES:
+        return False
+    if name in _SNAPSHOT_SECRET_NAMES or name.startswith(".env."):
+        return True
+    return name.endswith(_SNAPSHOT_SECRET_SUFFIXES)
+
+
+class FixerRequestError(RuntimeError):
+    """A failure while requesting or validating a structured fixer response."""
+
+
+def _drop_partial_file_replacements(patch: PatchResult, partial_files: list[str]) -> PatchResult:
+    """Refuse full replacements for files the fixer was shown cut short or not at all.
+
+    The fixer returns whole files, so rewriting one it only saw in part would silently drop
+    the part it never saw (for example the rest of a large single-page `index.html`).
+    """
+    blocked = {normalize_rel_path(p).casefold() for p in partial_files}
+    kept = [f for f in patch.files if normalize_rel_path(f.path).casefold() not in blocked]
+    dropped = [f.path for f in patch.files if normalize_rel_path(f.path).casefold() in blocked]
+    if not dropped:
+        return patch
+    logger.warning(
+        "[fix] Ignoring full replacement(s) of %s: the fixer was only shown part of %s.",
+        ", ".join(dropped),
+        "it" if len(dropped) == 1 else "them",
+    )
+    note = (
+        f"\n\n(Atlas did not apply the replacement for {', '.join(dropped)}: the file was too "
+        "large to show in full, so rewriting it would have lost the part that was not shown. "
+        "Fix it through smaller files instead.)"
+    )
+    return patch.model_copy(update={"files": kept, "diagnosis": patch.diagnosis + note})
 
 
 def spec_slug(spec_path: Path) -> str:
@@ -124,30 +214,65 @@ def materialize_files(
     return sorted(written)
 
 
-def snapshot_app_files(app_dir: Path, max_total_chars: int = 60_000) -> dict[str, str]:
-    """Collect current text files in `app_dir` up to `max_total_chars` for fix prompts."""
-    if not app_dir.is_dir():
+def snapshot_app_files(
+    app_dir: Path, max_total_chars: int = 100_000, *, partial: list[str] | None = None
+) -> dict[str, str]:
+    """Collect current text files in `app_dir` up to `max_total_chars` for fix prompts.
+
+    When `partial` is given, it receives the paths the snapshot could not show whole: files
+    cut short, files left out once the budget ran out, and files that are not UTF-8 text.
+    """
+    if not app_dir.is_dir() or max_total_chars <= 0:
         return {}
     root = app_dir.resolve()
     snapshot: dict[str, str] = {}
     remaining = max_total_chars
+    single_file_cap = 40_000 if max_total_chars >= 40_000 else max_total_chars
 
     for path in sorted(root.rglob("*")):
-        if not path.is_file() or path.name == ".gitkeep":
+        if remaining <= 0 and partial is None:
+            break
+        if path.is_symlink() or not path.is_file() or path.name == ".gitkeep":
             continue
         rel = path.relative_to(root)
         if any(part in _SNAPSHOT_IGNORED_DIRS for part in rel.parts):
             continue
-        try:
-            text = path.read_text(encoding="utf-8")
-        except (OSError, UnicodeDecodeError):
+        if len(rel.parts) == 1 and rel.name in _SNAPSHOT_IGNORED_FILES:
             continue
-        if len(text) > remaining:
-            if remaining > 500:
-                snapshot[rel.as_posix()] = text[:remaining] + "\n... [truncated]"
-            break
-        snapshot[rel.as_posix()] = text
-        remaining -= len(text)
+        if _is_sensitive_snapshot_path(rel):
+            continue
+        try:
+            resolved = path.resolve()
+            resolved_rel = resolved.relative_to(root).as_posix()
+            if root not in resolved.parents or resolved_rel != rel.as_posix():
+                continue
+        except (OSError, ValueError):
+            continue
+        cap = min(remaining, single_file_cap)
+        if cap <= 0:
+            if partial is not None and len(partial) < 500:
+                partial.append(rel.as_posix())
+            continue
+        try:
+            with path.open("r", encoding="utf-8") as stream:
+                text = stream.read(cap + 1)
+        except UnicodeDecodeError:
+            if partial is not None and len(partial) < 500:
+                partial.append(rel.as_posix())
+            continue
+        except OSError:
+            continue
+        if len(text) > cap:
+            if partial is not None and len(partial) < 500:
+                partial.append(rel.as_posix())
+            marker_size = min(cap, len(_SNAPSHOT_TRUNCATION_MARKER))
+            prefix_size = cap - marker_size
+            chunk = text[:prefix_size] + _SNAPSHOT_TRUNCATION_MARKER[:marker_size]
+        else:
+            chunk = text
+        if chunk:
+            snapshot[rel.as_posix()] = chunk
+            remaining -= len(chunk)
 
     return snapshot
 
@@ -185,8 +310,8 @@ def _format_e2e_contract(
             "preseeded_test_files": test_paths,
             "instructions": (
                 "These authoritative E2E test files are already on disk. Read them directly "
-                "and run pytest / node test against them while building; do NOT delete or "
-                "weaken them."
+                "and, if you can run commands, run pytest / node test against them while "
+                "building; do NOT delete or weaken them."
             ),
         }
         return "END-TO-END PRODUCT CONTRACT (TESTS ON DISK):\n" + json.dumps(payload, indent=2)
@@ -299,6 +424,7 @@ async def fix_app(
     plan: Plan | None = None,
     fix_round: int = 1,
     previous_diagnoses: list[str] | None = None,
+    protected_files: list[str] | None = None,
 ) -> PatchResult:
     """Diagnose failing verification checks and generate file patches."""
     model, backend_override, target = fixer_target_for_round(router, fix_round)
@@ -314,7 +440,8 @@ async def fix_app(
         for c in failed_round.checks
         if not c.passed
     ]
-    files_snapshot = snapshot_app_files(app_dir)
+    partial_files: list[str] = []
+    files_snapshot = snapshot_app_files(app_dir, partial=partial_files)
 
     payload: dict[str, object] = {
         "spec_summary": spec.summary,
@@ -327,6 +454,10 @@ async def fix_app(
     }
     if previous_diagnoses:
         payload["previous_diagnoses"] = previous_diagnoses
+    if protected_files:
+        payload["protected_files"] = sorted(protected_files)
+    if partial_files:
+        payload["partial_files"] = sorted(partial_files)
     if plan is not None:
         payload["selected_tools"] = {d.requirement_id: d.pick for d in plan.decisions}
 
@@ -342,15 +473,25 @@ async def fix_app(
         len(failing_checks),
         len(files_snapshot),
     )
-    _, patch = await complete_json_model(
-        router,
-        model=model,
-        role="fixer",
-        system=system,
-        user=json.dumps(payload, indent=2),
-        schema=PatchResult,
-        backend_override=backend_override,
-    )
+    try:
+        _, patch = await complete_json_model(
+            router,
+            model=model,
+            role="fixer",
+            system=system,
+            user=json.dumps(payload, indent=2),
+            schema=PatchResult,
+            backend_override=backend_override,
+        )
+    except TokenBudgetExceededError:
+        raise
+    except Exception as exc:
+        detail = redact(str(exc).strip().splitlines()[0] if str(exc).strip() else "", 300)
+        raise FixerRequestError(
+            f"Fixer request failed with {type(exc).__name__}" + (f": {detail}" if detail else "")
+        ) from exc
+    if partial_files:
+        patch = _drop_partial_file_replacements(patch, partial_files)
     return patch
 
 
@@ -532,62 +673,120 @@ async def supervise_app(
             )
             timeout = float(rcfg.get("timeout_seconds") or router.timeout_for("supervisor"))
             payload = base_req if provider == "claude_code" else full_req
-            started = time.monotonic()
             adapter = get_harness_adapter(provider)
-            try:
-                router._check_budget()
-                sup_extra: dict[str, Any] = {}
-                if rcfg.get("effort") is not None:
-                    sup_extra["effort"] = str(rcfg["effort"])
-                res = await adapter.run_structured(
-                    role="supervisor",
-                    model=model,
-                    system=system,
-                    user=json.dumps(payload, indent=2),
-                    json_schema=SupervisorOutput.model_json_schema(),
-                    timeout_seconds=timeout,
-                    auth=str(auth) if auth is not None else None,
-                    max_budget_usd=max_budget,
-                    tools=tools,
-                    cwd=resolved_app_dir,
-                    **sup_extra,
+            sup_extra: dict[str, Any] = {}
+            if rcfg.get("effort") is not None:
+                sup_extra["effort"] = str(rcfg["effort"])
+
+            async def _fallback_to_router(reason: BaseException) -> ReviewerVerdict:
+                logger.warning(
+                    "Supervisor '%s' harness failed (%s); falling back to ModelRouter.",
+                    reviewer_name,
+                    reason,
                 )
-            except TokenBudgetExceededError:
-                raise
-            except HarnessError as exc:
+                fb_model = _supervisor_fallback_model(router, rcfg)
+                used_model, out = await complete_json_model(
+                    router,
+                    model=fb_model,
+                    role="supervisor",
+                    system=system,
+                    user=json.dumps(full_req, indent=2),
+                    schema=SupervisorOutput,
+                    use_harness=False,
+                )
+                return _finish_verdict(
+                    ReviewerVerdict(
+                        reviewer=reviewer_name,
+                        model=used_model,
+                        harness="openrouter",
+                        approved=out.approved,
+                        summary=out.summary,
+                        issues=out.issues,
+                        improvement_plan=out.improvement_plan,
+                        requirement_notes=out.requirement_notes,
+                    )
+                )
+
+            repair_attempts = max(
+                0,
+                int(
+                    rcfg.get(
+                        "repair_attempts",
+                        router.cfg.get("limits", {}).get("repair_attempts", 1),
+                    )
+                ),
+            )
+            prompt_user = json.dumps(payload, indent=2)
+            last_parse_exc: BaseException | None = None
+            for attempt in range(repair_attempts + 1):
+                started = time.monotonic()
+                try:
+                    router._check_budget()
+                    res = await adapter.run_structured(
+                        role="supervisor",
+                        model=model,
+                        system=system,
+                        user=prompt_user,
+                        json_schema=SupervisorOutput.model_json_schema(),
+                        timeout_seconds=timeout,
+                        auth=str(auth) if auth is not None else None,
+                        max_budget_usd=max_budget,
+                        tools=tools,
+                        cwd=resolved_app_dir,
+                        **sup_extra,
+                    )
+                except TokenBudgetExceededError:
+                    raise
+                except HarnessError as exc:
+                    failed_usage: dict[str, Any] = dict(getattr(exc, "usage", None) or {})
+                    router.record_harness_call(
+                        role="supervisor",
+                        requested_model=model,
+                        used_model=str(failed_usage.get("used_model") or model),
+                        harness=provider,
+                        harness_version=None,
+                        auth_mode=failed_usage.get("auth_mode"),
+                        elapsed_ms=round((time.monotonic() - started) * 1000, 1),
+                        prompt_tokens=int(failed_usage.get("prompt_tokens") or 0),
+                        completion_tokens=int(failed_usage.get("completion_tokens") or 0),
+                        cached_tokens=int(failed_usage.get("cached_tokens") or 0),
+                        reasoning_tokens=int(failed_usage.get("reasoning_tokens") or 0),
+                        total_tokens=int(failed_usage.get("total_tokens") or 0),
+                        cost_usd=failed_usage.get("cost_usd"),
+                        cost_source=str(failed_usage.get("cost_source") or "unavailable"),
+                        usage_reported=bool(failed_usage.get("usage_reported")),
+                        api_cost_usd=failed_usage.get("api_cost_usd"),
+                        error=f"{type(exc).__name__}: {exc}",
+                    )
+                    if rcfg.get("fallback") == "router":
+                        return await _fallback_to_router(exc)
+                    raise
+
                 router.record_harness_call(
                     role="supervisor",
                     requested_model=model,
-                    used_model=model,
-                    harness=provider,
-                    harness_version=None,
-                    elapsed_ms=round((time.monotonic() - started) * 1000, 1),
-                    cost_usd=None,
-                    cost_source="unavailable",
-                    usage_reported=False,
-                    error=f"{type(exc).__name__}: {exc}",
+                    used_model=res.used_model,
+                    harness=res.harness,
+                    harness_version=res.harness_version,
+                    auth_mode=res.auth_mode,
+                    elapsed_ms=res.elapsed_ms,
+                    prompt_tokens=res.prompt_tokens,
+                    completion_tokens=res.completion_tokens,
+                    cached_tokens=res.cached_tokens,
+                    reasoning_tokens=res.reasoning_tokens,
+                    total_tokens=res.total_tokens,
+                    cost_usd=res.cost_usd,
+                    cost_source=res.cost_source,
+                    usage_reported=res.usage_reported,
+                    api_cost_usd=res.api_cost_usd,
                 )
-                if rcfg.get("fallback") == "router":
-                    logger.warning(
-                        "Supervisor '%s' harness failed (%s); falling back to ModelRouter.",
-                        reviewer_name,
-                        exc,
-                    )
-                    fb_model = _supervisor_fallback_model(router, rcfg)
-                    used_model, out = await complete_json_model(
-                        router,
-                        model=fb_model,
-                        role="supervisor",
-                        system=system,
-                        user=json.dumps(full_req, indent=2),
-                        schema=SupervisorOutput,
-                        use_harness=False,
-                    )
+                try:
+                    out = SupervisorOutput.model_validate(extract_json_object(res.text))
                     return _finish_verdict(
                         ReviewerVerdict(
                             reviewer=reviewer_name,
-                            model=used_model,
-                            harness="openrouter",
+                            model=res.used_model,
+                            harness=res.harness,
                             approved=out.approved,
                             summary=out.summary,
                             issues=out.issues,
@@ -595,38 +794,29 @@ async def supervise_app(
                             requirement_notes=out.requirement_notes,
                         )
                     )
-                raise
+                except (ValidationError, ValueError) as exc:
+                    last_parse_exc = exc
+                    logger.warning(
+                        "Supervisor '%s' returned invalid JSON/schema (attempt %d/%d): %s: %s",
+                        reviewer_name,
+                        attempt + 1,
+                        repair_attempts + 1,
+                        type(exc).__name__,
+                        exc,
+                    )
+                    if attempt < repair_attempts:
+                        prompt_user = (
+                            f"{json.dumps(payload, indent=2)}\n\n"
+                            "Your previous response did not match the SupervisorOutput JSON "
+                            f"schema ({type(exc).__name__}: {exc}). Return ONLY valid JSON "
+                            "matching the schema.\n"
+                            f"Previous output snippet:\n{res.text[:1500]}"
+                        )
 
-            router.record_harness_call(
-                role="supervisor",
-                requested_model=model,
-                used_model=res.used_model,
-                harness=res.harness,
-                harness_version=res.harness_version,
-                auth_mode=res.auth_mode,
-                elapsed_ms=res.elapsed_ms,
-                prompt_tokens=res.prompt_tokens,
-                completion_tokens=res.completion_tokens,
-                cached_tokens=res.cached_tokens,
-                reasoning_tokens=res.reasoning_tokens,
-                total_tokens=res.total_tokens,
-                cost_usd=res.cost_usd,
-                cost_source=res.cost_source,
-                usage_reported=res.usage_reported,
-            )
-            out = SupervisorOutput.model_validate(extract_json_object(res.text))
-            return _finish_verdict(
-                ReviewerVerdict(
-                    reviewer=reviewer_name,
-                    model=res.used_model,
-                    harness=res.harness,
-                    approved=out.approved,
-                    summary=out.summary,
-                    issues=out.issues,
-                    improvement_plan=out.improvement_plan,
-                    requirement_notes=out.requirement_notes,
-                )
-            )
+            assert last_parse_exc is not None
+            if rcfg.get("fallback") == "router":
+                return await _fallback_to_router(last_parse_exc)
+            raise last_parse_exc
 
         target_model = str(rcfg.get("model") or _supervisor_fallback_model(router, rcfg))
         used_model, out = await complete_json_model(
@@ -685,6 +875,7 @@ def _build_workspace_prompt(
     max_prompt_chars: int = 12_000,
     workspace_root: Path | None = None,
     require_absolute_paths: bool = False,
+    file_tools_only: bool = False,
 ) -> str:
     resolved_root = workspace_root.resolve() if workspace_root is not None else None
 
@@ -705,11 +896,22 @@ def _build_workspace_prompt(
     ]
     if resolved_root is not None:
         workspace_notes.append(f"- Workspace root directory: `{resolved_root}`.")
+    if file_tools_only:
+        workspace_notes.append(
+            "- You have file tools only (view, create and edit files); you cannot run shell "
+            "commands. Atlas runs the tests after you finish, so read the test files carefully "
+            "and write code that passes them."
+        )
     if require_absolute_paths and resolved_root is not None:
         workspace_notes.append(
             f"- IMPORTANT: Always pass full absolute paths under `{resolved_root}` to every "
             f"file tool (for example `{resolved_root}/BUILD_BRIEF.md`, never relative filenames "
             "like `BUILD_BRIEF.md`)."
+        )
+        workspace_notes.append(
+            "- Write small files first (such as `pyproject.toml`, `README.md`, or small helper "
+            "modules) before large files, and keep reasoning concise so progress lands on disk "
+            "quickly."
         )
     if brief_file:
         workspace_notes.append(
@@ -794,6 +996,7 @@ def _record_build_success(
         cost_usd=invocation.cost_usd,
         cost_source=invocation.cost_source,
         usage_reported=invocation.usage_reported,
+        api_cost_usd=invocation.api_cost_usd,
     )
 
 
@@ -869,8 +1072,13 @@ async def _run_local_build(
         "timeout_seconds": timeout_seconds,
         "skill_dirs": skill_dirs,
     }
+    if backend.get("sandbox") is False:
+        run_kwargs["sandbox"] = False
+    if backend.get("allow_shell") is True:
+        run_kwargs["allow_shell"] = True
     if backend.get("stall_seconds"):
         run_kwargs["stall_seconds"] = float(backend["stall_seconds"])
+    started = time.monotonic()
     try:
         result, invocation = await sdk_adapter.run_workspace_task(**run_kwargs)
     except Exception as exc:
@@ -881,7 +1089,7 @@ async def _run_local_build(
             harness=sdk_adapter.harness,
             harness_version=sdk_adapter.package_version(),
             auth_mode="local",
-            elapsed_ms=0.0,
+            elapsed_ms=round((time.monotonic() - started) * 1000, 1),
             cost_usd=0.0,
             cost_source="local_free",
             error=f"{type(exc).__name__}: {exc}",
@@ -926,6 +1134,7 @@ async def _run_harness_build(
     adapter = get_harness_adapter(provider)
     logger.info("[build] Starting %s workspace harness (model=%s)...", provider, model)
     ws_extra: dict[str, Any] = {"effort": effort} if effort is not None else {}
+    started = time.monotonic()
     try:
         result, invocation = await adapter.run_workspace_task(
             role="builder",
@@ -947,7 +1156,7 @@ async def _run_harness_build(
             harness=provider,
             harness_version=None,
             auth_mode=failed_usage.get("auth_mode"),
-            elapsed_ms=0.0,
+            elapsed_ms=round((time.monotonic() - started) * 1000, 1),
             prompt_tokens=int(failed_usage.get("prompt_tokens") or 0),
             completion_tokens=int(failed_usage.get("completion_tokens") or 0),
             cached_tokens=int(failed_usage.get("cached_tokens") or 0),
@@ -956,6 +1165,7 @@ async def _run_harness_build(
             cost_usd=failed_usage.get("cost_usd"),
             cost_source=str(failed_usage.get("cost_source") or "unavailable"),
             usage_reported=bool(failed_usage.get("usage_reported")),
+            api_cost_usd=failed_usage.get("api_cost_usd"),
             error=f"{type(exc).__name__}: {exc}",
         )
         raise
@@ -999,6 +1209,52 @@ def _offload_label(target: dict[str, Any]) -> str:
     )
 
 
+def _existing_skill_links(root: Path, skills: list[SkillMetadata]) -> list[Path]:
+    """Links in `.agents/skills` that already point at the configured skill folders."""
+    found: list[Path] = []
+    base = root.resolve() / ".agents" / "skills"
+    for meta in skills:
+        skill_dir = Path(meta.path).parent.resolve()
+        link = base / skill_dir.name
+        try:
+            if link.is_symlink() and link.resolve() == skill_dir:
+                found.append(link)
+        except OSError:
+            continue
+    return found
+
+
+def _attach_skill_usage(
+    result: WorkspaceBuildResult,
+    *,
+    resolved_skills: list[SkillMetadata],
+    skills_mode: Literal["progressive", "injected"] | None,
+    before_atimes: dict[str, int] | None,
+) -> WorkspaceBuildResult:
+    available = [m.name for m in resolved_skills]
+    if not available or skills_mode is None:
+        return result
+    if skills_mode == "injected":
+        used = list(available)
+    else:
+        used = detect_used_skills(
+            resolved_skills, summary_text=result.summary, before_atimes=before_atimes
+        )
+    logger.info(
+        "[build] Builder skills used: %s (available: %s; mode=%s)",
+        ", ".join(used) if used else "none",
+        ", ".join(available),
+        skills_mode,
+    )
+    return result.model_copy(
+        update={
+            "available_skills": available,
+            "used_skills": used,
+            "skills_mode": skills_mode,
+        }
+    )
+
+
 async def _offload_build(
     router: ModelRouter,
     targets: list[dict[str, Any]],
@@ -1011,9 +1267,12 @@ async def _offload_build(
     prompt_text: str,
     sandbox: bool,
     local_error: BaseException,
+    resolved_skills: list[SkillMetadata] | None = None,
+    skills_mode: Literal["progressive", "injected"] | None = None,
 ) -> WorkspaceBuildResult:
     """Hand the build to stronger models in order until one succeeds."""
     failures = [f"local: {type(local_error).__name__}: {local_error}"]
+    skills_list = resolved_skills or []
     for idx, target in enumerate(targets):
         label = _offload_label(target)
         target_type = str(target.get("type") or "harness")
@@ -1035,6 +1294,13 @@ async def _offload_build(
             phase="building",
             provider=provider,
             model=display_model,
+        )
+        # Antigravity scans every SKILL.md when it starts, so access times would mark all
+        # skills as used; trust only its "Skills used:" line there.
+        attempt_atimes = (
+            snapshot_skill_atimes(skills_list)
+            if target_type == "harness" and provider != "antigravity"
+            else None
         )
         try:
             router._check_budget()
@@ -1084,6 +1350,12 @@ async def _offload_build(
                 raise HarnessError(
                     f"Offload target '{label}' ({result.model}) finished without writing any files."
                 )
+            result = _attach_skill_usage(
+                result,
+                resolved_skills=skills_list,
+                skills_mode=skills_mode if target_type == "harness" else None,
+                before_atimes=attempt_atimes,
+            )
             publish(
                 "attempt",
                 "build",
@@ -1092,6 +1364,9 @@ async def _offload_build(
                 provider=provider,
                 model=result.model,
                 files=written,
+                available_skills=result.available_skills,
+                used_skills=result.used_skills,
+                skills_mode=result.skills_mode,
             )
             return result
         except TokenBudgetExceededError:
@@ -1158,12 +1433,16 @@ async def build_app_workspace(
     if clean:
         _clean_app_root(root)
 
-    def _seed_workspace() -> tuple[str | None, str | None, bool]:
+    def _write_plan_file() -> str | None:
+        if not (plan_markdown and plan_markdown.strip()):
+            return None
+        (root / _PLAN_FILE).write_text(plan_markdown.rstrip() + "\n", encoding="utf-8")
+        return _PLAN_FILE
+
+    def _seed_workspace(*, for_local_model: bool = False) -> tuple[str | None, str | None, bool]:
         plan_file: str | None = None
         brief_file: str | None = None
         if plan_markdown and plan_markdown.strip():
-            (root / _PLAN_FILE).write_text(plan_markdown.rstrip() + "\n", encoding="utf-8")
-            plan_file = _PLAN_FILE
             if is_local and plan is not None:
                 brief = render_build_brief(
                     plan,
@@ -1173,27 +1452,48 @@ async def build_app_workspace(
                 )
                 (root / _BRIEF_FILE).write_text(brief, encoding="utf-8")
                 brief_file = _BRIEF_FILE
+            if for_local_model and brief_file:
+                # The full plan (~30K tokens) would fill most of the local model's context,
+                # and it reads the file when it can even when told not to. It gets the brief;
+                # PLAN.md is written back once its attempt ends.
+                (root / _PLAN_FILE).unlink(missing_ok=True)
+            else:
+                plan_file = _write_plan_file()
         preseeded = False
         if e2e_suite is not None and e2e_suite.files:
             materialize_files(root, e2e_suite.files, clean=False)
             preseeded = True
         return plan_file, brief_file, preseeded
 
-    plan_file, brief_file, e2e_preseeded = _seed_workspace()
+    plan_file, brief_file, e2e_preseeded = _seed_workspace(for_local_model=is_local)
 
     timeout_seconds = float(backend.get("timeout_seconds") or router.timeout_for("builder"))
     sandbox = bool(backend.get("sandbox", True))
     skills_cfg = router.skills_config()
-    created_links = sync_workspace_skills(root, skills_cfg) if skills_cfg else []
+    resolved_skills = resolve_role_skills("builder", skills_cfg) if skills_cfg else []
+    agents_dir = root / ".agents"
+    agents_skills = agents_dir / "skills"
+    agents_dir_preexisting = agents_dir.exists() or agents_dir.is_symlink()
+    agents_skills_preexisting = agents_skills.exists() or agents_skills.is_symlink()
+    created_links = (
+        sync_workspace_skills(root, skills_cfg, role="builder") if skills_cfg else []
+    )
+    # Links left by a run that was killed before its cleanup still expose the skills.
+    linked_skills = created_links or _existing_skill_links(root, resolved_skills)
     discovery_mode = str(skills_cfg.get("discovery_mode") or "").strip().lower()
-    if discovery_mode == "progressive" and created_links:
+    skills_mode: Literal["progressive", "injected"] | None = None
+    if discovery_mode == "progressive" and linked_skills:
         skill_prompt = format_role_skill_index(
             "builder", skills_cfg, workspace_root=root if is_local else None
         )
         offload_skill_prompt = format_role_skill_index("builder", skills_cfg)
+        if resolved_skills:
+            skills_mode = "progressive"
     else:
         skill_prompt = load_role_skill_prompt("builder", skills_cfg)
         offload_skill_prompt = skill_prompt
+        if resolved_skills and skill_prompt:
+            skills_mode = "injected"
 
     prompt_text = _build_workspace_prompt(
         spec,
@@ -1206,15 +1506,18 @@ async def build_app_workspace(
         e2e_preseeded=e2e_preseeded,
         workspace_root=root,
         require_absolute_paths=is_local,
+        file_tools_only=is_local and backend.get("allow_shell") is not True,
     )
-    skill_dirs = [root / ".agents" / "skills"] if created_links else None
+    skill_dirs = [root / ".agents" / "skills"] if linked_skills else None
+    avail_names = [m.name for m in resolved_skills]
     logger.info(
-        "[build] Prepared workspace %s (PLAN.md=%s, brief=%s, e2e_files=%d, skills=%d)",
+        "[build] Prepared workspace %s (PLAN.md=%s, brief=%s, e2e_files=%d, skills=%s, mode=%s)",
         root,
         bool(plan_file),
         bool(brief_file),
         len(e2e_suite.files) if e2e_preseeded and e2e_suite else 0,
-        len(created_links),
+        ", ".join(avail_names) if avail_names else "none",
+        skills_mode or "none",
     )
     try:
         if is_local:
@@ -1235,6 +1538,14 @@ async def build_app_workspace(
                     raise HarnessError(
                         f"Local model {result.model} finished without writing any files."
                     )
+                # The Antigravity SDK reads every SKILL.md under skill_dirs during startup
+                # discovery, bumping OS st_atime_ns even when the model never opens the skill.
+                result = _attach_skill_usage(
+                    result,
+                    resolved_skills=resolved_skills,
+                    skills_mode=skills_mode,
+                    before_atimes=None,
+                )
                 publish(
                     "attempt",
                     "build",
@@ -1243,6 +1554,9 @@ async def build_app_workspace(
                     provider="antigravity_sdk",
                     model=result.model,
                     files=written,
+                    available_skills=result.available_skills,
+                    used_skills=result.used_skills,
+                    skills_mode=result.skills_mode,
                 )
                 return result
             except TokenBudgetExceededError:
@@ -1251,6 +1565,10 @@ async def build_app_workspace(
                 if not offload:
                     raise
                 local_error: BaseException = exc
+            finally:
+                # PLAN.md was kept away from the local model; put it back for the offload
+                # builders and for the product folder.
+                plan_file = _write_plan_file() or plan_file
 
             publish(
                 "attempt",
@@ -1293,6 +1611,8 @@ async def build_app_workspace(
                 prompt_text=offload_prompt,
                 sandbox=sandbox,
                 local_error=local_error,
+                resolved_skills=resolved_skills,
+                skills_mode=skills_mode,
             )
 
         if backend_type == "harness":
@@ -1310,6 +1630,9 @@ async def build_app_workspace(
             phase="building",
             provider=provider,
             model=model,
+        )
+        harness_atimes = (
+            snapshot_skill_atimes(resolved_skills) if provider != "antigravity" else None
         )
         try:
             harness_result = await _run_harness_build(
@@ -1338,6 +1661,12 @@ async def build_app_workspace(
                 error=f"{type(exc).__name__}: {exc}",
             )
             raise
+        harness_result = _attach_skill_usage(
+            harness_result,
+            resolved_skills=resolved_skills,
+            skills_mode=skills_mode,
+            before_atimes=harness_atimes,
+        )
         publish(
             "attempt",
             "build",
@@ -1346,15 +1675,34 @@ async def build_app_workspace(
             provider=provider,
             model=harness_result.model,
             files=len(harness_result.created_files) + len(harness_result.modified_files),
+            available_skills=harness_result.available_skills,
+            used_skills=harness_result.used_skills,
+            skills_mode=harness_result.skills_mode,
         )
         return harness_result
     finally:
+        skill_link_targets = {
+            Path(meta.path).parent.name: Path(meta.path).parent.resolve()
+            for meta in resolved_skills
+        }
         for link in created_links:
             if link.is_symlink():
-                link.unlink()
-        agents_skills = root / ".agents" / "skills"
-        if agents_skills.is_dir() and not any(agents_skills.iterdir()):
+                try:
+                    if link.resolve() == skill_link_targets.get(link.name):
+                        link.unlink()
+                except OSError:
+                    continue
+        if (
+            not agents_skills_preexisting
+            and not agents_skills.is_symlink()
+            and agents_skills.is_dir()
+            and not any(agents_skills.iterdir())
+        ):
             agents_skills.rmdir()
-            agents_dir = root / ".agents"
-            if agents_dir.is_dir() and not any(agents_dir.iterdir()):
-                agents_dir.rmdir()
+        if (
+            not agents_dir_preexisting
+            and not agents_dir.is_symlink()
+            and agents_dir.is_dir()
+            and not any(agents_dir.iterdir())
+        ):
+            agents_dir.rmdir()

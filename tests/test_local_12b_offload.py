@@ -242,7 +242,11 @@ def _fake_sdk(monkeypatch, chat_impl) -> None:
 
     fake_sdk = SimpleNamespace(Agent=FakeAgent, LocalOpenAIAgentConfig=FakeConfig)
     fake_hooks = SimpleNamespace(
-        policy=SimpleNamespace(workspace_only=lambda _: [], auto=lambda: None)
+        policy=SimpleNamespace(
+            workspace_only=lambda _: [],
+            deny=lambda *a, **kw: None,
+            allow_all=lambda: None,
+        )
     )
     original_import = __import__("importlib").import_module
 
@@ -608,14 +612,18 @@ async def test_local_build_reads_the_brief_not_the_full_plan(monkeypatch, tmp_pa
 
     seen: dict = {}
 
+    app_dir = tmp_path / "app" / "x"
+    app_dir.mkdir(parents=True)
+    (app_dir / "PLAN.md").write_text("# Old plan from an earlier run\n", encoding="utf-8")
+
     async def fake_sdk(self, **kwargs):
         seen.update(kwargs)
+        seen["plan_on_disk"] = (app_dir / "PLAN.md").exists()
         raise HarnessError("stop here")
 
     monkeypatch.setattr("atlas.pipeline.build.resolve_local_model", ready)
     monkeypatch.setattr("atlas.pipeline.build.AntigravitySDKAdapter.run_workspace_task", fake_sdk)
     router = _router(tmp_path, "      []")
-    app_dir = tmp_path / "app" / "x"
 
     with pytest.raises(HarnessError, match="stop here"):
         await build_app_workspace(
@@ -628,8 +636,14 @@ async def test_local_build_reads_the_brief_not_the_full_plan(monkeypatch, tmp_pa
     assert f"Read `{brief_path}` first" in prompt
     assert "Always pass full absolute paths" in prompt
     assert "no absolute paths" not in prompt
-    assert "do not read it whole" in prompt
     assert "Return ONLY JSON" not in prompt  # workspace agents write files, not a JSON reply
+    # The ~30K-token plan stays out of the 12B's reach (even a stale one) and comes back after.
+    assert seen["plan_on_disk"] is False
+    assert "PLAN.md" not in prompt
+    assert (app_dir / "PLAN.md").read_text(encoding="utf-8").startswith("# Plan")
+    # File tools only unless the config sets allow_shell.
+    assert "You have file tools only" in prompt
+    assert "allow_shell" not in seen
 
 
 # --- config validation -----------------------------------------------------------------
@@ -705,12 +719,12 @@ def test_shipped_fixer_uses_only_sonnet_and_hydrogen():
 
     assert rotate[1]["type"] == "harness"
     assert rotate[1]["provider"] == "antigravity"
-    assert rotate[1]["model"] == "gemini-4-hydrogen-high"
+    assert rotate[1]["model"] == "gemini-4-hydrogen-medium"
     assert rotate[1]["fallback"] == "router"
     assert rotate[1]["router_model"] == "openrouter/google/gemini-4-hydrogen"
 
     assert fixer_model_for_round(router, 1) == "claude_code/sonnet"
-    assert fixer_model_for_round(router, 2) == "antigravity/gemini-4-hydrogen-high"
+    assert fixer_model_for_round(router, 2) == "antigravity/gemini-4-hydrogen-medium"
     fb1, ov1, lbl1 = fixer_target_for_round(router, 1)
     assert (fb1, (ov1 or {}).get("model"), lbl1) == (
         "openrouter/anthropic/claude-sonnet-5.5",
@@ -720,8 +734,8 @@ def test_shipped_fixer_uses_only_sonnet_and_hydrogen():
     fb2, ov2, lbl2 = fixer_target_for_round(router, 2)
     assert (fb2, (ov2 or {}).get("model"), lbl2) == (
         "openrouter/google/gemini-4-hydrogen",
-        "gemini-4-hydrogen-high",
-        "antigravity/gemini-4-hydrogen-high",
+        "gemini-4-hydrogen-medium",
+        "antigravity/gemini-4-hydrogen-medium",
     )
 
     for model in (
@@ -833,7 +847,7 @@ def test_fixer_runs_harnesses_first_and_falls_back_only_on_error(monkeypatch, tm
     assert r2.diagnosis == "fixed value"
     assert calls == [
         ("claude_code", "sonnet", None),
-        ("antigravity", "gemini-4-hydrogen-high", None),
+        ("antigravity", "gemini-4-hydrogen-medium", None),
     ]
     assert router_fallbacks == []
 
@@ -876,7 +890,7 @@ def test_flow_description_formats_harness_fixer_entries():
         local_model=None,
         from_run=None,
     )
-    assert flow["fixer"] == ["claude_code/sonnet", "antigravity/gemini-4-hydrogen-high"]
+    assert flow["fixer"] == ["claude_code/sonnet", "antigravity/gemini-4-hydrogen-medium"]
 
 
 def test_builder_handover_order_local_sonnet_hydrogen(monkeypatch, tmp_path):
@@ -1084,3 +1098,334 @@ backends:
     assert str(resolved / ".agents" / "skills" / "writing-clean-code" / "SKILL.md") in prompt
     assert str(resolved / "tests" / "test_e2e_product.py") in prompt
 
+
+def test_snapshot_app_files_excludes_atlas_planning_files_and_does_not_starve_source(tmp_path):
+    from atlas.pipeline.build import snapshot_app_files
+
+    app_dir = tmp_path / "app" / "demo"
+    (app_dir / "tests").mkdir(parents=True)
+    (app_dir / "PLAN.md").write_text("P" * 120_000, encoding="utf-8")
+    (app_dir / "BUILD_BRIEF.md").write_text("B" * 20_000, encoding="utf-8")
+    (app_dir / ".ignore").write_text(".venv/\n", encoding="utf-8")
+    (app_dir / "index.html").write_text("<h1>Hello</h1>\n", encoding="utf-8")
+    (app_dir / "tests" / "test_e2e_product.py").write_text(
+        "def test_r1(): pass\n", encoding="utf-8"
+    )
+
+    snap = snapshot_app_files(app_dir)
+    assert "PLAN.md" not in snap
+    assert "BUILD_BRIEF.md" not in snap
+    assert ".ignore" not in snap
+    assert snap["index.html"] == "<h1>Hello</h1>\n"
+    assert snap["tests/test_e2e_product.py"] == "def test_r1(): pass\n"
+
+
+def test_runner_rotates_to_next_fixer_when_one_round_fails(monkeypatch, tmp_path):
+    from atlas.router import OutputTruncatedError
+    from atlas.runner import run_build
+    from atlas.schemas import CheckResult
+
+    spec = tmp_path / "demo.md"
+    spec.write_text("# Demo\n\n## Requirements\n- R001: Greet\n", encoding="utf-8")
+    cfg = tmp_path / "models.yaml"
+    cfg.write_text(
+        """
+roles:
+  parser: [m-p]
+  researcher: [m-r]
+  judge: [m-j]
+  builder: [m-build]
+  fixer: [m-a]
+backends:
+  fixer:
+    type: openrouter
+    rotate: [m-a, m-b]
+limits:
+  max_parallel_calls: 1
+  max_tokens: 1000
+  timeout_seconds: 10
+  attempts_per_model: 1
+  repair_attempts: 0
+  max_fix_rounds: 3
+verification:
+  require_requirement_tests: false
+  require_product_contract: false
+  require_e2e_tests: false
+""".strip()
+        + "\n",
+        encoding="utf-8",
+    )
+    app_dir = tmp_path / "app" / "demo"
+    fixer_calls: list[str] = []
+
+    async def fake_acompletion(*, model, messages, **kwargs):
+        if model == "m-p":
+            txt = json.dumps(
+                {
+                    "summary": "Demo",
+                    "requirements": [
+                        {
+                            "id": "R001",
+                            "title": "Greet",
+                            "kind": "functional",
+                            "description": "Greet",
+                            "acceptance_criteria": [],
+                            "depends_on": [],
+                        }
+                    ],
+                }
+            )
+        elif model == "m-build":
+            txt = json.dumps(
+                {
+                    "summary": "Built",
+                    "files": [{"path": "app.py", "content": "OK = False\n"}],
+                    "run_instructions": "pytest",
+                }
+            )
+        elif model == "m-a":
+            fixer_calls.append("m-a")
+            raise OutputTruncatedError("cut off on round 1")
+        else:
+            fixer_calls.append("m-b")
+            txt = json.dumps(
+                {
+                    "diagnosis": "flipped OK to True",
+                    "files": [{"path": "app.py", "content": "OK = True\n"}],
+                    "delete_files": [],
+                }
+            )
+        return SimpleNamespace(
+            choices=[SimpleNamespace(message=SimpleNamespace(content=txt), finish_reason="stop")],
+            usage=SimpleNamespace(prompt_tokens=10, completion_tokens=5, total_tokens=15),
+        )
+
+    async def fake_verify(root):
+        passed = "OK = True" in (root / "app.py").read_text(encoding="utf-8")
+        return "python", [
+            CheckResult(
+                name="python-pytest",
+                command="pytest",
+                passed=passed,
+                exit_code=0 if passed else 1,
+            )
+        ]
+
+    monkeypatch.setattr("atlas.router.litellm.acompletion", fake_acompletion)
+    run_dir = asyncio.run(
+        run_build(
+            spec,
+            tmp_path / "runs",
+            app_dir=app_dir,
+            config_path=cfg,
+            skip_research=True,
+            verify_fn=fake_verify,
+        )
+    )
+    manifest = json.loads((run_dir / "manifest.json").read_text(encoding="utf-8"))
+    assert manifest["status"] == "verified"
+    assert fixer_calls == ["m-a", "m-b"]
+
+
+def test_builder_records_and_publishes_chosen_skills(monkeypatch, tmp_path, caplog):
+    import logging
+
+    from atlas.events import RunEventBus, attach, detach
+
+    skills_root = tmp_path / "skills"
+    for s in ("developing-fullstack-apps", "writing-clean-code"):
+        d = skills_root / s
+        d.mkdir(parents=True)
+        (d / "SKILL.md").write_text(
+            f"---\nname: {s}\ndescription: {s}\n---\nRule for {s}.\n",
+            encoding="utf-8",
+        )
+
+    cfg = tmp_path / "harness.yaml"
+    cfg.write_text(
+        f"""
+roles:
+  parser: [openrouter/m]
+  researcher: [openrouter/m]
+  judge: [openrouter/m]
+  builder: [openrouter/m]
+  fixer: [openrouter/m]
+limits:
+  max_parallel_calls: 1
+  max_tokens: 100
+  timeout_seconds: 10
+skills:
+  sources: [{str(skills_root)!r}]
+  allowlist: [developing-fullstack-apps, writing-clean-code]
+  discovery_mode: progressive
+  by_role:
+    builder: [developing-fullstack-apps, writing-clean-code]
+backends:
+  builder:
+    type: harness
+    provider: claude_code
+    model: sonnet
+    auth: subscription
+""".strip()
+        + "\n",
+        encoding="utf-8",
+    )
+    router = ModelRouter(cfg)
+    app_dir = tmp_path / "app" / "demo"
+
+    async def fake_ws(self, *, role, model, prompt_text, app_dir, **kwargs):
+        app_dir.mkdir(parents=True, exist_ok=True)
+        (app_dir / "app.py").write_text("x = 1\n", encoding="utf-8")
+        return (
+            WorkspaceBuildResult(
+                summary="Built app.\nSkills used: writing-clean-code",
+                harness="claude_code",
+                model=model,
+                app_dir=str(app_dir),
+                stack="python",
+                created_files=["app.py"],
+                files_snapshot=["app.py"],
+            ),
+            HarnessInvocationResult(
+                text="ok",
+                used_model=model,
+                harness="claude_code",
+                auth_mode="subscription",
+                cost_source="subscription",
+                usage_reported=True,
+            ),
+        )
+
+    monkeypatch.setattr(ClaudeCodeAdapter, "_find_binary", staticmethod(lambda: "/bin/claude"))
+    monkeypatch.setattr(ClaudeCodeAdapter, "run_workspace_task", fake_ws)
+
+    bus = RunEventBus(persist=False)
+    attach(bus)
+    try:
+        with caplog.at_level(logging.INFO, logger="atlas"):
+            result = asyncio.run(build_app_workspace(router, SPEC, app_dir))
+    finally:
+        detach(bus)
+
+    assert result.available_skills == ["developing-fullstack-apps", "writing-clean-code"]
+    assert result.used_skills == ["writing-clean-code"]
+    assert result.skills_mode == "progressive"
+    assert (
+        "[build] Builder skills used: writing-clean-code "
+        "(available: developing-fullstack-apps, writing-clean-code; mode=progressive)"
+    ) in caplog.text
+    attempt_passed = next(
+        e for e in bus.events_after(0) if e["kind"] == "attempt" and e["status"] == "passed"
+    )
+    assert attempt_passed["data"]["used_skills"] == ["writing-clean-code"]
+    assert attempt_passed["data"]["skills_mode"] == "progressive"
+
+
+def test_local_builder_ignores_startup_atime_scan_noise(tmp_path, monkeypatch):
+    skills_root = tmp_path / "skills"
+    skill_dir = skills_root / "writing-clean-code"
+    skill_dir.mkdir(parents=True)
+    skill_md = skill_dir / "SKILL.md"
+    skill_md.write_text(
+        "---\nname: writing-clean-code\ndescription: Clean\n---\nKeep clean.\n",
+        encoding="utf-8",
+    )
+
+    cfg = tmp_path / "local.yaml"
+    cfg.write_text(
+        f"""
+roles:
+  builder: [local-auto]
+limits:
+  max_parallel_calls: 1
+  max_tokens: 100
+  timeout_seconds: 10
+skills:
+  sources: [{str(skills_root)!r}]
+  allowlist: [writing-clean-code]
+  discovery_mode: progressive
+  by_role:
+    builder: [writing-clean-code]
+backends:
+  builder:
+    type: local_harness
+    local_harness: antigravity_sdk
+    preferred: [google/gemma-4-12b-qat]
+    min_context_tokens: 49152
+""".strip()
+        + "\n",
+        encoding="utf-8",
+    )
+    router = ModelRouter(cfg)
+    app_dir = tmp_path / "app" / "demo"
+    candidate = LocalModelCandidate(
+        provider="lm_studio", name="google/gemma-4-12b-qat", base_url="http://localhost:1234/v1"
+    )
+
+    async def ready(**kwargs):
+        return LocalResolutionResult(selected=candidate, candidates=[candidate])
+
+    async def fake_sdk(self, *, app_dir, **kwargs):
+        app_dir.mkdir(parents=True, exist_ok=True)
+        (app_dir / "app.py").write_text("x = 1\n", encoding="utf-8")
+        return (
+            WorkspaceBuildResult(
+                summary="Built app cleanly without citing skills.",
+                harness="antigravity_sdk",
+                model="lm_studio/google/gemma-4-12b-qat",
+                app_dir=str(app_dir),
+                stack="python",
+                created_files=["app.py"],
+                files_snapshot=["app.py"],
+            ),
+            HarnessInvocationResult(
+                text="ok",
+                used_model="lm_studio/google/gemma-4-12b-qat",
+                harness="antigravity_sdk",
+                auth_mode="local",
+                cost_source="local_free",
+                usage_reported=True,
+            ),
+        )
+
+    real_stat = Path.stat
+    stat_calls = 0
+
+    class _BumpedStat:
+        def __init__(self, wrapped, st_atime_ns: int) -> None:
+            self._wrapped = wrapped
+            self.st_atime_ns = st_atime_ns
+
+        def __getattr__(self, name: str):
+            return getattr(self._wrapped, name)
+
+    def fake_stat(self: Path, **kw):
+        nonlocal stat_calls
+        real = real_stat(self, **kw)
+        if self == skill_md:
+            stat_calls += 1
+            return _BumpedStat(real, real.st_atime_ns + stat_calls * 1_000_000)
+        return real
+
+    monkeypatch.setattr(Path, "stat", fake_stat)
+    monkeypatch.setattr("atlas.pipeline.build.resolve_local_model", ready)
+    monkeypatch.setattr("atlas.pipeline.build.AntigravitySDKAdapter.run_workspace_task", fake_sdk)
+
+    result = asyncio.run(build_app_workspace(router, SPEC, app_dir))
+    assert result.available_skills == ["writing-clean-code"]
+    assert result.used_skills == []
+
+
+def test_local_build_prompt_advises_small_files_first(tmp_path):
+    from atlas.pipeline.build import _build_workspace_prompt
+
+    prompt_text = _build_workspace_prompt(
+        SPEC,
+        plan=None,
+        raw_spec="# Demo\nSimple app.",
+        skill_prompt="",
+        brief_file="BUILD_BRIEF.md",
+        workspace_root=tmp_path,
+        require_absolute_paths=True,
+    )
+    assert "Write small files first" in prompt_text

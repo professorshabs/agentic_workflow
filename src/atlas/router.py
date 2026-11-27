@@ -13,7 +13,7 @@ import yaml
 
 from atlas.events import publish, publishing
 from atlas.schemas import TokenUsageSummary
-from atlas.telemetry import extract_usage_metrics, summarize_usage
+from atlas.telemetry import api_equivalent_cost, extract_usage_metrics, summarize_usage
 
 logger = logging.getLogger("atlas.router")
 
@@ -245,6 +245,24 @@ class ModelRouter:
             if key not in self.cfg or not isinstance(self.cfg[key], dict):
                 raise ValueError(f"Missing or invalid '{key}' mapping in {self.path}")
 
+        pricing = self.cfg.get("pricing")
+        if pricing is not None:
+            if not isinstance(pricing, dict):
+                raise ValueError("pricing must map model names to {input, output} USD per 1M")
+            for name, row in pricing.items():
+                values = [row.get(k) for k in ("input", "output")] if isinstance(row, dict) else []
+                if not values or any(
+                    isinstance(v, bool) or not isinstance(v, (int, float)) or v < 0 for v in values
+                ):
+                    raise ValueError(
+                        f"pricing['{name}'] needs numeric input and output prices (USD per 1M)"
+                    )
+                cache = row.get("cache_read")
+                if cache is not None and (
+                    isinstance(cache, bool) or not isinstance(cache, (int, float)) or cache < 0
+                ):
+                    raise ValueError(f"pricing['{name}'].cache_read must be a number >= 0")
+
         if not self.cfg["roles"]:
             raise ValueError(f"'roles' must define at least one role in {self.path}")
 
@@ -396,6 +414,9 @@ class ModelRouter:
                             "builder is local-only unless you list `offload` targets"
                         )
                     _validate_offload_targets(f"backends['{role}']", bcfg.get("offload"))
+                    for flag in ("allow_shell", "sandbox"):
+                        if bcfg.get(flag) is not None and not isinstance(bcfg.get(flag), bool):
+                            raise ValueError(f"backends['{role}'].{flag} must be true or false")
                     for key in ("stall_seconds", "smoke_timeout_seconds", "max_parameter_size_b"):
                         val = bcfg.get(key)
                         if val is not None and (isinstance(val, bool) or float(val) <= 0):
@@ -629,8 +650,16 @@ class ModelRouter:
         skills = self.cfg.get("skills")
         return dict(skills) if isinstance(skills, dict) else {}
 
+    def pricing(self) -> dict[str, Any]:
+        """Optional `pricing` table (USD per 1M tokens) for the API-equivalent estimate."""
+        table = self.cfg.get("pricing")
+        return dict(table) if isinstance(table, dict) else {}
+
     def _append_call(self, entry: dict[str, Any]) -> None:
         """Record one billed (or free) model call and tell a listening UI about it."""
+        entry["api_cost_usd"], entry["api_cost_source"] = api_equivalent_cost(
+            entry, self.pricing()
+        )
         self.call_log.append(entry)
         if publishing():
             role = str(entry.get("role") or "")
@@ -646,6 +675,7 @@ class ModelRouter:
                 output_tokens=int(entry.get("completion_tokens") or 0),
                 cost_usd=entry.get("cost_usd"),
                 cost_source=entry.get("cost_source"),
+                api_cost_usd=entry.get("api_cost_usd"),
                 error=str(entry.get("error") or "")[:300],
             )
 
@@ -668,6 +698,7 @@ class ModelRouter:
         cost_source: str = "unavailable",
         usage_reported: bool = False,
         error: str | None = None,
+        api_cost_usd: float | None = None,
     ) -> None:
         """Append one harness invocation's honest telemetry into `call_log`."""
         self._append_call(
@@ -687,6 +718,7 @@ class ModelRouter:
                 "total_tokens": int(total_tokens),
                 "cost_usd": cost_usd,
                 "cost_source": cost_source,
+                **({"api_cost_usd": api_cost_usd} if api_cost_usd is not None else {}),
                 "usage_reported": usage_reported,
                 "timestamp": datetime.now(UTC).isoformat(),
                 **({"error": error} if error else {}),
@@ -749,6 +781,7 @@ class ModelRouter:
                 cost_usd=result.cost_usd,
                 cost_source=result.cost_source,
                 usage_reported=result.usage_reported,
+                api_cost_usd=result.api_cost_usd,
             )
             return result.used_model, result.text
         except TokenBudgetExceededError:
@@ -772,6 +805,7 @@ class ModelRouter:
                 cost_usd=failed_usage.get("cost_usd"),
                 cost_source=str(failed_usage.get("cost_source") or "unavailable"),
                 usage_reported=bool(failed_usage.get("usage_reported")),
+                api_cost_usd=failed_usage.get("api_cost_usd"),
                 error=f"{type(exc).__name__}: {exc}",
             )
             if isinstance(exc, HarnessError) and backend.get("fallback") == "router":

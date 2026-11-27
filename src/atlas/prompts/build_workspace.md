@@ -18,4 +18,6 @@ Rules:
 7. Work in small steps: write one file, move to the next. Do not re-read files you have
    already read unless you changed them.
 8. When every file is written, reply with a short plain-text summary (at most 10 lines): what
-   you built and how to run the tests.
+   you built, how to run the tests, and (if active skills were listed above) a line
+   `Skills used: <comma-separated skill names or none>` naming only skills you actually
+   read or applied.

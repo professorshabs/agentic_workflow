@@ -1,0 +1,10 @@
+{
+  "How should images and Open Graph sharing work within 'one self-contained HTML file'? Embedding images as base64 data URIs keeps the HTML strictly single-file (increasing payload size by ~33%), whereas Open Graph image previews on WhatsApp typically require an externally hosted absolute HTTP(S) image URL.": "it should not necessry need the absolute HTTP",
+  "What are the actual property details, copy, photos, price/rent, status ('For Sale' or 'To Let'), key facts values, unit of measure for erf/stand size, viewing schedule, contact details, suburb, reference number, and exact disclaimer text?": "use placeholder photos, rent is R14000 pm, it's a 2 bedroom house, can view on Wednesday and saturday. +27822110850, Claremont Cape Town",
+  "Is the deliverable a one-off static page for a specific property or a reusable template?": "yes once once",
+  "Which specific font family, accent color, and contrast threshold (e.g., WCAG AA 4.5:1) should be used?": "bluish and khakhi, not sure what is the symbol for that",
+  "How should the mobile above-the-fold requirement (seeing property type, price, and contact option without scrolling) be reconciled with the fixed top-to-bottom order where the Contact block is item 8? Specifically, is a sticky contact button sufficient for the contact requirement above the fold, and what maximum height should the hero photo have on mobile?": "yes reconsile",
+  "Which action(s) should the sticky/repeated mobile contact button trigger (e.g., tel: call, WhatsApp chat, or anchor jump to the Contact block), and should the email address use a mailto: link?": "whatsApp chat, yes email shoud shoud use mailto. email:professorshabs@gmail.com",
+  "Should the optional 3-4 thumbnail photo strip be included or omitted by default, and should thumbnails have any click-to-view behavior given that JavaScript is prohibited?": "include",
+  "What reference mobile viewport size and network bandwidth/latency profile define 'mobile' and 'mid-range mobile connection' for validating the no-scroll and < 2 second load acceptance criteria?": "less than one second is acceptance"
+}

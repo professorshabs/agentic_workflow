@@ -101,6 +101,9 @@ class HarnessInvocationResult(StrictModel):
     total_tokens: int = 0
     cost_usd: float | None = None
     cost_source: CostSource = "unavailable"
+    # The harness's own API-price figure when the call was not billed per token
+    # (Claude Code reports `total_cost_usd` even on a subscription).
+    api_cost_usd: float | None = None
     usage_reported: bool = False
     exit_code: int = 0
 

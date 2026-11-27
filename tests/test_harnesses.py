@@ -1057,3 +1057,219 @@ verification:
     doc = await run_doctor(ModelRouter(cfg_path))
     providers = {chk["provider"] for chk in doc["checks"]}
     assert {"antigravity", "claude_code", "openrouter", "local_model_daemon"}.issubset(providers)
+
+
+@pytest.mark.asyncio
+async def test_supervise_app_records_failed_usage_and_repairs_then_falls_back(
+    tmp_path, monkeypatch
+):
+    from atlas.pipeline import build as build_mod
+    from atlas.schemas import ParsedSpec, Requirement, SupervisorOutput, VerificationRound
+
+    cfg = tmp_path / "sup.yaml"
+    cfg.write_text(
+        """
+roles:
+  supervisor: [openrouter/anthropic/claude-opus-5.5]
+backends:
+  supervisor:
+    enabled: true
+    mode: unanimous
+    reviewers:
+      - name: opus
+        type: harness
+        provider: claude_code
+        model: opus
+        auth: subscription
+        repair_attempts: 1
+        fallback: router
+        router_model: openrouter/anthropic/claude-opus-5.5
+limits:
+  max_parallel_calls: 2
+  max_tokens: 1000
+  timeout_seconds: 10
+  repair_attempts: 1
+""".strip()
+        + "\n",
+        encoding="utf-8",
+    )
+    router = ModelRouter(cfg)
+    spec = ParsedSpec(
+        summary="App",
+        requirements=[Requirement(id="R001", title="Req", description="Desc")],
+    )
+    app_dir = tmp_path / "app"
+    app_dir.mkdir()
+    (app_dir / "app.py").write_text("x = 1\n", encoding="utf-8")
+    vround = VerificationRound(
+        round_number=1,
+        passed=True,
+        stack_detected="python",
+        checks=[CheckResult(name="pytest", command="pytest", passed=True, exit_code=0)],
+    )
+
+    err = HarnessError("timed out after billing")
+    err.usage = {
+        "used_model": "claude-opus-5-5",
+        "auth_mode": "subscription",
+        "prompt_tokens": 111,
+        "completion_tokens": 22,
+        "total_tokens": 133,
+        "cost_usd": 0.04,
+        "cost_source": "reported",
+        "usage_reported": True,
+    }
+
+    async def fail_with_usage(self, **kwargs):
+        raise err
+
+    fallback_calls: list[str] = []
+
+    async def fake_complete_json(rtr, *, model, role, system, user, schema, **kwargs):
+        fallback_calls.append(model)
+        return model, SupervisorOutput(approved=True, summary="Fallback approved")
+
+    monkeypatch.setattr(ClaudeCodeAdapter, "run_structured", fail_with_usage)
+    monkeypatch.setattr(build_mod, "complete_json_model", fake_complete_json)
+
+    review = await build_mod.supervise_app(router, spec, app_dir, vround)
+    assert review.approved is True
+    assert fallback_calls == ["openrouter/anthropic/claude-opus-5.5"]
+    failed_record = next(c for c in router.call_log if c.get("error"))
+    assert failed_record["total_tokens"] == 133
+    assert failed_record["cost_usd"] == 0.04
+    assert failed_record["usage_reported"] is True
+
+    # Also test invalid JSON/schema output -> repair attempt -> router fallback
+    router2 = ModelRouter(cfg)
+    harness_calls = 0
+
+    async def invalid_json(self, **kwargs):
+        nonlocal harness_calls
+        harness_calls += 1
+        return HarnessInvocationResult(
+            text="not json at all",
+            used_model="claude-opus-5-5",
+            harness="claude_code",
+            auth_mode="subscription",
+            cost_source="subscription",
+            usage_reported=True,
+        )
+
+    monkeypatch.setattr(ClaudeCodeAdapter, "run_structured", invalid_json)
+    review2 = await build_mod.supervise_app(router2, spec, app_dir, vround)
+    assert harness_calls == 2  # initial + 1 repair_attempt
+    assert review2.approved is True
+
+
+@pytest.mark.asyncio
+async def test_run_doctor_mixed_auth_provider_keys_and_offload_flag(tmp_path, monkeypatch):
+    cfg = tmp_path / "doctor_mixed.yaml"
+    cfg.write_text(
+        """
+roles:
+  parser: [anthropic/claude-sonnet-4]
+  builder: [local-auto]
+  fixer: [openrouter/m]
+backends:
+  parser:
+    type: litellm
+    model: anthropic/claude-sonnet-4
+  judge:
+    type: harness
+    provider: claude_code
+    auth: subscription
+  builder:
+    type: local_harness
+    local_harness: antigravity_sdk
+    offload:
+      - name: sonnet-api
+        type: harness
+        provider: claude_code
+        auth: api
+  fixer:
+    type: harness
+    provider: antigravity
+limits:
+  max_parallel_calls: 2
+  max_tokens: 1000
+  timeout_seconds: 10
+""".strip()
+        + "\n",
+        encoding="utf-8",
+    )
+    from atlas.harnesses.base import AuthStatus
+
+    seen_auths: list[str | None] = []
+
+    async def fake_claude_auth(self, *, auth=None):
+        seen_auths.append(auth)
+        return AuthStatus(
+            provider="claude_code",
+            available=True,
+            authenticated=True,
+            auth_mode="api_key" if auth == "api" else (auth or "subscription"),
+        )
+
+    async def fake_agy_auth(self, *, auth=None):
+        return AuthStatus(provider="antigravity", available=True, authenticated=True)
+
+    async def fake_sdk_auth(self, *, auth=None):
+        return AuthStatus(provider="antigravity_sdk", available=True, authenticated=True)
+
+    async def fake_local(**kwargs):
+        return LocalResolutionResult(reason="stopped")
+
+    monkeypatch.setenv("ANTHROPIC_API_KEY", "sk-ant-test")
+    monkeypatch.delenv("OPENROUTER_API_KEY", raising=False)
+    monkeypatch.setattr(ClaudeCodeAdapter, "check_auth", fake_claude_auth)
+    monkeypatch.setattr(AntigravityCLIAdapter, "check_auth", fake_agy_auth)
+    monkeypatch.setattr("atlas.harnesses.AntigravitySDKAdapter.check_auth", fake_sdk_auth)
+    monkeypatch.setattr("atlas.harnesses.resolve_local_model", fake_local)
+
+    report = await run_doctor(ModelRouter(cfg))
+    assert set(seen_auths) == {"api", "subscription"}
+    assert {
+        c["auth_mode"] for c in report["checks"] if c["provider"] == "claude_code"
+    } == {"subscription", "api_key"}
+    by_provider = {c["provider"]: c for c in report["checks"]}
+    assert "anthropic" in by_provider and by_provider["anthropic"]["authenticated"] is True
+    assert "openrouter" not in by_provider
+    assert by_provider["local_model_daemon"]["offload_configured"] is True
+
+
+@pytest.mark.asyncio
+async def test_run_doctor_uses_router_model_for_harness_fallback_credentials(tmp_path, monkeypatch):
+    cfg = tmp_path / "doctor_fallback.yaml"
+    cfg.write_text(
+        """
+roles:
+  parser: [gemini-4-hydrogen-high]
+backends:
+  parser:
+    type: harness
+    provider: antigravity
+    model: gemini-4-hydrogen-high
+    fallback: router
+    router_model: openai/gpt-4.1
+limits:
+  max_parallel_calls: 1
+  max_tokens: 1000
+  timeout_seconds: 10
+""".strip()
+        + "\n",
+        encoding="utf-8",
+    )
+    from atlas.harnesses.base import AuthStatus
+
+    async def fake_agy_auth(self, *, auth=None):
+        return AuthStatus(provider="antigravity", available=True, authenticated=True)
+
+    monkeypatch.setenv("OPENAI_API_KEY", "sk-test")
+    monkeypatch.delenv("OPENROUTER_API_KEY", raising=False)
+    monkeypatch.setattr(AntigravityCLIAdapter, "check_auth", fake_agy_auth)
+
+    report = await run_doctor(ModelRouter(cfg))
+    by_provider = {check["provider"]: check for check in report["checks"]}
+    assert by_provider["openai"]["authenticated"] is True
+    assert "openrouter" not in by_provider

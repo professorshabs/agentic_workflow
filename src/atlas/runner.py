@@ -12,6 +12,7 @@ from typing import Any, Literal
 
 from atlas.events import publish, publishing
 from atlas.pipeline.build import (
+    FixerRequestError,
     build_app,
     build_app_workspace,
     fix_app,
@@ -24,7 +25,7 @@ from atlas.pipeline.clarify import (
     clarify_with_user,
     collect_clarifying_questions,
 )
-from atlas.pipeline.e2e import generate_e2e_tests
+from atlas.pipeline.e2e import generate_e2e_tests, sanitize_e2e_suite_files
 from atlas.pipeline.judge import judge
 from atlas.pipeline.parse import parse_spec
 from atlas.pipeline.render import render_plan, render_run_report
@@ -34,9 +35,11 @@ from atlas.pipeline.verify import (
     check_e2e_tests,
     check_product_contract,
     check_requirement_coverage,
+    e2e_file_hashes,
+    normalize_rel_path,
     verify_app,
 )
-from atlas.router import ModelRouter
+from atlas.router import ModelRouter, TokenBudgetExceededError
 from atlas.schemas import (
     ApprovalRecord,
     CheckResult,
@@ -51,6 +54,7 @@ from atlas.schemas import (
     VerificationRound,
     WorkspaceBuildResult,
 )
+from atlas.skills import resolve_role_skills
 from atlas.telemetry import append_ledger, ledger_entry, summarize_usage
 
 logger = logging.getLogger("atlas.runner")
@@ -68,7 +72,13 @@ def _fmt_elapsed(started: float) -> str:
 
 def _fmt_usage_brief(summary: Any) -> str:
     cost_part = f", ${summary.cost_usd:.4f}" if summary.cost_usd is not None else ""
-    return f"{summary.total_calls} calls, {summary.total_tokens:,} tokens{cost_part}"
+    api_cost = getattr(summary, "api_cost_usd", None)
+    api_part = (
+        f", ~${api_cost:.2f} at API prices"
+        if api_cost is not None and api_cost != summary.cost_usd
+        else ""
+    )
+    return f"{summary.total_calls} calls, {summary.total_tokens:,} tokens{cost_part}{api_part}"
 
 
 def _flow_description(
@@ -147,12 +157,15 @@ def _flow_description(
         if supervisor_enabled
         else []
     )
+    builder_skills = [
+        m.name for m in resolve_role_skills("builder", router.skills_config())
+    ]
     return {
         "skip_research": skip_research,
         "e2e": use_e2e,
         "from_run": str(from_run) if from_run else None,
         "targets": targets,
-        "builder": {"type": btype, "attempts": attempts},
+        "builder": {"type": btype, "attempts": attempts, "skills": builder_skills},
         "fixer": fixer_models,
         "max_fix_rounds": max_fix_rounds,
         "supervisor_enabled": supervisor_enabled,
@@ -585,6 +598,8 @@ async def run_plan(
                     "output_tokens": summary.completion_tokens,
                     "cost_usd": summary.cost_usd,
                     "unpriced_calls": summary.unpriced_calls,
+                    "api_cost_usd": summary.api_cost_usd,
+                    "api_unestimated_calls": summary.api_unestimated_calls,
                 },
             )
 
@@ -626,7 +641,9 @@ def _load_resumed_artifacts(
     )
     e2e_file = from_run / "e2e_tests.json"
     e2e_suite = (
-        E2ETestSuite.model_validate_json(e2e_file.read_text(encoding="utf-8"))
+        sanitize_e2e_suite_files(
+            E2ETestSuite.model_validate_json(e2e_file.read_text(encoding="utf-8"))
+        )
         if e2e_file.is_file()
         else None
     )
@@ -720,6 +737,8 @@ async def run_build(
     rendered_plan: str | None = None
     generated_app: GeneratedApp | WorkspaceBuildResult | None = None
     verification: VerificationReport | None = None
+    rounds: list[VerificationRound] = []
+    fix_attempt = 0
     latest_review: Review | None = None
     written_files: list[str] = []
     tracked_files: set[str] = set()
@@ -1201,6 +1220,10 @@ async def run_build(
             tracked_files.update(e2e_written)
 
         manifest["stages"]["build"] = "completed"
+        if isinstance(generated_app, WorkspaceBuildResult) and generated_app.available_skills:
+            manifest["builder_available_skills"] = list(generated_app.available_skills)
+            manifest["builder_used_skills"] = list(generated_app.used_skills)
+            manifest["builder_skills_mode"] = generated_app.skills_mode
         (out / "build.json").write_text(generated_app.model_dump_json(indent=2), encoding="utf-8")
         tracked_files.update(written_files)
         _write_manifest(out, manifest)
@@ -1209,11 +1232,17 @@ async def run_build(
             if isinstance(generated_app, WorkspaceBuildResult)
             else ""
         )
+        skills_note = (
+            f", skills={','.join(generated_app.used_skills)}"
+            if isinstance(generated_app, WorkspaceBuildResult) and generated_app.used_skills
+            else ""
+        )
         logger.info(
-            "[build] Done in %s — %d file(s) written%s",
+            "[build] Done in %s — %d file(s) written%s%s",
             _fmt_elapsed(stage_started),
             len(written_files),
             model_note,
+            skills_note,
         )
         publish(
             "stage",
@@ -1225,19 +1254,37 @@ async def run_build(
                 generated_app.harness if isinstance(generated_app, WorkspaceBuildResult) else None
             ),
             offloaded_to=manifest.get("build_offloaded_to"),
+            available_skills=(
+                list(generated_app.available_skills)
+                if isinstance(generated_app, WorkspaceBuildResult)
+                else []
+            ),
+            used_skills=(
+                list(generated_app.used_skills)
+                if isinstance(generated_app, WorkspaceBuildResult)
+                else []
+            ),
+            skills_mode=(
+                generated_app.skills_mode
+                if isinstance(generated_app, WorkspaceBuildResult)
+                else None
+            ),
             summary=generated_app.summary[:600],
         )
 
         rounds_limit = (
             max_fix_rounds if max_fix_rounds is not None else active_router.max_fix_rounds
         )
-        rounds: list[VerificationRound] = []
 
         functional_ids = [r.id for r in spec.requirements if r.kind == "functional"]
         check_coverage = active_router.require_requirement_tests and bool(functional_ids)
         check_contract = active_router.require_product_contract
         e2e_paths = [f.path for f in e2e_suite.files] if e2e_suite is not None else []
-        e2e_paths_set = set(e2e_paths)
+        e2e_expected_hashes = (
+            e2e_file_hashes(e2e_suite.files) if e2e_suite is not None else {}
+        )
+        e2e_norm_set = set(e2e_expected_hashes)
+        e2e_guard = {p.casefold() for p in e2e_norm_set}
 
         async def _run_verify() -> tuple[str, list[CheckResult]]:
             if verify_fn is not None:
@@ -1246,6 +1293,7 @@ async def run_build(
                 stack, found_checks = await verify_app(
                     app_dir,
                     timeout_seconds=active_router.verify_timeout_seconds,
+                    lint_exclude=sorted(e2e_norm_set) or None,
                 )
             if check_coverage:
                 found_checks = [*found_checks, check_requirement_coverage(app_dir, functional_ids)]
@@ -1259,6 +1307,7 @@ async def run_build(
                         e2e_paths,
                         verifiable=e2e_suite.verifiable,
                         unverifiable_reason=e2e_suite.unverifiable_reason,
+                        expected_hashes=e2e_expected_hashes,
                     ),
                 ]
             return stack, found_checks
@@ -1277,7 +1326,6 @@ async def run_build(
         rounds.append(current_round)
         _log_verification_round(current_round, time.monotonic() - verify_started)
 
-        fix_attempt = 0
         previous_diagnoses: list[str] = []
         supervisor_enabled = bool(active_router.backend_for("supervisor").get("enabled", False))
         while fix_attempt <= rounds_limit:
@@ -1362,6 +1410,7 @@ async def run_build(
             logger.info(
                 "[fix] Round %d/%d: fixing [%s]...", fix_attempt, rounds_limit, failing_names
             )
+            cur_fixer = fixer_model_for_round(active_router, fix_attempt)
             publish(
                 "stage",
                 "fix",
@@ -1369,26 +1418,89 @@ async def run_build(
                 round=fix_attempt,
                 max_rounds=rounds_limit,
                 failing=[c.name for c in current_round.checks if not c.passed],
-                model=fixer_model_for_round(active_router, fix_attempt),
+                model=cur_fixer,
             )
-            patch = await fix_app(
-                active_router,
-                spec,
-                app_dir,
-                current_round,
-                plan=plan,
-                fix_round=fix_attempt,
-                previous_diagnoses=list(previous_diagnoses),
-            )
+            try:
+                patch = await fix_app(
+                    active_router,
+                    spec,
+                    app_dir,
+                    current_round,
+                    plan=plan,
+                    fix_round=fix_attempt,
+                    previous_diagnoses=list(previous_diagnoses),
+                    protected_files=sorted(e2e_norm_set),
+                )
+            except TokenBudgetExceededError:
+                raise
+            except FixerRequestError as fix_exc:
+                # A round that returns no usable patch should not end a long run while rounds
+                # remain: move on to the next round (the next fixer in the rotation, or the
+                # same one again) and tell it what went wrong.
+                if fix_attempt >= rounds_limit:
+                    raise
+                next_fixer = fixer_model_for_round(active_router, fix_attempt + 1)
+                reason = (
+                    str(fix_exc).removeprefix("Fixer request failed with ")
+                    or type(fix_exc).__name__
+                )
+                logger.warning(
+                    "[fix] Round %d/%d (%s) failed (%s); %s for round %d/%d.",
+                    fix_attempt,
+                    rounds_limit,
+                    cur_fixer,
+                    reason,
+                    f"rotating to {next_fixer}"
+                    if next_fixer != cur_fixer
+                    else f"retrying {next_fixer}",
+                    fix_attempt + 1,
+                    rounds_limit,
+                )
+                publish(
+                    "stage",
+                    "fix",
+                    "failed",
+                    round=fix_attempt,
+                    max_rounds=rounds_limit,
+                    model=cur_fixer,
+                    error=reason,
+                )
+                hint = (
+                    " Return only the files that must change, and keep each one short."
+                    if "OutputTruncated" in reason
+                    else ""
+                )
+                previous_diagnoses.append(
+                    f"Round {fix_attempt} ({cur_fixer}) returned no usable patch "
+                    f"({reason[:240]}).{hint}"
+                )
+                continue
             current_round.diagnosis = patch.diagnosis
             previous_diagnoses.append(patch.diagnosis)
-            safe_deletes = [p for p in patch.delete_files if p not in e2e_paths_set]
+            dropped_protected = [
+                p.path for p in patch.files if normalize_rel_path(p.path).casefold() in e2e_guard
+            ]
+            safe_patch_files = [
+                p
+                for p in patch.files
+                if normalize_rel_path(p.path).casefold() not in e2e_guard
+            ]
+            safe_deletes = [
+                p for p in patch.delete_files if normalize_rel_path(p).casefold() not in e2e_guard
+            ]
+            if dropped_protected:
+                logger.warning(
+                    "[fix] Ignoring edits to protected E2E test file(s): %s",
+                    ", ".join(dropped_protected),
+                )
             updated = materialize_files(
                 app_dir,
-                patch.files,
+                safe_patch_files,
                 clean=False,
                 delete_files=safe_deletes,
             )
+            if e2e_suite is not None and e2e_suite.files:
+                materialize_files(app_dir, e2e_suite.files, clean=False)
             tracked_files.update(updated)
             tracked_files.difference_update(safe_deletes)
             diag_line = patch.diagnosis.splitlines()[0][:120] if patch.diagnosis else ""
@@ -1469,6 +1581,18 @@ async def run_build(
         manifest["model_calls"] = active_router.call_log
         sorted_files = sorted(tracked_files)
         manifest["generated_files"] = sorted_files
+        if verification is None and rounds:
+            last_round = rounds[-1]
+            verification = VerificationReport(
+                passed=False,
+                stack_detected=last_round.stack_detected,
+                rounds=rounds,
+                final_checks=last_round.checks,
+            )
+            (out / "verification.json").write_text(
+                verification.model_dump_json(indent=2), encoding="utf-8"
+            )
+            manifest["fix_rounds"] = fix_attempt
         if verification is not None:
             manifest["verification_passed"] = verification.passed
             manifest["verification_rounds"] = len(verification.rounds)
@@ -1520,6 +1644,8 @@ async def run_build(
                     "output_tokens": token_summary.completion_tokens,
                     "cost_usd": token_summary.cost_usd,
                     "unpriced_calls": token_summary.unpriced_calls,
+                    "api_cost_usd": token_summary.api_cost_usd,
+                    "api_unestimated_calls": token_summary.api_unestimated_calls,
                 },
             )
 

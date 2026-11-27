@@ -413,3 +413,169 @@ async def test_judge_evaluates_multiple_requirements_in_parallel_with_scoped_res
     # Case-insensitive deduplication while preserving order
     assert plan.risks == ["Unicode edge case", "Shared risk"]
     assert plan.tasks == ["Implement slugify", "Write tests", "Implement store", "Implement CLI"]
+
+
+@pytest.mark.asyncio
+async def test_research_harness_backend_deduplicates_multi_model_roles(monkeypatch):
+    from atlas.pipeline import research as research_mod
+
+    spec = ParsedSpec(
+        summary="Multi-model config under harness",
+        requirements=[
+            Requirement(id="R001", title="Req 1", description="Do A"),
+            Requirement(id="R002", title="Req 2", description="Do B"),
+        ],
+    )
+
+    class _HarnessResearchRouter(ModelRouter):
+        def __init__(self) -> None:
+            self.path = Path("fake")
+            self.cfg = {
+                "roles": {"researcher": ["m-one", "m-two", "m-three"]},
+                "backends": {
+                    "researcher": {"type": "harness", "provider": "antigravity", "model": "neon"}
+                },
+                "limits": {"max_parallel_calls": 4, "max_tokens": 1000, "timeout_seconds": 10},
+            }
+            self._semaphores = {}
+            self.call_log = []
+
+    calls: list[str] = []
+
+    async def fake_complete_json_model(router, *, model, role, system, user, **kwargs):
+        calls.append(model)
+        req_id = "R001" if "Requirement R001" in user else "R002"
+        return "neon", ResearchNote(
+            requirement_id=req_id,
+            model="neon",
+            candidates=[CandidateTool(name="stdlib")],
+        )
+
+    monkeypatch.setattr(research_mod, "complete_json_model", fake_complete_json_model)
+    report = await research(_HarnessResearchRouter(), spec)
+    assert len(calls) == 2
+    assert {n.requirement_id for n in report.notes} == {"R001", "R002"}
+
+
+@pytest.mark.asyncio
+async def test_run_build_preserves_verification_json_and_fix_rounds_on_mid_loop_crash(
+    tmp_path, monkeypatch
+):
+    from atlas import runner as runner_mod
+    from atlas.schemas import (
+        CheckResult,
+        GeneratedApp,
+        GeneratedFile,
+        PatchResult,
+        Plan,
+        ToolDecision,
+    )
+
+    spec_file = tmp_path / "spec.md"
+    spec_file.write_text("# Demo\nA small app\n", encoding="utf-8")
+    spec = ParsedSpec(
+        summary="Demo app",
+        requirements=[Requirement(id="R001", title="Run", description="Runs cleanly")],
+    )
+    plan = Plan(
+        spec=spec,
+        decisions=[
+            ToolDecision(
+                requirement_id="R001",
+                options=[{"name": "stdlib"}, {"name": "alt"}],
+                pick="stdlib",
+                rationale="Standard library",
+            )
+        ],
+        risks=[],
+        tasks=["Write app.py"],
+    )
+    from_run = tmp_path / "prev_run"
+    from_run.mkdir()
+    (from_run / "spec.json").write_text(spec.model_dump_json(indent=2), encoding="utf-8")
+    (from_run / "plan.json").write_text(plan.model_dump_json(indent=2), encoding="utf-8")
+
+    cfg = tmp_path / "models.yaml"
+    cfg.write_text(
+        """
+roles:
+  parser: [openrouter/m]
+  researcher: [openrouter/m]
+  judge: [openrouter/m]
+  builder: [openrouter/m]
+  fixer: [openrouter/m]
+limits:
+  max_parallel_calls: 2
+  max_tokens: 1000
+  timeout_seconds: 10
+  max_fix_rounds: 3
+verification:
+  require_requirement_tests: false
+  require_product_contract: false
+  require_e2e_tests: false
+""".strip()
+        + "\n",
+        encoding="utf-8",
+    )
+
+    async def fake_build(*args, **kwargs):
+        return GeneratedApp(
+            summary="Built",
+            stack="python",
+            files=[GeneratedFile(path="app.py", content="x = 1\n", purpose="app")],
+        )
+
+    verify_calls = 0
+
+    async def fake_verify(app_dir: Path):
+        nonlocal verify_calls
+        verify_calls += 1
+        return (
+            "python",
+            [
+                CheckResult(
+                    name="pytest",
+                    command="pytest",
+                    passed=False,
+                    exit_code=1,
+                    stderr=f"failure round {verify_calls}",
+                )
+            ],
+        )
+
+    fix_calls = 0
+
+    async def fake_fix(*args, **kwargs):
+        nonlocal fix_calls
+        fix_calls += 1
+        if fix_calls == 1:
+            return PatchResult(
+                diagnosis="First round attempt",
+                files=[GeneratedFile(path="app.py", content="x = 2\n", purpose="update")],
+            )
+        raise RuntimeError("OutputTruncatedError: mid-loop crash")
+
+    monkeypatch.setattr(runner_mod, "build_app", fake_build)
+    monkeypatch.setattr(runner_mod, "fix_app", fake_fix)
+
+    runs_root = tmp_path / "runs"
+    with pytest.raises(RuntimeError, match="mid-loop crash"):
+        await run_build(
+            spec_file,
+            runs_root,
+            tmp_path / "app" / "demo",
+            config_path=cfg,
+            from_run=from_run,
+            verify_fn=fake_verify,
+            ledger_path=tmp_path / "usage" / "ledger.jsonl",
+        )
+
+    [out_dir] = list(runs_root.iterdir())
+    assert (out_dir / "verification.json").is_file()
+    vjson = json.loads((out_dir / "verification.json").read_text(encoding="utf-8"))
+    assert vjson["passed"] is False
+    assert [r["round_number"] for r in vjson["rounds"]] == [1, 2]
+    manifest = json.loads((out_dir / "manifest.json").read_text(encoding="utf-8"))
+    assert manifest["status"] == "failed"
+    assert manifest["verification_rounds"] == 2
+    assert manifest["fix_rounds"] == 2

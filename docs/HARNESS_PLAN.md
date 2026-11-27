@@ -14,7 +14,7 @@
 | Judge | Claude Code `claude`, Opus 5.5, **strictly read-only** (pre-build planning, fallback OpenRouter). | Implemented |
 | E2E contract | Claude Code `claude`, Sonnet (`--effort high`), **strictly read-only** (pre-build black-box E2E tests, fallback OpenRouter). | Implemented |
 | Post-build Supervisor | **Dual parallel panel:** Claude Opus (`claude_code`, read-only, fallback OpenRouter) + Gemini 4 Neon (`agy`, fallback OpenRouter), merging findings into one unified review + improvement plan sent to Fixer. | Implemented |
-| Fixer | **Read-only Claude Code (`sonnet`, `--tools ""`, subscription) ↔ Antigravity CLI (`agy`, `gemini-4-hydrogen-high`)**, alternating between rounds, falling back to OpenRouter only on harness error. **No Codex.** | Implemented |
+| Fixer | **Read-only Claude Code (`sonnet`, `--tools ""`, subscription) ↔ Antigravity CLI (`agy`, `gemini-4-hydrogen-medium`)**, alternating between rounds, falling back to OpenRouter only on harness error. **No Codex.** | Implemented |
 | Verifier | Atlas `verify_app` + `spec-coverage`, credential-scrubbed, no model. Unchanged. | Confirmed |
 | Framework vs products | **Atlas is the framework; each product in `app/<spec-name>/` stands on its own.** Products are built and tested on your Mac, with **their own tests** that `verify_app` runs. GitHub CI, when you add it, tests only the Atlas framework. Deploying a product is a separate, later step (section 9). | Confirmed |
 | Interactive `atlas` chat | Deferred. `atlas run <spec.md>` alias kept as a small step. | Deferred |
@@ -48,7 +48,7 @@ Today every pipeline role is one API request through `ModelRouter` (LiteLLM), so
 | **E2E (`e2e`)** | Claude Code `claude` (read-only, fallback OpenRouter) | `sonnet` (`--effort high`) | Pre-build `generate_e2e_tests` (`--e2e-tests` / `require_e2e_tests: true`); compact prompt (omits raw findings & rejected candidates when `Plan` exists), `--tools ""`, `--max-budget-usd 2.00`, `600s` timeout, fallback to OpenRouter (`openrouter/anthropic/claude-sonnet-5.5`) only on error; locks down black-box `tests/` files (`e2e-product-tests`). |
 | **Supervisor** *(post-build dual panel)* | Parallel `reviewers`: Claude Code (`claude`, read-only, fallback OpenRouter) + Antigravity CLI `agy` (fallback OpenRouter) | Claude Opus 5.5 + Gemini 4 Neon | After green checks, both inspect the built app against the spec independently (`unanimous` mode by default). Verdicts merge into one unified `Review` (`issues` + `improvement_plan` in `supervisor_review.json`); any flagged issues go sequentially to the Fixer. |
 | **Builder** | Antigravity Python SDK (`lightweight()`) → ordered `offload` (`claude_code` → `agy` → `openrouter`) | Auto-discovered local Gemma 4 12B (`google/gemma-4-12b-qat` on LM Studio, `gemma4:12b-mlx` / `gemma4:12b` on Ollama; `only_preferred`, `max_parameter_size_b: 14`, `min_context_tokens: 49152`), handing off on stall/error/empty build to Claude Sonnet (`claude_code`, subscription, `acceptEdits`, file-only tools), then Gemini 4 Hydrogen (`agy`), then OpenRouter only on harness error | Edits files in an isolated workspace → `WorkspaceBuildResult` (diff + snapshot); reads short `BUILD_BRIEF.md` first, records `local_model` or `build_offloaded_to` / `build_offload_harness`. |
-| **Fixer** | Claude Code (`claude`, read-only) ↔ Antigravity CLI (`agy`) (fallback OpenRouter) | Round 1, 3, …: `claude_code` (`sonnet`, `--tools ""`). Round 2, 4, …: `agy` (`gemini-4-hydrogen-high`). OpenRouter (`claude-sonnet-5.5` / `gemini-4-hydrogen`) only on error | Runs only when verification fails; returns `PatchResult` (full replacement files), applied through `materialize_files` path checks. Each round gets the previous round's diagnosis and the `writing-clean-code` skill. |
+| **Fixer** | Claude Code (`claude`, read-only) ↔ Antigravity CLI (`agy`) (fallback OpenRouter) | Round 1, 3, …: `claude_code` (`sonnet`, `--tools ""`). Round 2, 4, …: `agy` (`gemini-4-hydrogen-medium`). OpenRouter (`claude-sonnet-5.5` / `gemini-4-hydrogen`) only on error | Runs only when verification fails; returns `PatchResult` (full replacement files), applied through `materialize_files` path checks (`PLAN.md`/`BUILD_BRIEF.md`/`.ignore` excluded from snapshots). Each round gets the previous round's diagnosis and the `writing-clean-code` skill. |
 | **Verifier** | Atlas built-in `verify_app` | none | Runs the **product's own tests** (pytest / `npm test`) plus compile, lint and build checks, `spec-coverage` and the product contract (section 4.1); credential-scrubbed (`_verification_env`). |
 
 ### Verified local laptop audit (checked on the Mac, 2026-11-23)
@@ -74,10 +74,12 @@ flowchart TD
     Research --> Clarify["Clarifying Questions (TTY / --answers -> clarifications.json + spec.assumptions)"]
     Clarify --> Judge["Judge per requirement: Claude Code Opus 5.5, read-only -> Plan"]
     Judge --> E2E["Pre-build E2E Tests: Claude Code Sonnet (--effort high, read-only) -> e2e_tests.json"]
-    E2E --> Ready{"Local model ready? explicit model or discovery + memory, context, tool smoke check"}
-    Ready -- "no" --> Stop["Stop with setup instructions (no cloud builder)"]
-    Ready -- "yes" --> Builder["Builder: Antigravity SDK (pre-seeded PLAN.md + tests/ + progressive skill index + lean prompt)"]
-    Builder --> Snapshot["WorkspaceBuildResult + authoritative E2E test check -> runs/run_id/build.json"]
+    E2E --> Ready{"Local 12B ready? (LM Studio / Ollama + >= 49152 ctx + tool smoke check)"}
+    Ready -- "no, no offload" --> Stop["Stop with setup instructions"]
+    Ready -- "no, offload" --> Offload["Offload: claude_code Sonnet -> agy Hydrogen -> OpenRouter"]
+    Ready -- "yes" --> Builder["Builder: Antigravity SDK (pre-seeded PLAN.md + BUILD_BRIEF.md + tests/ + role-scoped skills)"]
+    Offload --> Snapshot["WorkspaceBuildResult + authoritative E2E test check -> runs/run_id/build.json"]
+    Builder --> Snapshot
     Snapshot --> Verify["Atlas verify_app + spec-coverage + product-contract + e2e-product-tests (credential-scrubbed)"]
     Verify -- "fail, rounds left" --> Fixer["Fixer: claude_code Sonnet / agy Hydrogen (fallback OpenRouter) -> PatchResult"]
     Fixer --> Verify
@@ -134,7 +136,7 @@ config = LocalOpenAIAgentConfig(
 ```
 
 - The SDK is pre-1.0 (alpha). Pin the exact `google-antigravity` version in `pyproject.toml` **only after Phase 0 succeeds**.
-- **Checked against the installed 0.1.24 package** (`test_installed_antigravity_sdk_matches_what_the_adapter_calls`, runs whenever the SDK is installed): `hooks.policy.workspace_only(workspaces)` and `auto()`, the `model` / `base_url` / `workspaces` / `policies` / `skills_paths` config fields, `.lightweight()` (keeps `run_command`, `view_file`, `create_file`, `edit_file`), `async with Agent(cfg)`, `await response.text()` and `response.usage_metadata` (prompt / candidates / cached / thoughts / total token counts for the whole turn).
+- **Checked against the installed 0.1.24 package** (`test_installed_antigravity_sdk_matches_what_the_adapter_calls`, runs whenever the SDK is installed): `hooks.policy.workspace_only(workspaces)`, `deny()` and `allow_all()`, the `model` / `base_url` / `workspaces` / `policies` / `skills_paths` / `save_dir` / `capabilities` config fields, `.lightweight()` (keeps `view_file`, `create_file`, `edit_file`, and `run_command` only when `allow_shell: true`), `async with Agent(cfg)`, `await response.text()` and `response.usage_metadata` (prompt / candidates / cached / thoughts / total token counts for the whole turn).
 - **The SDK starts its local harness with a copy of Atlas's environment**, and its `env` option can only add variables. The adapter therefore hides every credential from `os.environ` while the agent session runs (section 8.2).
 - Phase 0 must confirm: workspace scoping (the agent can only write inside its workspace; the SDK's policy hooks can deny everything else), whether token usage is reported for local models, and whether skills are discovered.
 
@@ -147,21 +149,21 @@ config = LocalOpenAIAgentConfig(
 3. **Filter out:**
    - embeddings and rerankers (`embed`, `bge`, `nomic-embed`, `mxbai-embed`, `rerank`);
    - models without tool calling (Ollama `capabilities` must include `tools`);
-   - models below `min_context_tokens` (32,768). Ollama defaults to a 4,096-token context so start it with `OLLAMA_CONTEXT_LENGTH=64000`, and load LM Studio at 32K–64K;
-   - models whose estimated footprint exceeds `memory_budget_fraction` of RAM (`0.78`, about 18.7 GB on a 24 GB Mac).
-4. **Rank** what is left: the `preferred` list first (`google/gemma-4-26b-a4b-qat`, `gemma-4-26b-a4b-it-qat-mlx-4bit`, `gemma4:12b-mlx`, `gemma4:12b`), then loaded status, parameter count, and file size.
-5. **Tool smoke check:** before the build, the chosen model must make a valid `ping` tool call (`tool_choice="required"`, `max_tokens=256`, `timeout=180s` so swap-in after long planning stages succeeds). `probe_lm_studio` also reads `/api/v0/models` to capture `loaded` state, runtime `loaded_context_length`, and `tool_use` capabilities.
+   - models below `min_context_tokens` (49,152 in `config/harness.yaml`). Ollama defaults to a 4,096-token context so start it with `OLLAMA_CONTEXT_LENGTH=64000`, and load LM Studio at `>= 49152`;
+   - models above `max_parameter_size_b` (`14` in `config/harness.yaml`) or whose estimated footprint exceeds `memory_budget_fraction` of RAM (`0.70` in `config/harness.yaml`).
+4. **Rank** what is left: the `preferred` list first (`google/gemma-4-12b-qat`, `gemma4:12b-mlx`, `gemma4:12b`, with `only_preferred: true` so 26B+ models stay ignored even if installed), then loaded status, parameter count, and file size.
+5. **Tool smoke check:** before the build, the chosen model must make a valid `ping` tool call (`tool_choice="required"`, `max_tokens=256`, `smoke_timeout_seconds: 90` in `config/harness.yaml` so swap-in after long planning stages succeeds). `probe_lm_studio` also reads `/api/v0/models` to capture `loaded` state, runtime `loaded_context_length`, and `tool_use` capabilities.
 6. **Runtime context check (Ollama):** `/api/show` reports the model's *trained* maximum (often 128K), not what Ollama serves. The smoke call loads the model, so Atlas then reads `/api/ps` and rejects the model if it was loaded below `min_context_tokens`, telling you to restart with `OLLAMA_CONTEXT_LENGTH=…`. Without this, a 4,096-token default would silently truncate the builder's prompt.
-7. **No model ready → stop** with clear instructions (`ollama serve`, `ollama pull gemma4:12b-mlx`, start LM Studio's server). There is no cloud builder fallback.
+7. **No model ready or local stall/empty build → ordered offload (when configured):** `config/harness.yaml` hands off cleanly to `claude_code` (`sonnet`, subscription, file-only tools) → `antigravity` (`gemini-4-hydrogen-high`) → `openrouter` (`openrouter/anthropic/claude-sonnet-5.5`) last resort; without `offload`, Atlas stops with local setup instructions.
 
 ### 5.3 Model choice for this Mac (M5, 24 GB)
 
 | Model | Size | Fit on 24 GB | Role here |
 | :--- | :--- | :--- | :--- |
-| `google/gemma-4-26b-a4b-qat` / `gemma-4-26b-a4b-it-qat-mlx-4bit` (LM Studio) | 15.6 GB (MoE, 4B active) | Fits with 32K–64K context (~17.3 GB est. < 18.7 GB cap) | **1st `preferred` choice.** Fast MLX MoE when LM Studio's local server is running. |
+| `google/gemma-4-12b-qat` (LM Studio) | ~7.5 GB | Effortless fit with 49K–64K context | **1st `preferred` choice.** Selected first when LM Studio is running with `>= 49152` context. |
 | `gemma4:12b-mlx` / `gemma4:12b` (Ollama) | ~7.0 GB | Effortless fit with 64K context and ~16 GB free RAM | **Fallback `preferred` choice.** Selected automatically when LM Studio is stopped and Ollama is running. |
-| `qwen3-coder:30b` | 19 GB at Q4 | Too big once context is added (suits 32 GB Macs) | Skip |
-| Dense ~27B models | ~17 GB | Fits, but slow as an agent | Better for chat than for a build loop |
+| Larger local models (`> 14B`, e.g. 26B/27B/30B) | 15–19 GB | Excluded by `only_preferred: true` and `max_parameter_size_b: 14` | Skipped so complex builds stay fast locally and offload cleanly to `claude_code` Sonnet / `agy` Hydrogen when needed. |
+| Dense ~27B models | ~17 GB | Fits, but slow as an agent | Skipped when `only_preferred: true` |
 
 - **Ollama:** start it with `OLLAMA_CONTEXT_LENGTH=64000 ollama serve`.
 - **LM Studio:** set the context length to 32K–64K (with KV-cache quantization recommended for 64K) when loading `gemma-4-26B-A4B-it-QAT-MLX-4bit`, then start its local server.
@@ -198,7 +200,7 @@ config = LocalOpenAIAgentConfig(
 
 ## 7. Fixer: alternating `claude_code` and `agy` (OpenRouter on error)
 
-- **Harness-first rotation:** Round 1, 3, …: read-only `claude_code` (`sonnet`, `--tools ""`, subscription, fallback `openrouter/anthropic/claude-sonnet-5.5`). Round 2, 4, …: `agy` (`gemini-4-hydrogen-high`, fallback `openrouter/google/gemini-4-hydrogen`). OpenRouter runs only if the active harness errors.
+- **Harness-first rotation:** Round 1, 3, …: read-only `claude_code` (`sonnet`, `--tools ""`, subscription, fallback `openrouter/anthropic/claude-sonnet-5.5`). Round 2, 4, …: `agy` (`gemini-4-hydrogen-medium`, fallback `openrouter/google/gemini-4-hydrogen`). OpenRouter runs only if the active harness errors.
 - **Sequential only:** the fixer never runs while the builder, judge or supervisor is running.
 - **Input:** the spec's requirements, failing checks (stdout/stderr tails), a snapshot of current files, the previous round's diagnosis, and the `writing-clean-code` skill text.
 - **Output:** `PatchResult` (full replacement files or deletions), applied through `materialize_files` with the existing path checks.
@@ -221,7 +223,9 @@ config = LocalOpenAIAgentConfig(
 - Each harness gets **only its own credentials**: `ANTHROPIC_*` / `CLAUDE_CODE_*` only to `claude`, `GEMINI_*` / `GOOGLE_*` / `ANTIGRAVITY_*` only to `agy`, nothing to the local builder.
 - **Claude billing guard:** if `ANTHROPIC_API_KEY` is set, Claude Code uses it instead of your subscription and bills the API. Atlas loads `.env` into its own environment (and so does LiteLLM when it is imported), so the Claude adapter removes `ANTHROPIC_API_KEY` from `claude`'s environment unless `backends.judge.auth: api` is set on purpose. `atlas doctor` also flags a login whose `claude auth status` reports `authMethod: api_key`.
 - **`agy` billing guard:** the same rule for `GEMINI_API_KEY` / `GOOGLE_API_KEY` / `ANTIGRAVITY_API_KEY`: they reach `agy` only with `auth: api` on that backend; otherwise `agy` uses its cached login and the ledger says `cached_login`.
-- **Local builder:** the Antigravity SDK hands its harness a copy of `os.environ`, and the local model's `run_command` tool runs there. The adapter removes every credential (same rules as `verify_app`) from the process environment for the length of the session and restores it afterwards.
+- **Local builder permissions (2026-11-26):** `workspace_only` + `allow_all`, no `policy.auto()`. With `auto()` and no catch-all allow, the SDK refused every file tool ("No policy rule matched ... denied (fail-closed)"), and `auto()` sent a "Runtime Policy Guardian" prompt to the same local 12B before each shell command (236 s for one `cat`), so every local build stalled. The 12B now gets file tools only (`run_command` hidden and denied) unless `backends.builder.allow_shell: true`, which allows commands whose `Cwd` is inside the product folder, in the SDK's OS sandbox when `sandbox: true`. `PLAN.md` (~30K tokens) is kept out of the folder during the local attempt (the 12B reads `BUILD_BRIEF.md`) and written back afterwards. The SDK's SQLite run records go to a temporary `atlas-sdk-*` folder, deleted when the attempt writes files and kept (path logged) when it fails or writes nothing.
+- **Authoritative E2E files in verification (2026-11-26):** run `20261126T095231Z` spent all three fix rounds on two failures nobody could fix, both in the protected `tests/test_e2e_product.py`: ruff 0.16+ flags UP031 (`"%s" % x`) by default and its fix is "unsafe", so the generation-time `ruff --fix` left it; and the skip check flagged five `pytest.skip()` calls that were all conditional (no Chromium). Now `verify_app(lint_exclude=...)` keeps protected E2E files out of `python-ruff` (`--extend-exclude`; the runner and `atlas verify --from-run` pass them), skip detection uses the syntax tree (only `@pytest.mark.skip`, a module-level skip or `pytestmark`, or a skip that is the first statement of a test count), and when a file's SHA-256 matches the authoritative suite, content warnings are reported as notes instead of failing the check.
+- **Local builder:** the Antigravity SDK hands its harness a copy of `os.environ`, and the local model's `run_command` tool (when allowed) runs there. The adapter removes every credential (same rules as `verify_app`) from the process environment for the length of the session and restores it afterwards.
 - `verify_app` keeps stripping every `*_API_KEY*`, `*_TOKEN*`, `*_SECRET*` and `GITHUB_*` variable.
 
 ### 8.3 `atlas doctor` (before any tokens are spent)
@@ -379,25 +383,48 @@ backends:
         router_model: openrouter/google/gemini-4-neon
 
   builder:
-    type: local_harness               # local only: no cloud builder
+    type: local_harness               # local first, then ordered cloud offload
     local_harness: antigravity_sdk    # LocalOpenAIAgentConfig(model=..., base_url=...).lightweight()
     local_providers:
-      ollama: http://localhost:11434/v1
       lm_studio: http://localhost:1234/v1
-    local_model: null                 # auto-discover LM Studio 26B or Ollama 12B (section 5.2)
-    preferred: [google/gemma-4-26b-a4b-qat, gemma-4-26b-a4b-it-qat-mlx-4bit, gemma4:12b-mlx, gemma4:12b]
+      ollama: http://localhost:11434/v1
+    local_model: null                 # auto-discover Gemma 4 12B (section 5.2)
+    preferred: [google/gemma-4-12b-qat, gemma4:12b-mlx, gemma4:12b]
+    only_preferred: true
+    max_parameter_size_b: 14
     require_tools: true
-    min_context_tokens: 32768         # Ollama: OLLAMA_CONTEXT_LENGTH=64000; LM Studio: 32K-64K
-    memory_budget_fraction: 0.78      # ~18.7 GB of 24 GB
+    min_context_tokens: 49152         # Ollama: OLLAMA_CONTEXT_LENGTH=64000; LM Studio: >= 49152
+    memory_budget_fraction: 0.70
     require_tool_smoke_check: true
-    timeout_seconds: 1800
+    smoke_timeout_seconds: 90
+    timeout_seconds: 900
+    stall_seconds: 420
+    brief_max_chars: 24000
     sandbox: true
+    offload:
+      - { name: sonnet, type: harness, provider: claude_code, model: sonnet, auth: subscription, max_budget_usd: 5.00, timeout_seconds: 900 }
+      - { name: hydrogen, type: harness, provider: antigravity, model: gemini-4-hydrogen-high, timeout_seconds: 900 }
+      - { name: sonnet-openrouter, type: openrouter, model: openrouter/anthropic/claude-sonnet-5.5 }
 
   fixer:
-    type: openrouter                  # sequential PatchResult via ModelRouter
-    rotate:                           # round 1, 3, ...: first; round 2, 4, ...: second
-      - openrouter/anthropic/claude-sonnet-5.5
-      - openrouter/google/gemini-4-hydrogen
+    type: harness
+    fallback: router                  # OpenRouter only if the active harness errors
+    rotate:                           # round 1, 3, ...: Claude Sonnet (`claude`); round 2, 4, ...: Hydrogen (`agy`)
+      - type: harness
+        provider: claude_code
+        model: sonnet
+        read_only: true
+        auth: subscription
+        max_budget_usd: 2.00
+        timeout_seconds: 300
+        fallback: router
+        router_model: openrouter/anthropic/claude-sonnet-5.5
+      - type: harness
+        provider: antigravity
+        model: gemini-4-hydrogen-medium
+        timeout_seconds: 420
+        fallback: router
+        router_model: openrouter/google/gemini-4-hydrogen
 
 limits:
   max_tokens_by_role:
@@ -405,13 +432,13 @@ limits:
     judge: 16000
     e2e: 32000
     builder: 32000
-    fixer: 24000
+    fixer: 48000
   timeout_seconds_by_role:
     researcher: 240
     judge: 300
     e2e: 300
     builder: 1800
-    fixer: 300
+    fixer: 420
 
 limits_extra:
   max_total_tokens_per_run: null      # set a number to cap every harness by tokens

@@ -123,7 +123,7 @@ def test_verify_text_json_and_failure(run_cli, monkeypatch):
                     stderr="E501 line too long"),
     ]
 
-    async def fake_verify(app_dir, timeout_seconds):
+    async def fake_verify(app_dir, timeout_seconds, **kwargs):
         return "python", checks
 
     monkeypatch.setattr(cli, "verify_app", fake_verify)
@@ -135,7 +135,7 @@ def test_verify_text_json_and_failure(run_cli, monkeypatch):
     payload = json.loads(out)
     assert code == 1 and payload["stack"] == "python" and payload["passed"] is False
 
-    async def passing(app_dir, timeout_seconds):
+    async def passing(app_dir, timeout_seconds, **kwargs):
         return "python", checks[:1]
 
     monkeypatch.setattr(cli, "verify_app", passing)
@@ -396,3 +396,68 @@ def test_build_summary_prints_before_the_ui_is_kept_open(run_cli, monkeypatch, t
     monkeypatch.setattr(cli, "run_build", fake_run_build)
     code, _, _ = run_cli("build", "specs/example-app.md", "--ui", "--no-open", "--ui-keep-open")
     assert code == 0 and printed_before_exit == [True]
+
+
+def test_verify_cli_product_contract_and_from_run(run_cli, monkeypatch, tmp_path):
+    from atlas.schemas import E2ETestSuite, GeneratedFile, ParsedSpec, Requirement
+
+    app_dir = tmp_path / "product"
+    (app_dir / "tests").mkdir(parents=True)
+    (app_dir / "README.md").write_text("# Demo\n\nInstall & test: `pytest`.\n", encoding="utf-8")
+    (app_dir / "pyproject.toml").write_text("[project]\nname='demo'\n", encoding="utf-8")
+    e2e_text = "def test_r001_product():\n    # R001\n    assert True\n"
+    (app_dir / "tests" / "test_e2e_product.py").write_text(e2e_text, encoding="utf-8")
+
+    run_dir = tmp_path / "runs" / "r_prev"
+    run_dir.mkdir(parents=True)
+    spec = ParsedSpec(
+        summary="Demo product",
+        requirements=[Requirement(id="R001", title="Work", description="Works")],
+    )
+    e2e = E2ETestSuite(
+        summary="Product tests",
+        product_interface="cli",
+        stack="python",
+        verifiable=True,
+        scenarios=["run"],
+        files=[GeneratedFile(path="tests/test_e2e_product.py", content=e2e_text)],
+    )
+    (run_dir / "spec.json").write_text(spec.model_dump_json(indent=2), encoding="utf-8")
+    (run_dir / "e2e_tests.json").write_text(e2e.model_dump_json(indent=2), encoding="utf-8")
+
+    lint_excluded: list = []
+
+    async def passing(app_path, timeout_seconds, **kwargs):
+        lint_excluded.append(kwargs.get("lint_exclude"))
+        return "python", [CheckResult(name="pytest", command="pytest", passed=True, exit_code=0)]
+
+    monkeypatch.setattr(cli, "verify_app", passing)
+
+    code, out, _ = run_cli("verify", "--app-dir", str(app_dir), "--json")
+    assert code == 0
+    assert [c["name"] for c in json.loads(out)["checks"]] == ["pytest"]
+
+    code, out, _ = run_cli(
+        "verify",
+        "--app-dir",
+        str(app_dir),
+        "--product-contract",
+        "--from-run",
+        str(run_dir),
+        "--json",
+    )
+    assert code == 0
+    names = [c["name"] for c in json.loads(out)["checks"]]
+    assert names == ["pytest", "spec-coverage", "e2e-product-tests", "product-contract"]
+    # The authoritative E2E file is left out of the product lint (nobody may edit it).
+    assert lint_excluded[-1] == ["tests/test_e2e_product.py"]
+
+    # Mutating the E2E file must fail e2e-product-tests via --from-run SHA-256 verification.
+    (app_dir / "tests" / "test_e2e_product.py").write_text(
+        "def test_r001_tampered():\n    # R001\n    assert True\n", encoding="utf-8"
+    )
+    code, out, _ = run_cli(
+        "verify", "--app-dir", str(app_dir), "--from-run", str(run_dir), "--json"
+    )
+    assert code == 1
+    assert json.loads(out)["passed"] is False

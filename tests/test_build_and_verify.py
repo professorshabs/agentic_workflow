@@ -427,6 +427,33 @@ def test_materialize_files_clean_delete_and_snapshot(tmp_path):
     assert ".gitkeep" not in snap
     assert "__pycache__/ignored.pyc" not in snap
     assert snap["z_big.txt"].endswith("... [truncated]")
+    assert sum(map(len, snap.values())) <= 600
+
+
+def test_snapshot_app_files_skips_credentials_and_external_symlinks(tmp_path):
+    app_dir = tmp_path / "app"
+    app_dir.mkdir()
+    (app_dir / "main.py").write_text("print('safe')\n", encoding="utf-8")
+    (app_dir / ".env").write_text("API_KEY=secret\n", encoding="utf-8")
+    (app_dir / ".env.example").write_text("API_KEY=replace-me\n", encoding="utf-8")
+    (app_dir / "private.pem").write_text("private key material", encoding="utf-8")
+    (app_dir / "secrets").mkdir()
+    (app_dir / "secrets" / "config.json").write_text("{}", encoding="utf-8")
+
+    outside = tmp_path / "outside.txt"
+    outside.write_text("outside secret", encoding="utf-8")
+    try:
+        (app_dir / "linked.txt").symlink_to(outside)
+    except OSError:
+        pass
+
+    snapshot = snapshot_app_files(app_dir)
+    assert "main.py" in snapshot
+    assert ".env.example" in snapshot
+    assert ".env" not in snapshot
+    assert "private.pem" not in snapshot
+    assert "secrets/config.json" not in snapshot
+    assert "linked.txt" not in snapshot
 
 
 async def test_detect_stack_and_verify_app_edge_cases(tmp_path):

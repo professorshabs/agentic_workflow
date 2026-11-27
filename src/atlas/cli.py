@@ -19,9 +19,15 @@ from atlas.local_models import (
 )
 from atlas.pipeline.build import default_app_dir
 from atlas.pipeline.clarify import load_answers_file
-from atlas.pipeline.verify import verify_app
+from atlas.pipeline.verify import (
+    check_e2e_tests,
+    check_product_contract,
+    check_requirement_coverage,
+    e2e_file_hashes,
+    verify_app,
+)
 from atlas.router import ModelRouter
-from atlas.runner import run_build, run_plan
+from atlas.runner import _load_resumed_artifacts, run_build, run_plan
 from atlas.schemas import TokenUsageSummary
 from atlas.telemetry import (
     DEFAULT_LEDGER,
@@ -105,6 +111,19 @@ def _add_clarify_and_e2e_args(p: argparse.ArgumentParser) -> None:
         default=None,
         help="generate authoritative black-box E2E product tests before build",
     )
+
+
+def _verify_app_dir(from_run: Path | None) -> Path:
+    """Product folder for `atlas verify`: the one the run built, else `app`."""
+    if from_run is not None:
+        try:
+            manifest = json.loads((from_run / "manifest.json").read_text(encoding="utf-8"))
+        except (OSError, ValueError):
+            manifest = None
+        recorded = manifest.get("app_dir") if isinstance(manifest, dict) else None
+        if isinstance(recorded, str) and recorded.strip():
+            return Path(recorded)
+    return Path("app")
 
 
 def main() -> None:
@@ -212,8 +231,24 @@ def main() -> None:
     verify_parser = sub.add_parser(
         "verify", help="detect stack and run test/lint/build verification checks"
     )
-    verify_parser.add_argument("--app-dir", type=Path, default=Path("app"))
+    verify_parser.add_argument(
+        "--app-dir",
+        type=Path,
+        default=None,
+        help="product folder to verify (default: the run's folder with --from-run, else app)",
+    )
     verify_parser.add_argument("--timeout", type=float, default=180.0)
+    verify_parser.add_argument(
+        "--product-contract",
+        action="store_true",
+        help="also run the README/DEPLOYMENT/test-suite product contract check",
+    )
+    verify_parser.add_argument(
+        "--from-run",
+        type=Path,
+        default=None,
+        help="run folder whose spec.json and e2e_tests.json enforce coverage and E2E integrity",
+    )
     verify_parser.add_argument("--json", action="store_true")
 
     tokens_parser = sub.add_parser("tokens", help="show token usage and cost for a run")
@@ -382,9 +417,37 @@ def main() -> None:
                 raise FileNotFoundError(f"Run folder not found: {run_dir}")
             serve_replay(run_dir, port=args.port, open_browser=not args.no_open)
         elif args.cmd == "verify":
-            stack, checks = asyncio.run(
-                verify_app(args.app_dir, timeout_seconds=args.timeout)
+            if args.app_dir is None:
+                args.app_dir = _verify_app_dir(args.from_run)
+            resumed = _load_resumed_artifacts(args.from_run) if args.from_run is not None else None
+            protected = (
+                sorted(e2e_file_hashes(resumed[4].files))
+                if resumed is not None and resumed[4] is not None
+                else None
             )
+            if protected:
+                stack, checks = asyncio.run(
+                    verify_app(args.app_dir, timeout_seconds=args.timeout, lint_exclude=protected)
+                )
+            else:
+                stack, checks = asyncio.run(verify_app(args.app_dir, timeout_seconds=args.timeout))
+            if resumed is not None:
+                spec, _, _, _, e2e_suite = resumed
+                functional_ids = [r.id for r in spec.requirements if r.kind == "functional"]
+                if functional_ids:
+                    checks.append(check_requirement_coverage(args.app_dir, functional_ids))
+                if e2e_suite is not None:
+                    checks.append(
+                        check_e2e_tests(
+                            args.app_dir,
+                            [f.path for f in e2e_suite.files],
+                            verifiable=e2e_suite.verifiable,
+                            unverifiable_reason=e2e_suite.unverifiable_reason,
+                            expected_hashes=e2e_file_hashes(e2e_suite.files),
+                        )
+                    )
+            if args.product_contract:
+                checks.append(check_product_contract(args.app_dir))
             passed = bool(checks) and all(c.passed for c in checks)
             if args.json:
                 print(
@@ -398,6 +461,7 @@ def main() -> None:
                     )
                 )
             else:
+                print(f"App folder: {args.app_dir}")
                 print(f"Stack: {stack}")
                 for chk in checks:
                     badge = "PASS" if chk.passed else "FAIL"

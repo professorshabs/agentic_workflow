@@ -154,6 +154,9 @@ def test_old_runs_are_rebuilt_from_their_artifacts(tmp_path):
     (tmp_path / "build.json").write_text(json.dumps({
         "summary": "Built app.py",
         "files_snapshot": ["app.py", "tests/test_app.py"],
+        "available_skills": ["developing-fullstack-apps", "writing-clean-code"],
+        "used_skills": ["writing-clean-code"],
+        "skills_mode": "progressive",
     }), encoding="utf-8")
     (tmp_path / "tokens.json").write_text(json.dumps({
         "calls": [
@@ -180,6 +183,17 @@ def test_old_runs_are_rebuilt_from_their_artifacts(tmp_path):
     assert ("stage", "e2e_tests", "unverifiable") in by
     assert ("attempt", "build", "offloaded") in by
     assert ("attempt", "build", "passed") in by
+    build_stage = next(e for e in events if e["kind"] == "stage" and e["stage"] == "build")
+    assert build_stage["data"]["available_skills"] == [
+        "developing-fullstack-apps",
+        "writing-clean-code",
+    ]
+    assert build_stage["data"]["used_skills"] == ["writing-clean-code"]
+    assert build_stage["data"]["skills_mode"] == "progressive"
+    assert events[0]["data"]["flow"]["builder"]["skills"] == [
+        "developing-fullstack-apps",
+        "writing-clean-code",
+    ]
     assert ("workspace", "build", None) in by
     assert ("usage", "parse", "passed") in by
     assert ("usage", "build", "passed") in by
@@ -372,3 +386,51 @@ limits:
     ]
     assert events[-1]["kind"] == "run" and events[-1]["status"] == "passed"
     assert (out / "events.jsonl").is_file()
+
+
+def test_replay_of_an_older_run_fills_in_input_and_output_tokens(tmp_path):
+    """Runs recorded before usage events carried the split get it from tokens.json."""
+    lines = [
+        {"v": 1, "seq": 1, "ts": 1.0, "run_id": "r", "kind": "run", "stage": "run",
+         "status": "running", "message": "", "data": {"run_id": "r"}},
+        {"v": 1, "seq": 2, "ts": 2.0, "run_id": "r", "kind": "usage", "stage": "parse",
+         "status": "passed", "message": "", "data": {"role": "parser", "tokens": 30}},
+        {"v": 1, "seq": 3, "ts": 3.0, "run_id": "r", "kind": "usage", "stage": "build",
+         "status": "passed", "message": "", "data": {"role": "builder", "tokens": 70}},
+        {"v": 1, "seq": 4, "ts": 4.0, "run_id": "r", "kind": "run", "stage": "run",
+         "status": "passed", "message": "",
+         "data": {"result": "verified", "usage": {"calls": 2, "tokens": 100}}},
+    ]
+    (tmp_path / "events.jsonl").write_text(
+        "".join(json.dumps(line) + "\n" for line in lines), encoding="utf-8"
+    )
+    (tmp_path / "tokens.json").write_text(
+        json.dumps({
+            "prompt_tokens": 80,
+            "completion_tokens": 20,
+            "calls": [
+                {"role": "parser", "prompt_tokens": 25, "completion_tokens": 5},
+                {"role": "builder", "prompt_tokens": 55, "completion_tokens": 15},
+            ],
+        }),
+        encoding="utf-8",
+    )
+    events = load_run_events(tmp_path)
+    usage = [e["data"] for e in events if e["kind"] == "usage"]
+    assert [(u["input_tokens"], u["output_tokens"]) for u in usage] == [(25, 5), (55, 15)]
+    final = events[-1]["data"]["usage"]
+    assert (final["input_tokens"], final["output_tokens"]) == (80, 20)
+
+
+def test_token_split_is_not_guessed_when_calls_do_not_line_up(tmp_path):
+    lines = [
+        {"v": 1, "seq": 1, "ts": 1.0, "run_id": "r", "kind": "usage", "stage": "parse",
+         "status": "passed", "message": "", "data": {"role": "parser", "tokens": 30}},
+    ]
+    (tmp_path / "events.jsonl").write_text(json.dumps(lines[0]) + "\n", encoding="utf-8")
+    (tmp_path / "tokens.json").write_text(
+        json.dumps({"calls": [{"role": "judge", "prompt_tokens": 1, "completion_tokens": 2}]}),
+        encoding="utf-8",
+    )
+    (event,) = load_run_events(tmp_path)
+    assert "input_tokens" not in event["data"]

@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import logging
+import re
 from pathlib import Path
 from typing import Any
 
@@ -192,18 +193,60 @@ def format_role_skill_index(
     return "\n".join(lines)
 
 
-def sync_workspace_skills(workspace_root: Path, skills_cfg: dict[str, Any]) -> list[Path]:
-    """Expose allowlisted skills into `<workspace_root>/.agents/skills/` via symlinks."""
+def sync_workspace_skills(
+    workspace_root: Path,
+    skills_cfg: dict[str, Any],
+    *,
+    role: str | None = None,
+) -> list[Path]:
+    """Expose configured skills into `<workspace_root>/.agents/skills/` via symlinks."""
     sources = list(skills_cfg.get("sources") or [])
     if not sources:
         return []
-    raw_allowlist = skills_cfg.get("allowlist")
-    allowlist = list(raw_allowlist) if raw_allowlist is not None else None
-    discovered = discover_skills(sources, allowlist=allowlist)
-    if not discovered:
+    if role is not None:
+        skill_metadata = resolve_role_skills(role, skills_cfg)
+    else:
+        raw_allowlist = skills_cfg.get("allowlist")
+        allowlist = list(raw_allowlist) if raw_allowlist is not None else None
+        skill_metadata = list(discover_skills(sources, allowlist=allowlist).values())
+    # Directory names are the link keys used by the skill index; frontmatter is untrusted.
+    discovered = {Path(meta.path).parent.name: meta for meta in skill_metadata}
+
+    root = workspace_root.resolve()
+    agents_dir = root / ".agents"
+    target_root = agents_dir / "skills"
+    if agents_dir.is_symlink() or (agents_dir.exists() and not agents_dir.is_dir()):
+        logger.warning("Skipping skill sync because workspace `.agents` is not a real directory.")
+        return []
+    if target_root.is_symlink() or (target_root.exists() and not target_root.is_dir()):
+        logger.warning(
+            "Skipping skill sync because workspace `.agents/skills` is not a real directory."
+        )
         return []
 
-    target_root = (workspace_root / ".agents" / "skills").resolve()
+    if role is not None and target_root.is_dir():
+        raw_allowlist = skills_cfg.get("allowlist")
+        allowlist = list(raw_allowlist) if raw_allowlist is not None else None
+        configured = discover_skills(sources, allowlist=allowlist)
+        configured_by_key = {
+            Path(meta.path).parent.name: Path(meta.path).parent.resolve()
+            for meta in configured.values()
+        }
+        for existing in list(target_root.iterdir()):
+            expected_target = configured_by_key.get(existing.name)
+            if (
+                existing.is_symlink()
+                and existing.name not in discovered
+                and expected_target is not None
+            ):
+                try:
+                    if existing.resolve() == expected_target:
+                        existing.unlink()
+                except OSError:
+                    continue
+
+    if not discovered:
+        return []
     target_root.mkdir(parents=True, exist_ok=True)
     created_links: list[Path] = []
 
@@ -216,11 +259,89 @@ def sync_workspace_skills(workspace_root: Path, skills_cfg: dict[str, Any]) -> l
             logger.debug("Skipping existing non-symlink workspace skill directory: %s", link_path)
             continue
         if link_path.is_symlink():
-            if link_path.resolve() == skill_dir:
-                created_links.append(link_path)
+            try:
+                if link_path.resolve() == skill_dir:
+                    if role is None:
+                        # Preserve the legacy non-role API, whose caller owns cleanup.
+                        created_links.append(link_path)
+                    continue
+            except OSError:
+                pass
+            if role is None:
+                link_path.unlink()
+            else:
+                logger.warning(
+                    "Skipping existing workspace skill symlink with a different target: %s",
+                    link_path,
+                )
                 continue
-            link_path.unlink()
         link_path.symlink_to(skill_dir, target_is_directory=True)
         created_links.append(link_path)
 
     return created_links
+
+
+_SKILLS_USED_LINE_RE = re.compile(
+    r"(?:^|\n)\s*(?:[-*]\s*)?(?:\*\*)?skills?\s+used(?:\*\*)?\s*:\s*(.+)",
+    re.IGNORECASE,
+)
+
+
+def snapshot_skill_atimes(skills: list[SkillMetadata]) -> dict[str, int]:
+    """Capture `st_atime_ns` per skill `SKILL.md` to detect reads when the OS records atimes."""
+    atimes: dict[str, int] = {}
+    for meta in skills:
+        try:
+            atimes[meta.name] = Path(meta.path).stat().st_atime_ns
+        except OSError:
+            atimes[meta.name] = 0
+    return atimes
+
+
+def detect_used_skills(
+    skills: list[SkillMetadata],
+    *,
+    summary_text: str = "",
+    before_atimes: dict[str, int] | None = None,
+) -> list[str]:
+    """Determine which allowlisted skills were read or reported used by a workspace builder."""
+    if not skills:
+        return []
+
+    lookup: dict[str, str] = {}
+    for meta in skills:
+        lookup[meta.name.lower()] = meta.name
+        lookup[Path(meta.path).parent.name.lower()] = meta.name
+
+    used: set[str] = set()
+
+    if before_atimes:
+        for meta in skills:
+            prev = before_atimes.get(meta.name, 0)
+            if prev <= 0:
+                continue
+            try:
+                if Path(meta.path).stat().st_atime_ns > prev:
+                    used.add(meta.name)
+            except OSError:
+                continue
+
+    if summary_text:
+        for match in _SKILLS_USED_LINE_RE.finditer(summary_text):
+            raw_line = match.group(1).strip()
+            # Split on a spaced "and" only: skill names like `build-and-test` contain one.
+            for part in re.split(r"[,;|]|\s+and\s+", raw_line, flags=re.IGNORECASE):
+                token = part.strip().strip("`*'\".()[]{}").lower()
+                if not token or token in {"none", "n/a", "na", "no skills", "no skill"}:
+                    continue
+                canonical = lookup.get(token)
+                if canonical is not None:
+                    used.add(canonical)
+
+        lowered = summary_text.lower()
+        for meta in skills:
+            key = Path(meta.path).parent.name.lower()
+            if f"{key}/skill.md" in lowered:
+                used.add(meta.name)
+
+    return [meta.name for meta in skills if meta.name in used]

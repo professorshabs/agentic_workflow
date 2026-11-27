@@ -2,7 +2,9 @@
 
 from __future__ import annotations
 
+import ast
 import asyncio
+import hashlib
 import importlib.util
 import json
 import os
@@ -13,8 +15,9 @@ import sys
 import tempfile
 import time
 import tomllib
-from pathlib import Path
-from typing import Literal
+from collections.abc import Sequence
+from pathlib import Path, PurePosixPath
+from typing import Any, Literal
 
 from atlas.schemas import CheckResult
 
@@ -238,7 +241,11 @@ def _python_env(app_dir: Path) -> dict[str, str]:
 
 
 async def _run_python_checks(
-    app_dir: Path, python_exe: str, timeout: float, env: dict[str, str]
+    app_dir: Path,
+    python_exe: str,
+    timeout: float,
+    env: dict[str, str],
+    lint_exclude: list[str] | None = None,
 ) -> list[CheckResult]:
     checks: list[CheckResult] = []
     compile_res = await _run_subprocess(
@@ -266,23 +273,37 @@ async def _run_python_checks(
     if ruff_exe:
         ruff_res = await _run_subprocess(
             "python-ruff",
-            [ruff_exe, "check", "--isolated", "--no-cache", "."],
+            [
+                ruff_exe,
+                "check",
+                "--isolated",
+                "--no-cache",
+                *[arg for path in lint_exclude or [] for arg in ("--extend-exclude", path)],
+                ".",
+            ],
             app_dir,
             timeout,
             env=env,
         )
+        if lint_exclude:
+            ruff_res.stdout = (
+                f"{ruff_res.stdout}\n(not linted: authoritative E2E test file(s) "
+                f"{', '.join(lint_exclude)}; nobody may edit them)"
+            ).strip()
         checks.append(ruff_res)
 
     return checks
 
 
-async def _verify_python(app_dir: Path, timeout: float) -> list[CheckResult]:
+async def _verify_python(
+    app_dir: Path, timeout: float, lint_exclude: list[str] | None = None
+) -> list[CheckResult]:
     env = _python_env(app_dir)
     pytest_available = importlib.util.find_spec("pytest") is not None
     needs_isolated_install = _has_external_python_deps(app_dir) or not pytest_available
 
     if not needs_isolated_install:
-        return await _run_python_checks(app_dir, sys.executable, timeout, env)
+        return await _run_python_checks(app_dir, sys.executable, timeout, env, lint_exclude)
 
     with tempfile.TemporaryDirectory(prefix="atlas-verify-") as tmpdir:
         venv_dir = Path(tmpdir) / "venv"
@@ -321,7 +342,7 @@ async def _verify_python(app_dir: Path, timeout: float) -> list[CheckResult]:
             return [install_res]
 
         checks = [install_res]
-        checks.extend(await _run_python_checks(app_dir, venv_python, timeout, env))
+        checks.extend(await _run_python_checks(app_dir, venv_python, timeout, env, lint_exclude))
         return checks
 
 
@@ -566,6 +587,96 @@ _E2E_SKIP_RE = re.compile(
     r"@pytest\.mark\.skip\b|pytest\.skip\s*\(|(?:test|it)\.skip\s*\(",
     flags=re.MULTILINE,
 )
+_JS_SKIP_RE = re.compile(r"\b(?:test|it|describe)\.skip\s*\(", flags=re.MULTILINE)
+
+
+def _is_pytest_skip(node: ast.AST, *, decorator: bool = False) -> bool:
+    """`pytest.skip(...)`, or as a decorator `pytest.mark.skip` / `pytest.mark.skip(...)`."""
+    target = node.func if isinstance(node, ast.Call) else node
+    if not isinstance(target, ast.Attribute) or target.attr != "skip":
+        return False
+    owner = target.value
+    is_mark = (isinstance(owner, ast.Attribute) and owner.attr == "mark") or (
+        isinstance(owner, ast.Name) and owner.id == "mark"  # `from pytest import mark`
+    )
+    if decorator or is_mark:
+        return is_mark
+    return isinstance(owner, ast.Name) and owner.id == "pytest"
+
+
+def _unconditional_python_skips(text: str) -> list[int] | None:
+    """Line numbers of skips that always fire; None when the file does not parse.
+
+    Unconditional: `@pytest.mark.skip` on a test, a module-level `pytestmark` skip, a
+    `pytest.skip(...)` statement at module level, or one that is the first statement of a test
+    function. A skip inside `if`/`try`/`with`/a loop (no browser available, say), after other
+    statements (a helper's fallback), or `skipif` is conditional.
+    """
+    try:
+        tree = ast.parse(text)
+    except SyntaxError:
+        return None
+    lines: list[int] = []
+
+    def direct_skip_calls(body: list[ast.stmt]) -> None:
+        for stmt in body:
+            if isinstance(stmt, ast.Expr) and isinstance(stmt.value, ast.Call):
+                if _is_pytest_skip(stmt.value):
+                    lines.append(stmt.lineno)
+
+    direct_skip_calls(tree.body)
+    for node in ast.walk(tree):
+        if isinstance(node, (ast.FunctionDef, ast.AsyncFunctionDef, ast.ClassDef)):
+            for deco in node.decorator_list:
+                if _is_pytest_skip(deco, decorator=True):
+                    lines.append(deco.lineno)
+            if not isinstance(node, ast.ClassDef) and node.name.startswith("test"):
+                body = node.body
+                if (
+                    body
+                    and isinstance(body[0], ast.Expr)
+                    and isinstance(body[0].value, ast.Constant)
+                    and isinstance(body[0].value.value, str)
+                ):
+                    body = body[1:]  # docstring
+                direct_skip_calls(body[:1])
+        if isinstance(node, ast.Assign) and any(
+            isinstance(t, ast.Name) and t.id == "pytestmark" for t in node.targets
+        ):
+            values = node.value.elts if isinstance(node.value, (ast.List, ast.Tuple)) else [
+                node.value
+            ]
+            if any(_is_pytest_skip(v, decorator=True) for v in values):
+                lines.append(node.lineno)
+    return sorted(set(lines))
+
+
+def unconditional_skip_lines(path: str, text: str) -> list[int]:
+    """Lines with skips that always fire (Python via its syntax tree, JS by pattern)."""
+    if path.endswith(".py"):
+        found = _unconditional_python_skips(text)
+        if found is not None:
+            return found
+        return [text.count("\n", 0, m.start()) + 1 for m in _E2E_SKIP_RE.finditer(text)]
+    return [text.count("\n", 0, m.start()) + 1 for m in _JS_SKIP_RE.finditer(text)]
+
+
+def normalize_rel_path(path: str) -> str:
+    """Normalize a workspace-relative path to POSIX form without leading `./`."""
+    return PurePosixPath(path.replace("\\", "/")).as_posix()
+
+
+def e2e_file_hashes(files: Sequence[Any]) -> dict[str, str]:
+    """Compute SHA-256 digests keyed by normalized path for authoritative E2E test files."""
+    hashes: dict[str, str] = {}
+    for entry in files:
+        rel = normalize_rel_path(str(entry.path))
+        content = str(entry.content)
+        # materialize_files canonicalizes generated text files with a final newline.
+        if content and not content.endswith("\n"):
+            content += "\n"
+        hashes[rel] = hashlib.sha256(content.encode("utf-8")).hexdigest()
+    return hashes
 
 
 def check_e2e_tests(
@@ -574,11 +685,13 @@ def check_e2e_tests(
     *,
     verifiable: bool = True,
     unverifiable_reason: str | None = None,
+    expected_hashes: dict[str, str] | None = None,
 ) -> CheckResult:
     """Verify researcher/QA-generated black-box E2E product tests remain intact and runnable."""
     started = time.monotonic()
     root = app_dir.resolve() if app_dir.is_dir() else app_dir
     issues: list[str] = []
+    notes: list[str] = []
     present: list[str] = []
 
     if not verifiable and not expected_files:
@@ -610,12 +723,35 @@ def check_e2e_tests(
             issues.append(f"{rel}: unreadable ({exc})")
             continue
         present.append(rel)
+        untouched = False
+        if expected_hashes is not None:
+            expected_sha = expected_hashes.get(normalize_rel_path(rel))
+            if expected_sha is None:
+                issues.append(f"{rel}: no authoritative SHA-256 digest was provided")
+            else:
+                # Hash the bytes on disk: reading as text folds \r\n into \n.
+                actual_sha = hashlib.sha256(target.read_bytes()).hexdigest()
+                if actual_sha != expected_sha:
+                    issues.append(
+                        f"{rel}: modified from authoritative E2E suite (sha256 mismatch)"
+                    )
+                else:
+                    untouched = True
+        content_issues: list[str] = []
         if not _E2E_DEF_RE.search(text):
-            issues.append(f"{rel}: contains no test definitions")
+            content_issues.append(f"{rel}: contains no test definitions")
         if not _E2E_ASSERT_RE.search(text):
-            issues.append(f"{rel}: contains no assertions")
-        if _E2E_SKIP_RE.search(text):
-            issues.append(f"{rel}: contains unconditional skip marker")
+            content_issues.append(f"{rel}: contains no assertions")
+        skip_lines = unconditional_skip_lines(rel, text)
+        if skip_lines:
+            where = ", ".join(str(n) for n in skip_lines[:5])
+            content_issues.append(f"{rel}: contains unconditional skip marker (line {where})")
+        if untouched:
+            # The file is exactly what the E2E stage wrote, and nobody may change it, so these
+            # can't be fixed by the builder or fixer: report them without failing the check.
+            notes.extend(f"note (authoritative file, not failing): {i}" for i in content_issues)
+        else:
+            issues.extend(content_issues)
 
     passed = not issues
     cmd_files = ", ".join(expected_files) if expected_files else "none"
@@ -625,7 +761,7 @@ def check_e2e_tests(
         passed=passed,
         exit_code=0 if passed else 1,
         duration_ms=round((time.monotonic() - started) * 1000, 1),
-        stdout=", ".join(present),
+        stdout="\n".join([", ".join(present), *notes]).strip(),
         stderr="\n".join(issues),
     )
 
@@ -636,8 +772,13 @@ async def verify_app(
     timeout_seconds: float = 180.0,
     extra_commands: list[str] | None = None,
     allow_custom_commands: bool = False,
+    lint_exclude: list[str] | None = None,
 ) -> tuple[str, list[CheckResult]]:
-    """Detect the project stack and run automated build, lint, and test checks."""
+    """Detect the project stack and run automated build, lint, and test checks.
+
+    `lint_exclude` lists files (relative to `app_dir`) that the lint step skips: the
+    authoritative E2E tests, which the builder and fixer are not allowed to change.
+    """
     if not app_dir.is_dir():
         return (
             "other",
@@ -656,7 +797,7 @@ async def verify_app(
     checks: list[CheckResult] = []
 
     if stack in ("python", "mixed"):
-        checks.extend(await _verify_python(app_dir, timeout_seconds))
+        checks.extend(await _verify_python(app_dir, timeout_seconds, lint_exclude))
     if stack in ("node", "mixed"):
         checks.extend(await _verify_node(app_dir, timeout_seconds))
 

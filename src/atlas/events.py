@@ -323,8 +323,55 @@ def load_run_events_with_offset(run_dir: Path) -> tuple[list[dict[str, Any]], in
             if isinstance(item, dict) and isinstance(item.get("seq"), int):
                 events.append(item)
         events.sort(key=lambda e: e["seq"])
+        _backfill_token_split(run_dir, events)
         return events, len(raw)
     return synthesize_events(run_dir), 0
+
+
+def _backfill_token_split(run_dir: Path, events: list[dict[str, Any]]) -> None:
+    """Add input/output token counts to replays of runs recorded before usage events had them.
+
+    `tokens.json` (or the manifest's `token_usage`) keeps prompt/completion totals and, per call,
+    the same calls in the same order as the `usage` events, so both can be filled in.
+    """
+    usage_events = [
+        e for e in events if e.get("kind") == "usage" and isinstance(e.get("data"), dict)
+    ]
+    finals = [
+        e
+        for e in events
+        if e.get("kind") == "run"
+        and e.get("status") not in (None, "running")
+        and isinstance(e.get("data"), dict)
+        and isinstance(e["data"].get("usage"), dict)
+    ]
+    calls_missing = any("input_tokens" not in e["data"] for e in usage_events)
+    final_missing = any("input_tokens" not in e["data"]["usage"] for e in finals)
+    if not (calls_missing or final_missing):
+        return
+    doc = _read_json(run_dir / "tokens.json")
+    if not isinstance(doc, dict):
+        manifest = _read_json(run_dir / "manifest.json")
+        doc = manifest.get("token_usage") if isinstance(manifest, dict) else None
+    if not isinstance(doc, dict):
+        return
+    if final_missing and doc.get("prompt_tokens") is not None:
+        for e in finals:
+            usage = e["data"]["usage"]
+            usage.setdefault("input_tokens", int(doc.get("prompt_tokens") or 0))
+            usage.setdefault("output_tokens", int(doc.get("completion_tokens") or 0))
+    calls = doc.get("calls")
+    if not (calls_missing and isinstance(calls, list) and len(calls) == len(usage_events)):
+        return
+    # Only trust the pairing when every call lines up with its event by role.
+    for event, call in zip(usage_events, calls, strict=True):
+        if not isinstance(call, dict) or str(call.get("role") or "") != str(
+            event["data"].get("role") or ""
+        ):
+            return
+    for event, call in zip(usage_events, calls, strict=True):
+        event["data"].setdefault("input_tokens", int(call.get("prompt_tokens") or 0))
+        event["data"].setdefault("output_tokens", int(call.get("completion_tokens") or 0))
 
 
 def load_run_events(run_dir: Path) -> list[dict[str, Any]]:
@@ -385,6 +432,11 @@ def synthesize_events(run_dir: Path) -> list[dict[str, Any]]:
             "kind": str(builder_type),
         })
 
+    b_avail = (
+        list(build_doc.get("available_skills") or [])
+        if isinstance(build_doc, dict)
+        else []
+    ) or list(manifest.get("builder_available_skills") or [])
     add(
         "run",
         "run",
@@ -401,7 +453,7 @@ def synthesize_events(run_dir: Path) -> list[dict[str, Any]]:
             "e2e": "e2e_tests" in stages,
             "supervisor_enabled": bool(reviewers),
             "supervisor_reviewers": reviewers,
-            "builder": {"type": builder_type, "attempts": attempts},
+            "builder": {"type": builder_type, "attempts": attempts, "skills": b_avail},
         },
     )
     add("stage", "run", "passed", spec_path=manifest.get("spec_path", ""), run_id=run_id)
@@ -556,6 +608,14 @@ def synthesize_events(run_dir: Path) -> list[dict[str, Any]]:
                 count=len(file_list),
                 truncated=len(file_list) > 400,
             )
+        b_used = (
+            list(build_doc.get("used_skills") or [])
+            if isinstance(build_doc, dict)
+            else []
+        ) or list(manifest.get("builder_used_skills") or [])
+        b_skills_mode = (
+            build_doc.get("skills_mode") if isinstance(build_doc, dict) else None
+        ) or manifest.get("builder_skills_mode")
         add(
             "stage",
             "build",
@@ -565,6 +625,9 @@ def synthesize_events(run_dir: Path) -> list[dict[str, Any]]:
             offloaded_to=offloaded_to,
             files=len(file_list) or len(manifest.get("generated_files") or []),
             summary=build_summary[:600],
+            available_skills=b_avail,
+            used_skills=b_used,
+            skills_mode=b_skills_mode,
         )
     elif error and manifest.get("mode", "build") == "build":
         planned = [s for s in ("parse", "research", "judge") if s not in stages]
@@ -664,6 +727,7 @@ def synthesize_events(run_dir: Path) -> list[dict[str, Any]]:
                 output_tokens=int(c.get("completion_tokens") or 0),
                 cost_usd=c.get("cost_usd"),
                 cost_source=c.get("cost_source"),
+                api_cost_usd=c.get("api_cost_usd"),
                 error=str(c.get("error") or "")[:300],
             )
 
@@ -688,6 +752,8 @@ def synthesize_events(run_dir: Path) -> list[dict[str, Any]]:
                 "output_tokens": usage.get("completion_tokens"),
                 "cost_usd": usage.get("cost_usd"),
                 "unpriced_calls": usage.get("unpriced_calls"),
+                "api_cost_usd": usage.get("api_cost_usd"),
+                "api_unestimated_calls": usage.get("api_unestimated_calls"),
             },
         },
         ts=finished_at,

@@ -157,6 +157,16 @@ async def test_local_builder_sdk_crash_is_logged_as_free_local_call(monkeypatch,
     async def crash(self, **kwargs):
         raise RuntimeError("SDK session closed")
 
+    from types import SimpleNamespace
+
+    clock = 100.0
+
+    def fake_mono() -> float:
+        nonlocal clock
+        clock += 0.125
+        return clock
+
+    monkeypatch.setattr("atlas.pipeline.build.time", SimpleNamespace(monotonic=fake_mono))
     monkeypatch.setattr("atlas.pipeline.build.resolve_local_model", ready)
     monkeypatch.setattr(
         "atlas.pipeline.build.AntigravitySDKAdapter.run_workspace_task", crash
@@ -174,3 +184,36 @@ async def test_local_builder_sdk_crash_is_logged_as_free_local_call(monkeypatch,
     assert call["used_model"] == "ollama/gemma4:12b"
     assert call["cost_source"] == "local_free" and call["auth_mode"] == "local"
     assert "SDK session closed" in call["error"]
+    assert call["elapsed_ms"] > 0
+
+
+async def test_harness_builder_failure_records_nonzero_elapsed_ms(monkeypatch, tmp_path):
+    from types import SimpleNamespace
+
+    from atlas.harnesses import AntigravityCLIAdapter
+
+    clock = 10.0
+
+    def fake_mono() -> float:
+        nonlocal clock
+        clock += 0.25
+        return clock
+
+    monkeypatch.setattr("atlas.pipeline.build.time", SimpleNamespace(monotonic=fake_mono))
+
+    async def fail_ws(self, **kwargs):
+        raise HarnessError("agy crashed mid-build")
+
+    monkeypatch.setattr(AntigravityCLIAdapter, "run_workspace_task", fail_ws)
+    router = _router(
+        tmp_path,
+        """    type: harness
+    provider: antigravity
+    model: gemini-4-hydrogen-high""",
+    )
+    with pytest.raises(HarnessError, match="crashed"):
+        await build_app_workspace(router, SPEC, tmp_path / "app" / "x")
+
+    [call] = router.call_log
+    assert call["elapsed_ms"] == 250.0
+    assert "agy crashed" in call["error"]

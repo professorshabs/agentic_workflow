@@ -119,9 +119,10 @@ backends:
     require_tool_smoke_check: true
     smoke_timeout_seconds: 90         # includes loading the model
     timeout_seconds: 900              # whole local build; then offload
-    stall_seconds: 300                # no file written for 5 min -> offload
+    stall_seconds: 420                # no file written for 7 min -> offload
     brief_max_chars: 24000            # BUILD_BRIEF.md (~6K tokens) instead of the ~30K-token PLAN.md
-    sandbox: true
+    allow_shell: false                # file tools only; true gives it run_command (Cwd inside the folder)
+    sandbox: true                     # OS sandbox for run_command when allow_shell is true
     offload:
       - name: sonnet
         type: harness
@@ -154,8 +155,8 @@ backends:
         router_model: openrouter/anthropic/claude-sonnet-5.5
       - type: harness
         provider: antigravity
-        model: gemini-4-hydrogen-high
-        timeout_seconds: 300
+        model: gemini-4-hydrogen-medium
+        timeout_seconds: 420
         fallback: router
         router_model: openrouter/google/gemini-4-hydrogen
 
@@ -172,6 +173,16 @@ skills:
     builder: [developing-fullstack-apps, writing-clean-code]
     fixer: [writing-clean-code]
 
+# Prices for the "API-equivalent cost" estimate only (USD per 1M tokens; OpenRouter list
+# prices on 2026-11-26). Calls on your Claude subscription or Google login aren't billed per
+# token; this estimates what they would cost on pay-per-token APIs. Claude Code reports its
+# own figure, which is used first; models missing here fall back to LiteLLM's price map.
+pricing:
+  sonnet: {input: 2.00, output: 10.00, cache_read: 0.10}
+  opus: {input: 4.00, output: 20.00, cache_read: 0.20}
+  gemini-4-hydrogen: {input: 1.50, output: 7.50, cache_read: 0.075}
+  gemini-4-neon: {input: 3.00, output: 15.00, cache_read: 0.15}
+
 limits:
   max_parallel_calls: 6
   max_tokens: 6000
@@ -180,14 +191,14 @@ limits:
     judge: 16000
     e2e: 32000
     builder: 32000
-    fixer: 24000
+    fixer: 48000
   timeout_seconds: 90
   timeout_seconds_by_role:
     researcher: 240
     judge: 300
     e2e: 300
     builder: 900                      # fallback timeout for builder and offload targets
-    fixer: 300
+    fixer: 420
   attempts_per_model: 2
   repair_attempts: 1
   max_fix_rounds: 3

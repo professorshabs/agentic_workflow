@@ -321,10 +321,19 @@ async def test_sdk_builder_scopes_workspace_and_restores_process_cwd(
             return FakeResponse()
 
     fake_sdk = SimpleNamespace(Agent=FakeAgent, LocalOpenAIAgentConfig=FakeConfig)
+    deny_predicates: list = []
+
+    def fake_deny(tool, *, when=None, name="", reason=""):
+        policies.append(f"deny:{tool}:{name}")
+        if when is not None:
+            deny_predicates.append(when)
+        return f"deny:{tool}"
+
     fake_hooks = SimpleNamespace(
         policy=SimpleNamespace(
             workspace_only=lambda paths: policies.append(f"workspace:{paths[0]}") or ["workspace"],
-            auto=lambda: policies.append("auto") or "auto-policy",
+            deny=fake_deny,
+            allow_all=lambda: policies.append("allow_all") or "allow_all",
         )
     )
     original_import = __import__("importlib").import_module
@@ -370,7 +379,14 @@ async def test_sdk_builder_scopes_workspace_and_restores_process_cwd(
     assert config_args["workspaces"] == [str(app_dir.resolve())]
     assert config_args["skills_paths"] == [str(skill_dir.resolve())]
     assert config_args["lightweight"] is True
-    assert policies == [f"workspace:{app_dir.resolve()}", "auto"]
+    assert "save_dir" in config_args
+    assert not Path(str(config_args["save_dir"])).exists()  # empty records are removed
+    assert policies == [
+        f"workspace:{app_dir.resolve()}",
+        "deny:run_command:no_shell",  # file tools only by default
+        "allow_all",
+    ]
+    assert deny_predicates == []
 
 
 async def test_sdk_builder_timeout_restores_process_cwd(monkeypatch, tmp_path):
@@ -403,7 +419,11 @@ async def test_sdk_builder_timeout_restores_process_cwd(monkeypatch, tmp_path):
 
     fake_sdk = SimpleNamespace(Agent=FakeAgent, LocalOpenAIAgentConfig=FakeConfig)
     fake_hooks = SimpleNamespace(
-        policy=SimpleNamespace(workspace_only=lambda _: [], auto=lambda: None)
+        policy=SimpleNamespace(
+            workspace_only=lambda _: [],
+            deny=lambda *a, **kw: "deny",
+            allow_all=lambda: "allow_all",
+        )
     )
     original_import = __import__("importlib").import_module
 
@@ -427,3 +447,188 @@ async def test_sdk_builder_timeout_restores_process_cwd(monkeypatch, tmp_path):
         )
 
     assert Path.cwd() == previous_cwd
+
+
+def test_sdk_workspace_cwd_predicate(tmp_path):
+    from atlas.harnesses.antigravity import _is_command_outside_workspace
+
+    ws = (tmp_path / "app" / "demo").resolve()
+    ws.mkdir(parents=True)
+    sub = ws / "tests"
+    sub.mkdir()
+
+    assert _is_command_outside_workspace(ws, {"Cwd": str(ws)}) is False
+    assert _is_command_outside_workspace(ws, {"Cwd": str(sub)}) is False
+    assert _is_command_outside_workspace(ws, {"Cwd": "tests"}) is False
+    assert _is_command_outside_workspace(ws, {"Cwd": None}) is False
+    assert _is_command_outside_workspace(ws, {"CommandLine": "pytest"}) is False
+    assert _is_command_outside_workspace(ws, {"Cwd": str(tmp_path)}) is True
+    assert _is_command_outside_workspace(ws, {"Cwd": ".."}) is True
+    assert _is_command_outside_workspace(ws, {"Cwd": ""}) is True
+    assert _is_command_outside_workspace(ws, "not-a-dict") is True
+    assert (
+        _is_command_outside_workspace(
+            ws, {"Cwd": str(ws), "BypassSandbox": True}, require_sandbox=True
+        )
+        is True
+    )
+    assert (
+        _is_command_outside_workspace(
+            ws, {"Cwd": str(ws), "BypassSandbox": True}, require_sandbox=False
+        )
+        is False
+    )
+
+
+def _sdk_fakes(app_dir: Path, *, write_product: bool, with_types: bool = True):
+    """Minimal stand-ins for `google.antigravity` and its hooks, recording what Atlas asks for."""
+    seen: dict[str, object] = {"deny_calls": []}
+
+    class FakeConfig:
+        def __init__(self, **kwargs):
+            seen.update(kwargs)
+
+        def lightweight(self):
+            return self
+
+    class FakeResponse:
+        usage_metadata = None
+
+        async def text(self):
+            return "done"
+
+    class FakeAgent:
+        def __init__(self, cfg):
+            pass
+
+        async def __aenter__(self):
+            return self
+
+        async def __aexit__(self, *exc):
+            return False
+
+        async def chat(self, prompt_text):
+            (Path(str(seen["save_dir"])) / "trajectory.db").write_bytes(b"SQLite format 3\x00")
+            if write_product:
+                (app_dir / "main.py").write_text("print('hi')\n", encoding="utf-8")
+            return FakeResponse()
+
+    def deny(tool, *, when=None, name="", reason=""):
+        seen["deny_calls"].append((tool, name, when))  # type: ignore[union-attr]
+        return name
+
+    types_ns = SimpleNamespace(
+        CapabilitiesConfig=lambda **kw: ("caps", kw),
+        RunCommandConfig=lambda **kw: ("run_command_config", kw),
+        BuiltinTools=SimpleNamespace(RUN_COMMAND="run_command"),
+    )
+    sdk = SimpleNamespace(Agent=FakeAgent, LocalOpenAIAgentConfig=FakeConfig)
+    if with_types:
+        sdk.types = types_ns
+    hooks = SimpleNamespace(
+        policy=SimpleNamespace(
+            workspace_only=lambda paths: ["workspace_only"],
+            deny=deny,
+            allow_all=lambda: "allow_all",
+        )
+    )
+    return sdk, hooks, seen
+
+
+def _use_fakes(monkeypatch, sdk, hooks):
+    original_import = __import__("importlib").import_module
+
+    def fake_import(name):
+        if name == "google.antigravity":
+            return sdk
+        if name == "google.antigravity.hooks":
+            return hooks
+        return original_import(name)
+
+    monkeypatch.setattr("atlas.harnesses.antigravity.importlib.import_module", fake_import)
+    monkeypatch.setattr(AntigravitySDKAdapter, "package_version", lambda self: "0.1.24")
+
+
+_LOCAL = LocalModelCandidate(
+    provider="lm_studio", name="google/gemma-4-12b-qat", base_url="http://localhost:1234/v1"
+)
+
+
+async def test_sdk_builder_hides_the_shell_tool_by_default(monkeypatch, tmp_path):
+    app_dir = tmp_path / "app"
+    sdk, hooks, seen = _sdk_fakes(app_dir, write_product=True)
+    _use_fakes(monkeypatch, sdk, hooks)
+
+    await AntigravitySDKAdapter().run_workspace_task(
+        candidate=_LOCAL, prompt_text="Build.", app_dir=app_dir
+    )
+
+    assert seen["capabilities"] == ("caps", {"disabled_tools": ["run_command"]})
+    [(tool, name, when)] = seen["deny_calls"]  # type: ignore[misc]
+    assert (tool, name, when) == ("run_command", "no_shell", None)
+    assert seen["policies"] == ["workspace_only", "no_shell", "allow_all"]
+    assert not Path(str(seen["save_dir"])).exists()  # files were written: records removed
+
+
+async def test_sdk_builder_with_allow_shell_keeps_commands_in_the_folder(monkeypatch, tmp_path):
+    app_dir = tmp_path / "app"
+    sdk, hooks, seen = _sdk_fakes(app_dir, write_product=True)
+    _use_fakes(monkeypatch, sdk, hooks)
+
+    await AntigravitySDKAdapter().run_workspace_task(
+        candidate=_LOCAL, prompt_text="Build.", app_dir=app_dir, allow_shell=True, sandbox=True
+    )
+
+    caps = seen["capabilities"]
+    assert caps[0] == "caps"  # type: ignore[index]
+    assert caps[1]["run_command_config"][1]["enable_sandbox"] is True  # type: ignore[index]
+    [(tool, name, when)] = seen["deny_calls"]  # type: ignore[misc]
+    assert (tool, name) == ("run_command", "workspace_cwd")
+    assert when({"Cwd": "/etc"}) is True
+    assert when({"Cwd": str(app_dir.resolve())}) is False
+    assert when({"Cwd": str(app_dir.resolve()), "BypassSandbox": True}) is True
+
+
+async def test_sdk_builder_keeps_its_records_when_it_writes_nothing(monkeypatch, tmp_path, caplog):
+    app_dir = tmp_path / "app"
+    sdk, hooks, seen = _sdk_fakes(app_dir, write_product=False)
+    _use_fakes(monkeypatch, sdk, hooks)
+
+    with caplog.at_level("WARNING", logger="atlas.harnesses.antigravity"):
+        build, _ = await AntigravitySDKAdapter().run_workspace_task(
+            candidate=_LOCAL, prompt_text="Build.", app_dir=app_dir
+        )
+
+    records = Path(str(seen["save_dir"]))
+    try:
+        assert build.created_files == []
+        assert (records / "trajectory.db").is_file()
+        assert str(records) in caplog.text and "Kept the local agent's records" in caplog.text
+    finally:
+        import shutil
+
+        shutil.rmtree(records, ignore_errors=True)
+
+
+async def test_sdk_builder_keeps_its_records_when_it_fails(monkeypatch, tmp_path):
+    app_dir = tmp_path / "app"
+    sdk, hooks, seen = _sdk_fakes(app_dir, write_product=False)
+
+    async def boom(self, prompt_text):
+        (Path(str(seen["save_dir"])) / "trajectory.db").write_bytes(b"x")
+        raise RuntimeError("model crashed")
+
+    sdk.Agent.chat = boom
+    _use_fakes(monkeypatch, sdk, hooks)
+
+    with pytest.raises(RuntimeError, match="model crashed"):
+        await AntigravitySDKAdapter().run_workspace_task(
+            candidate=_LOCAL, prompt_text="Build.", app_dir=app_dir
+        )
+    records = Path(str(seen["save_dir"]))
+    try:
+        assert (records / "trajectory.db").is_file()
+    finally:
+        import shutil
+
+        shutil.rmtree(records, ignore_errors=True)

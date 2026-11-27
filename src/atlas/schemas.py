@@ -341,6 +341,9 @@ class WorkspaceBuildResult(StrictModel):
     files_snapshot: list[str] = Field(default_factory=list)
     exit_code: int = 0
     run_instructions: str = ""
+    available_skills: list[str] = Field(default_factory=list)
+    used_skills: list[str] = Field(default_factory=list)
+    skills_mode: Literal["progressive", "injected"] | None = None
 
     @field_validator("created_files", "modified_files", "deleted_files", "files_snapshot")
     @classmethod
@@ -393,6 +396,10 @@ class ModelCallRecord(BaseModel):
     total_tokens: int = 0
     cost_usd: float | None = None
     cost_source: CostSource = "unavailable"
+    # What the call would cost at pay-per-token API prices: the real bill when there is one,
+    # the harness's own figure (Claude Code), or tokens x a price list. None when unknown.
+    api_cost_usd: float | None = None
+    api_cost_source: str | None = None
     usage_reported: bool = False
     timestamp: str | None = None
     # Set when the provider returned a response Atlas could not use (empty, or cut off at
@@ -409,6 +416,7 @@ class UsageBucket(StrictModel):
     reasoning_tokens: int
     total_tokens: int
     cost_usd: float | None = None
+    api_cost_usd: float | None = None
     elapsed_ms: float = 0.0
 
 
@@ -424,6 +432,9 @@ class TokenUsageSummary(StrictModel):
     unreported_usage_calls: int = 0
     unpriced_calls: int = 0
     failed_calls: int = 0
+    # API-equivalent estimate across all calls (see ModelCallRecord.api_cost_usd).
+    api_cost_usd: float | None = None
+    api_unestimated_calls: int = 0
     by_stage: list[UsageBucket] = Field(default_factory=list)
     by_model: list[UsageBucket] = Field(default_factory=list)
     calls: list[ModelCallRecord] = Field(default_factory=list)

@@ -20,6 +20,7 @@ from pathlib import Path
 from typing import Any
 
 import pytest
+import yaml
 
 from atlas.harnesses import (
     AntigravityCLIAdapter,
@@ -959,7 +960,7 @@ async def test_doctor_checks_every_harness_in_the_hybrid_profile(monkeypatch, tm
 
     by_provider = {c["provider"]: c for c in report["checks"]}
     assert set(by_provider) == {
-        "antigravity", "claude_code", "antigravity_sdk", "local_model_daemon", "openrouter"
+        "antigravity", "claude_code", "local_openai", "local_model_daemon", "openrouter"
     }
     assert by_provider["antigravity"]["authenticated"] is True
     assert by_provider["antigravity"]["auth_mode"] == "cached_login"
@@ -999,7 +1000,12 @@ async def test_doctor_reports_signed_out_harness_and_missing_sdk(monkeypatch, tm
     monkeypatch.setattr("atlas.harnesses.resolve_local_model", nothing_running)
     monkeypatch.setenv("OPENROUTER_API_KEY", "or-key")
 
-    report = await run_doctor(ModelRouter(repo / "config" / "harness.yaml"))
+    cfg_data = yaml.safe_load((repo / "config" / "harness.yaml").read_text(encoding="utf-8"))
+    cfg_data["backends"]["builder"]["local_harness"] = "antigravity_sdk"
+    sdk_cfg = tmp_path / "sdk_harness.yaml"
+    sdk_cfg.write_text(yaml.safe_dump(cfg_data), encoding="utf-8")
+
+    report = await run_doctor(ModelRouter(sdk_cfg))
 
     by_provider = {c["provider"]: c for c in report["checks"]}
     assert report["healthy"] is False

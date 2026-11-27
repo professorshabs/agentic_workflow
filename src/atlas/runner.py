@@ -107,7 +107,7 @@ def _flow_description(
             "name": "local",
             "label": str(local or "local model"),
             "kind": "local",
-            "provider": "antigravity_sdk",
+            "provider": str(builder.get("local_harness") or "antigravity_sdk"),
         })
         for target in builder.get("offload") or []:
             if isinstance(target, dict):
@@ -1170,7 +1170,7 @@ async def run_build(
             )
             written_files = list(generated_app.files_snapshot)
             if builder_type == "local_harness":
-                if generated_app.harness == "antigravity_sdk":
+                if generated_app.harness in ("antigravity_sdk", "local_openai"):
                     manifest["local_model"] = generated_app.model
                 else:
                     # The local model could not finish; a cloud model built the product.

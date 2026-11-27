@@ -12,6 +12,7 @@ from __future__ import annotations
 import bisect
 import json
 import logging
+import os
 import re
 import threading
 import time
@@ -153,9 +154,9 @@ class RunEventBus:
                     if event.get("status") == "running":
                         self.run_id = self.run_id or event.get("run_id") or data.get("run_id")
                         if data.get("out_dir"):
-                            self.out_dir = Path(str(data["out_dir"]))
+                            self.out_dir = Path(os.path.abspath(str(data["out_dir"])))
                         if data.get("app_dir"):
-                            self.app_dir = Path(str(data["app_dir"]))
+                            self.app_dir = Path(os.path.abspath(str(data["app_dir"])))
                     elif event.get("status") is not None:
                         self.finished = True
             self._cond.notify_all()
@@ -163,9 +164,9 @@ class RunEventBus:
     def _bind(self, data: dict[str, Any]) -> None:
         self.run_id = str(data.get("run_id") or "") or None
         if data.get("out_dir"):
-            self.out_dir = Path(str(data["out_dir"]))
+            self.out_dir = Path(os.path.abspath(str(data["out_dir"])))
         if data.get("app_dir"):
-            self.app_dir = Path(str(data["app_dir"]))
+            self.app_dir = Path(os.path.abspath(str(data["app_dir"])))
         if self._persist and self.out_dir is not None and self.out_dir.is_dir():
             try:
                 self._file = (self.out_dir / "events.jsonl").open("a", encoding="utf-8")

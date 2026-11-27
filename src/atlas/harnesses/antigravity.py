@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import asyncio
 import contextlib
+import http.server
 import importlib
 import importlib.metadata
 import importlib.util
@@ -11,11 +12,16 @@ import json
 import logging
 import os
 import shutil
+import socketserver
 import tempfile
+import threading
 import time
+import urllib.parse
 from collections.abc import Iterator
 from pathlib import Path
 from typing import Any
+
+import httpx
 
 from atlas.local_models import LocalModelCandidate
 from atlas.pipeline.verify import credential_free_env
@@ -585,6 +591,180 @@ def _is_command_outside_workspace(
     return resolved_cwd != resolved_app_dir and resolved_app_dir not in resolved_cwd.parents
 
 
+_HOP_BY_HOP_REQ_HEADERS = frozenset(
+    {"host", "content-length", "transfer-encoding", "connection", "accept-encoding"}
+)
+_HOP_BY_HOP_RESP_HEADERS = frozenset(
+    {"transfer-encoding", "content-length", "connection", "keep-alive", "content-encoding"}
+)
+
+
+def _rewrite_chat_completion_body(
+    raw_body: bytes,
+    *,
+    reasoning_effort: str | None,
+    max_completion_tokens: int | None,
+) -> bytes:
+    """Shape an OpenAI `/chat/completions` JSON payload for a local model server."""
+    if not raw_body:
+        return raw_body
+    try:
+        payload = json.loads(raw_body.decode("utf-8"))
+    except (UnicodeDecodeError, json.JSONDecodeError):
+        return raw_body
+    if not isinstance(payload, dict):
+        return raw_body
+
+    if reasoning_effort is not None:
+        payload["reasoning_effort"] = reasoning_effort
+    if max_completion_tokens is not None:
+        existing_mct = payload.get("max_completion_tokens")
+        if (
+            isinstance(existing_mct, (int, float))
+            and not isinstance(existing_mct, bool)
+            and int(existing_mct) > 0
+        ):
+            payload["max_completion_tokens"] = min(int(existing_mct), max_completion_tokens)
+        else:
+            payload["max_completion_tokens"] = max_completion_tokens
+        existing_mt = payload.get("max_tokens")
+        if (
+            isinstance(existing_mt, (int, float))
+            and not isinstance(existing_mt, bool)
+            and int(existing_mt) > 0
+        ):
+            payload["max_tokens"] = min(int(existing_mt), max_completion_tokens)
+
+    return json.dumps(payload, ensure_ascii=False).encode("utf-8")
+
+
+def _read_request_body(handler: http.server.BaseHTTPRequestHandler) -> bytes:
+    """Read an HTTP request body from `Content-Length` or `Transfer-Encoding: chunked`."""
+    transfer_encoding = str(handler.headers.get("Transfer-Encoding") or "").lower()
+    if "chunked" in transfer_encoding:
+        chunks: list[bytes] = []
+        while True:
+            size_line = handler.rfile.readline()
+            if not size_line:
+                break
+            size_token = size_line.split(b";", 1)[0].strip()
+            if not size_token:
+                continue
+            chunk_size = int(size_token, 16)
+            if chunk_size == 0:
+                while True:
+                    trailer = handler.rfile.readline()
+                    if not trailer or trailer in (b"\r\n", b"\n"):
+                        break
+                break
+            chunks.append(handler.rfile.read(chunk_size))
+            handler.rfile.readline()
+        return b"".join(chunks)
+
+    raw_length = handler.headers.get("Content-Length")
+    if not raw_length:
+        return b""
+    try:
+        length = max(0, int(raw_length))
+    except ValueError:
+        return b""
+    return handler.rfile.read(length) if length else b""
+
+
+class _ThreadingHTTPServer(socketserver.ThreadingMixIn, http.server.HTTPServer):
+    daemon_threads = True
+    allow_reuse_address = True
+
+
+@contextlib.contextmanager
+def _local_openai_proxy(
+    upstream_base_url: str,
+    *,
+    reasoning_effort: str | None = None,
+    max_completion_tokens: int | None = None,
+) -> Iterator[str]:
+    """Run a loopback proxy shaping `/chat/completions` payloads, or pass through unchanged."""
+    if reasoning_effort is None and max_completion_tokens is None:
+        yield upstream_base_url
+        return
+
+    parts = urllib.parse.urlsplit(upstream_base_url)
+    upstream_origin = f"{parts.scheme}://{parts.netloc}"
+    upstream_prefix = parts.path.rstrip("/")
+    client = httpx.Client(timeout=httpx.Timeout(connect=10.0, read=None, write=30.0, pool=10.0))
+
+    class _ProxyHandler(http.server.BaseHTTPRequestHandler):
+        def log_message(self, format: str, *args: Any) -> None:
+            return
+
+        def _forward(self, method: str) -> None:
+            raw_body = _read_request_body(self) if method in ("POST", "PUT") else b""
+            path_only = urllib.parse.urlsplit(self.path).path.rstrip("/")
+            if method == "POST" and path_only.endswith("/chat/completions"):
+                raw_body = _rewrite_chat_completion_body(
+                    raw_body,
+                    reasoning_effort=reasoning_effort,
+                    max_completion_tokens=max_completion_tokens,
+                )
+
+            fwd_headers = {
+                k: v
+                for k, v in self.headers.items()
+                if k.lower() not in _HOP_BY_HOP_REQ_HEADERS
+            }
+            fwd_headers["accept-encoding"] = "identity"
+            target_url = f"{upstream_origin}{self.path}"
+
+            try:
+                with client.stream(
+                    method, target_url, headers=fwd_headers, content=raw_body or None
+                ) as resp:
+                    self.send_response(resp.status_code)
+                    for hk, hv in resp.headers.items():
+                        if hk.lower() in _HOP_BY_HOP_RESP_HEADERS:
+                            continue
+                        self.send_header(hk, hv)
+                    self.send_header("Connection", "close")
+                    self.end_headers()
+                    for chunk in resp.iter_bytes():
+                        if not chunk:
+                            continue
+                        self.wfile.write(chunk)
+                        self.wfile.flush()
+            except (BrokenPipeError, ConnectionResetError, OSError, httpx.HTTPError):
+                return
+
+        def do_GET(self) -> None:
+            self._forward("GET")
+
+        def do_POST(self) -> None:
+            self._forward("POST")
+
+        def do_PUT(self) -> None:
+            self._forward("PUT")
+
+        def do_DELETE(self) -> None:
+            self._forward("DELETE")
+
+        def do_HEAD(self) -> None:
+            self._forward("HEAD")
+
+        def do_OPTIONS(self) -> None:
+            self._forward("OPTIONS")
+
+    server = _ThreadingHTTPServer(("127.0.0.1", 0), _ProxyHandler)
+    thread = threading.Thread(target=server.serve_forever, daemon=True)
+    thread.start()
+    try:
+        port = server.server_address[1]
+        yield f"http://127.0.0.1:{port}{upstream_prefix}"
+    finally:
+        client.close()
+        server.shutdown()
+        server.server_close()
+        thread.join(timeout=2.0)
+
+
 class AntigravitySDKAdapter:
     """Google Antigravity Python SDK adapter for local Ollama / LM Studio execution."""
 
@@ -635,6 +815,8 @@ class AntigravitySDKAdapter:
         skill_dirs: list[Path] | None = None,
         stall_seconds: float | None = None,
         stall_poll_seconds: float = 10.0,
+        reasoning_effort: str | None = None,
+        max_completion_tokens: int | None = None,
     ) -> tuple[WorkspaceBuildResult, HarnessInvocationResult]:
         """Run the local agent in `app_dir`.
 
@@ -660,6 +842,8 @@ class AntigravitySDKAdapter:
                 stall_seconds=stall_seconds,
                 stall_poll_seconds=stall_poll_seconds,
                 records_dir=records_dir,
+                reasoning_effort=reasoning_effort,
+                max_completion_tokens=max_completion_tokens,
             )
             keep_records = not (build.created_files or build.modified_files or build.deleted_files)
             return build, call
@@ -687,6 +871,8 @@ class AntigravitySDKAdapter:
         stall_seconds: float | None,
         stall_poll_seconds: float,
         records_dir: str,
+        reasoning_effort: str | None = None,
+        max_completion_tokens: int | None = None,
     ) -> tuple[WorkspaceBuildResult, HarnessInvocationResult]:
         version = self.package_version()
         if version is None:
@@ -775,7 +961,15 @@ class AntigravitySDKAdapter:
         usage_meta: Any = None
         try:
             os.chdir(resolved_app_dir)
-            with _credentials_hidden_from_children():
+            with (
+                _credentials_hidden_from_children(),
+                _local_openai_proxy(
+                    candidate.base_url,
+                    reasoning_effort=reasoning_effort,
+                    max_completion_tokens=max_completion_tokens,
+                ) as effective_base_url,
+            ):
+                config_kwargs["base_url"] = effective_base_url
                 config_kwargs["save_dir"] = records_dir
                 cfg = LocalOpenAIAgentConfig(**config_kwargs).lightweight()
                 async with Agent(cfg) as agent:

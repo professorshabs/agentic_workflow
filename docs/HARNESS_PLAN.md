@@ -384,7 +384,7 @@ backends:
 
   builder:
     type: local_harness               # local first, then ordered cloud offload
-    local_harness: antigravity_sdk    # LocalOpenAIAgentConfig(model=..., base_url=...).lightweight()
+    local_harness: local_openai       # native Python tool-loop (antigravity_sdk also supported)
     local_providers:
       lm_studio: http://localhost:1234/v1
       ollama: http://localhost:11434/v1
@@ -401,6 +401,9 @@ backends:
     stall_seconds: 420
     brief_max_chars: 24000
     sandbox: true
+    reasoning_effort: none
+    max_completion_tokens: 4096
+    max_turns: 24
     offload:
       - { name: sonnet, type: harness, provider: claude_code, model: sonnet, auth: subscription, max_budget_usd: 5.00, timeout_seconds: 900 }
       - { name: hydrogen, type: harness, provider: antigravity, model: gemini-4-hydrogen-high, timeout_seconds: 900 }

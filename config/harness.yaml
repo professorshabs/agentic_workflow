@@ -99,7 +99,7 @@ backends:
 
   builder:
     type: local_harness
-    local_harness: antigravity_sdk
+    local_harness: local_openai       # native Python tool-loop (antigravity_sdk also supported)
     local_providers:
       lm_studio: http://localhost:1234/v1
       ollama: http://localhost:11434/v1
@@ -123,6 +123,9 @@ backends:
     brief_max_chars: 24000            # BUILD_BRIEF.md (~6K tokens) instead of the ~30K-token PLAN.md
     allow_shell: false                # file tools only; true gives it run_command (Cwd inside the folder)
     sandbox: true                     # OS sandbox for run_command when allow_shell is true
+    reasoning_effort: none            # stops 12B thinking spirals; null keeps server default
+    max_completion_tokens: 4096       # per-turn output cap (~135s max at 30 tok/s)
+    max_turns: 24                     # tool-call turn limit for local_openai
     offload:
       - name: sonnet
         type: harness

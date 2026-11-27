@@ -18,6 +18,7 @@ from atlas.harnesses import (
     AntigravitySDKAdapter,
     HarnessError,
     HarnessUnavailableError,
+    LocalOpenAIAdapter,
     get_harness_adapter,
 )
 from atlas.harnesses.base import capture_workspace_build_result, snapshot_file_hashes
@@ -1010,8 +1011,10 @@ async def _run_local_build(
     skill_dirs: list[Path] | None,
     local_model_override: str | None,
     emit_passed: bool = True,
+    protected_files: list[str] | None = None,
 ) -> WorkspaceBuildResult:
-    """Resolve the configured local model and build in `root` with the Antigravity SDK."""
+    """Resolve the configured local model and build in `root` with the local builder."""
+    local_harness_name = str(backend.get("local_harness") or "antigravity_sdk")
     explicit_model = local_model_override or backend.get("local_model")
     providers = backend.get("local_providers") or {
         "ollama": DEFAULT_OLLAMA_URL,
@@ -1027,7 +1030,7 @@ async def _run_local_build(
         "running",
         attempt="local",
         phase="resolving",
-        provider="antigravity_sdk",
+        provider=local_harness_name,
         model=str(explicit_model or "auto"),
     )
     resolution = await resolve_local_model(
@@ -1042,7 +1045,7 @@ async def _run_local_build(
             "build",
             "failed",
             attempt="local",
-            provider="antigravity_sdk",
+            provider=local_harness_name,
             error=resolution.reason,
         )
         raise HarnessUnavailableError(resolution.reason)
@@ -1054,17 +1057,25 @@ async def _run_local_build(
         "running",
         attempt="local",
         phase="building",
-        provider="antigravity_sdk",
+        provider=local_harness_name,
         model=f"{candidate.provider}/{candidate.name}",
         stall_seconds=backend.get("stall_seconds"),
         timeout_seconds=timeout_seconds,
     )
+    adapter_label = (
+        "native local OpenAI loop"
+        if local_harness_name == "local_openai"
+        else "Antigravity SDK agent"
+    )
     logger.info(
-        "[build] Selected local model %s/%s — starting Antigravity SDK agent...",
+        "[build] Selected local model %s/%s — starting %s...",
         candidate.provider,
         candidate.name,
+        adapter_label,
     )
-    sdk_adapter = AntigravitySDKAdapter()
+    local_adapter: AntigravitySDKAdapter | LocalOpenAIAdapter = (
+        LocalOpenAIAdapter() if local_harness_name == "local_openai" else AntigravitySDKAdapter()
+    )
     run_kwargs: dict[str, Any] = {
         "candidate": candidate,
         "prompt_text": prompt_text,
@@ -1078,20 +1089,36 @@ async def _run_local_build(
         run_kwargs["allow_shell"] = True
     if backend.get("stall_seconds"):
         run_kwargs["stall_seconds"] = float(backend["stall_seconds"])
+    if backend.get("reasoning_effort") is not None:
+        run_kwargs["reasoning_effort"] = str(backend["reasoning_effort"])
+    if backend.get("max_completion_tokens") is not None:
+        run_kwargs["max_completion_tokens"] = int(backend["max_completion_tokens"])
+    if local_harness_name == "local_openai" and backend.get("max_turns") is not None:
+        run_kwargs["max_turns"] = int(backend["max_turns"])
+    if local_harness_name == "local_openai" and protected_files:
+        run_kwargs["protected_files"] = protected_files
     started = time.monotonic()
     try:
-        result, invocation = await sdk_adapter.run_workspace_task(**run_kwargs)
+        result, invocation = await local_adapter.run_workspace_task(**run_kwargs)
     except Exception as exc:
+        err_usage = getattr(exc, "usage", None)
+        u_dict = err_usage if isinstance(err_usage, dict) else {}
         router.record_harness_call(
             role="builder",
             requested_model=candidate.name,
             used_model=f"{candidate.provider}/{candidate.name}",
-            harness=sdk_adapter.harness,
-            harness_version=sdk_adapter.package_version(),
+            harness=local_adapter.harness,
+            harness_version=local_adapter.package_version(),
             auth_mode="local",
             elapsed_ms=round((time.monotonic() - started) * 1000, 1),
+            prompt_tokens=int(u_dict.get("prompt_tokens") or 0),
+            completion_tokens=int(u_dict.get("completion_tokens") or 0),
+            cached_tokens=int(u_dict.get("cached_tokens") or 0),
+            reasoning_tokens=int(u_dict.get("reasoning_tokens") or 0),
+            total_tokens=int(u_dict.get("total_tokens") or 0),
             cost_usd=0.0,
             cost_source="local_free",
+            usage_reported=bool(u_dict.get("usage_reported", False)),
             error=f"{type(exc).__name__}: {exc}",
         )
         publish(
@@ -1099,7 +1126,7 @@ async def _run_local_build(
             "build",
             "failed",
             attempt="local",
-            provider="antigravity_sdk",
+            provider=local_harness_name,
             error=f"{type(exc).__name__}: {exc}",
         )
         raise
@@ -1110,7 +1137,7 @@ async def _run_local_build(
             "build",
             "passed",
             attempt="local",
-            provider="antigravity_sdk",
+            provider=local_harness_name,
             model=invocation.used_model,
             files=len(result.created_files) + len(result.modified_files),
         )
@@ -1482,9 +1509,11 @@ async def build_app_workspace(
     linked_skills = created_links or _existing_skill_links(root, resolved_skills)
     discovery_mode = str(skills_cfg.get("discovery_mode") or "").strip().lower()
     skills_mode: Literal["progressive", "injected"] | None = None
+    local_harness_name = str(backend.get("local_harness") or "antigravity_sdk")
+    needs_abs_paths = is_local and local_harness_name == "antigravity_sdk"
     if discovery_mode == "progressive" and linked_skills:
         skill_prompt = format_role_skill_index(
-            "builder", skills_cfg, workspace_root=root if is_local else None
+            "builder", skills_cfg, workspace_root=root if needs_abs_paths else None
         )
         offload_skill_prompt = format_role_skill_index("builder", skills_cfg)
         if resolved_skills:
@@ -1505,7 +1534,7 @@ async def build_app_workspace(
         brief_file=brief_file,
         e2e_preseeded=e2e_preseeded,
         workspace_root=root,
-        require_absolute_paths=is_local,
+        require_absolute_paths=needs_abs_paths,
         file_tools_only=is_local and backend.get("allow_shell") is not True,
     )
     skill_dirs = [root / ".agents" / "skills"] if linked_skills else None
@@ -1523,6 +1552,12 @@ async def build_app_workspace(
         if is_local:
             offload = [dict(t) for t in (backend.get("offload") or []) if isinstance(t, dict)]
             try:
+                local_protected: list[str] = []
+                if e2e_preseeded and e2e_suite is not None:
+                    local_protected.extend(normalize_rel_path(f.path) for f in e2e_suite.files)
+                for extra_doc in (brief_file, plan_file):
+                    if extra_doc:
+                        local_protected.append(extra_doc)
                 result = await _run_local_build(
                     router,
                     backend,
@@ -1532,6 +1567,7 @@ async def build_app_workspace(
                     skill_dirs=skill_dirs,
                     local_model_override=local_model_override,
                     emit_passed=False,
+                    protected_files=local_protected or None,
                 )
                 written = len(result.created_files) + len(result.modified_files)
                 if offload and written == 0:
@@ -1551,7 +1587,7 @@ async def build_app_workspace(
                     "build",
                     "passed",
                     attempt="local",
-                    provider="antigravity_sdk",
+                    provider=local_harness_name,
                     model=result.model,
                     files=written,
                     available_skills=result.available_skills,

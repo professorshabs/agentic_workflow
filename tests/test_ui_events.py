@@ -434,3 +434,28 @@ def test_token_split_is_not_guessed_when_calls_do_not_line_up(tmp_path):
     )
     (event,) = load_run_events(tmp_path)
     assert "input_tokens" not in event["data"]
+
+
+def test_bus_stores_absolute_app_dir_across_chdir(bus, tmp_path, monkeypatch):
+    project_root = tmp_path / "repo"
+    app = project_root / "app" / "example-app"
+    out = project_root / "runs" / "r1"
+    app.mkdir(parents=True)
+    out.mkdir(parents=True)
+    monkeypatch.chdir(project_root)
+
+    publish("run", "run", "running", run_id="r1", out_dir="runs/r1", app_dir="app/example-app")
+    assert bus.app_dir == app
+    assert bus.out_dir == out
+
+    monkeypatch.chdir(app)
+    assert bus.app_dir is not None and bus.app_dir.is_dir() and bus.app_dir == app
+
+
+def test_ui_stall_handoff_copy_uses_idle_duration_words():
+    from pathlib import Path
+
+    html = Path("src/atlas/ui/static/index.html").read_text(encoding="utf-8")
+    assert "function fmtDurWords" in html
+    assert "hands off after ${fmtDurWords(a.stall_seconds)} idle" in html
+    assert "handed on at" not in html

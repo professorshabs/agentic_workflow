@@ -1429,3 +1429,174 @@ def test_local_build_prompt_advises_small_files_first(tmp_path):
         require_absolute_paths=True,
     )
     assert "Write small files first" in prompt_text
+
+
+# --- local OpenAI shaping proxy ---------------------------------------------------------
+
+
+def test_local_openai_proxy_noop_when_unconfigured():
+    from atlas.harnesses.antigravity import _local_openai_proxy
+
+    upstream = "http://localhost:1234/v1"
+    with _local_openai_proxy(upstream) as url:
+        assert url == upstream
+
+
+def test_local_openai_proxy_rewrites_chat_completions_and_streams_sse():
+    import http.server
+    import socketserver
+    import threading
+
+    from atlas.harnesses.antigravity import _local_openai_proxy
+
+    captured: list[tuple[str, str, dict | None]] = []
+
+    class _UpstreamHandler(http.server.BaseHTTPRequestHandler):
+        def log_message(self, format: str, *args) -> None:
+            return
+
+        def do_GET(self) -> None:
+            captured.append(("GET", self.path, None))
+            body = json.dumps({"data": [{"id": "google/gemma-4-12b-qat"}]}).encode("utf-8")
+            self.send_response(200)
+            self.send_header("Content-Type", "application/json")
+            self.send_header("Content-Length", str(len(body)))
+            self.end_headers()
+            self.wfile.write(body)
+
+        def do_POST(self) -> None:
+            length = int(self.headers.get("Content-Length") or 0)
+            payload = json.loads(self.rfile.read(length).decode("utf-8"))
+            captured.append(("POST", self.path, payload))
+            self.send_response(200)
+            self.send_header("Content-Type", "text/event-stream")
+            self.end_headers()
+            chunks = (
+                b'data: {"choices":[{"delta":{"content":"hi"}}]}\n\n',
+                b"data: [DONE]\n\n",
+            )
+            for chunk in chunks:
+                self.wfile.write(chunk)
+                self.wfile.flush()
+
+    class _Srv(socketserver.ThreadingMixIn, http.server.HTTPServer):
+        daemon_threads = True
+
+    srv = _Srv(("127.0.0.1", 0), _UpstreamHandler)
+    t = threading.Thread(target=srv.serve_forever, daemon=True)
+    t.start()
+    try:
+        upstream_url = f"http://127.0.0.1:{srv.server_address[1]}/v1"
+        with _local_openai_proxy(
+            upstream_url, reasoning_effort="none", max_completion_tokens=8192
+        ) as proxy_url:
+            models_resp = httpx.get(f"{proxy_url}/models", timeout=5.0)
+            assert models_resp.status_code == 200
+            assert models_resp.json()["data"][0]["id"] == "google/gemma-4-12b-qat"
+
+            # SDK large default (65535) gets capped to 8192 and reasoning_effort injected.
+            r1 = httpx.post(
+                f"{proxy_url}/chat/completions",
+                json={"model": "m", "messages": [], "max_completion_tokens": 65535},
+                timeout=5.0,
+            )
+            assert r1.status_code == 200
+            assert 'data: {"choices":[{"delta":{"content":"hi"}}]}' in r1.text
+            assert "data: [DONE]" in r1.text
+
+            # Smaller caller max_completion_tokens (512) is preserved.
+            r2 = httpx.post(
+                f"{proxy_url}/chat/completions",
+                json={"model": "m", "messages": [], "max_completion_tokens": 512},
+                timeout=5.0,
+            )
+            assert r2.status_code == 200
+    finally:
+        srv.shutdown()
+        srv.server_close()
+        t.join(timeout=2.0)
+
+    assert captured[0] == ("GET", "/v1/models", None)
+    assert captured[1][0:2] == ("POST", "/v1/chat/completions")
+    assert captured[1][2] == {
+        "model": "m",
+        "messages": [],
+        "reasoning_effort": "none",
+        "max_completion_tokens": 8192,
+    }
+    assert captured[2][2]["max_completion_tokens"] == 512
+
+
+@pytest.mark.parametrize(
+    ("extra", "match"),
+    [
+        ({"reasoning_effort": "extreme"}, "reasoning_effort"),
+        ({"max_completion_tokens": 0}, "max_completion_tokens"),
+        ({"max_completion_tokens": True}, "max_completion_tokens"),
+    ],
+)
+def test_builder_rejects_invalid_reasoning_or_token_cap(tmp_path, extra, match):
+    cfg = {
+        "roles": {"builder": ["local-auto"]},
+        "backends": {
+            "builder": {
+                "type": "local_harness",
+                "local_harness": "antigravity_sdk",
+                "local_providers": {"lm_studio": LMS},
+                **extra,
+            }
+        },
+        "limits": {
+            "max_parallel_calls": 2,
+            "max_tokens": 2000,
+            "timeout_seconds": 30,
+            "attempts_per_model": 1,
+            "repair_attempts": 0,
+        },
+    }
+    cfg_path = tmp_path / "h.yaml"
+    cfg_path.write_text(yaml.safe_dump(cfg), encoding="utf-8")
+    with pytest.raises(ValueError, match=match):
+        ModelRouter(cfg_path)
+
+
+async def test_run_local_build_forwards_reasoning_effort_and_token_cap(monkeypatch, tmp_path):
+    cand = _cand(TWELVE_B)
+    seen: dict = {}
+
+    async def ready(**kwargs):
+        return LocalResolutionResult(selected=cand, candidates=[cand])
+
+    async def fake_sdk(self, **kwargs):
+        seen.update(kwargs)
+        app_dir = kwargs["app_dir"]
+        app_dir.mkdir(parents=True, exist_ok=True)
+        (app_dir / "main.py").write_text("print('ok')\n", encoding="utf-8")
+        return (
+            WorkspaceBuildResult(
+                summary="done",
+                harness="antigravity_sdk",
+                model=f"lm_studio/{TWELVE_B}",
+                app_dir=str(app_dir),
+                created_files=["main.py"],
+                files_snapshot=["main.py"],
+            ),
+            HarnessInvocationResult(
+                text="ok",
+                used_model=f"lm_studio/{TWELVE_B}",
+                harness="antigravity_sdk",
+                auth_mode="local",
+                cost_source="local_free",
+                usage_reported=True,
+            ),
+        )
+
+    monkeypatch.setattr("atlas.pipeline.build.resolve_local_model", ready)
+    monkeypatch.setattr("atlas.pipeline.build.AntigravitySDKAdapter.run_workspace_task", fake_sdk)
+    router = _router(tmp_path, "      []")
+    router.cfg["backends"]["builder"]["reasoning_effort"] = "none"
+    router.cfg["backends"]["builder"]["max_completion_tokens"] = 8192
+
+    await build_app_workspace(router, SPEC, tmp_path / "app" / "x")
+    assert seen["reasoning_effort"] == "none"
+    assert seen["max_completion_tokens"] == 8192

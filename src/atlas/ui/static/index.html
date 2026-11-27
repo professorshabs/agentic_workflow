@@ -472,6 +472,7 @@ const STAGES = [
 const NAMES = Object.fromEntries(STAGES.map(s => [s.id, s.name]));
 const HARNESS_NAMES = {
   antigravity_sdk: "Local SDK",
+  local_openai: "Local OpenAI",
   antigravity: "Antigravity CLI",
   agy: "Antigravity CLI",
   claude_code: "Claude Code",
@@ -514,6 +515,14 @@ function fmtDur(sec) {
   sec = Math.max(0, Math.round(sec));
   const h = Math.floor(sec / 3600), m = Math.floor((sec % 3600) / 60), s = sec % 60;
   return h ? `${h}:${String(m).padStart(2, "0")}:${String(s).padStart(2, "0")}` : `${m}:${String(s).padStart(2, "0")}`;
+}
+function fmtDurWords(sec) {
+  if (sec == null || !isFinite(sec)) return "";
+  sec = Math.max(0, Math.round(sec));
+  const h = Math.floor(sec / 3600), m = Math.floor((sec % 3600) / 60), s = sec % 60;
+  if (h) return `${h}h ${String(m).padStart(2, "0")}m`;
+  if (m) return `${m}m ${String(s).padStart(2, "0")}s`;
+  return `${s}s`;
 }
 function fmtBytes(n) {
   if (n == null || !isFinite(n)) return "";
@@ -865,7 +874,7 @@ function activitySentence(now) {
       if (a.phase === "resolving") return { text: "Checking that the local model is loaded and ready", state: "running" };
       const who = a.name === "local" ? `${short(a.model)} on this Mac` : a.name === "builder" ? short(a.model || a.label) : `${a.name} (${short(a.model || a.label)})`;
       const idle = idleSeconds(now);
-      const limit = a.stall_seconds ? ` (handed on at ${fmtDur(a.stall_seconds)})` : "";
+      const limit = a.stall_seconds ? ` (hands off after ${fmtDurWords(a.stall_seconds)} idle)` : "";
       const idleNote = idle != null && idle > 30 ? `. No file changes for ${fmtDur(idle)}${limit}` : "";
       return { text: `Building with ${who}${idleNote}`, state: "running" };
     }
@@ -1083,7 +1092,7 @@ function detailBody(id, status, now) {
         const curIdle = idle != null ? idle : 0;
         const pct = Math.min(100, Math.round(100 * curIdle / a.stall_seconds));
         const cls = pct >= 85 ? "bad" : pct >= 60 ? "warn" : "";
-        h += `<div class="stall-box"><div id="stall-label">Last file change ${fmtDur(curIdle)} ago · stall handoff to ${esc(S.attemptOrder[1] || "next builder")} at ${fmtDur(a.stall_seconds)}</div><span class="meter" aria-hidden="true"><i id="stall-fill" class="${cls}" style="width:${pct}%"></i></span></div>`;
+        h += `<div class="stall-box"><div id="stall-label">Last file change ${fmtDur(curIdle)} ago · stall handoff to ${esc(S.attemptOrder[1] || "next builder")} after ${fmtDurWords(a.stall_seconds)} idle</div><span class="meter" aria-hidden="true"><i id="stall-fill" class="${cls}" style="width:${pct}%"></i></span></div>`;
       }
       if (S.workspace) {
         const ws = S.workspace;
@@ -1213,7 +1222,7 @@ function updateDetailClock(id, status, now) {
     if (a && a.name === "local" && a.stall_seconds) {
       const curIdle = idle != null ? idle : 0;
       const pct = Math.min(100, Math.round(100 * curIdle / a.stall_seconds));
-      stallLabel.textContent = `Last file change ${fmtDur(curIdle)} ago · stall handoff to ${S.attemptOrder[1] || "next builder"} at ${fmtDur(a.stall_seconds)}`;
+      stallLabel.textContent = `Last file change ${fmtDur(curIdle)} ago · stall handoff to ${S.attemptOrder[1] || "next builder"} after ${fmtDurWords(a.stall_seconds)} idle`;
       stallFill.style.width = `${pct}%`;
       stallFill.className = pct >= 85 ? "bad" : pct >= 60 ? "warn" : "";
     }

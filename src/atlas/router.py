@@ -49,7 +49,7 @@ _ROLE_STAGE = {
 }
 _ALLOWED_BACKEND_TYPES = {"openrouter", "litellm", "harness", "local_harness"}
 _ALLOWED_HARNESS_PROVIDERS = {"antigravity", "claude_code"}
-_ALLOWED_LOCAL_HARNESSES = {"antigravity_sdk"}
+_ALLOWED_LOCAL_HARNESSES = {"antigravity_sdk", "local_openai"}
 _ALLOWED_LOCAL_PROVIDERS = {"ollama", "lm_studio"}
 _ALLOWED_AUTH_MODES = {"subscription", "oauth_token", "api"}
 _ALLOWED_SUPERVISOR_TOOLS = {"Read", "Grep", "Glob"}
@@ -421,6 +421,33 @@ class ModelRouter:
                         val = bcfg.get(key)
                         if val is not None and (isinstance(val, bool) or float(val) <= 0):
                             raise ValueError(f"backends['{role}'].{key} must be > 0")
+                    effort = bcfg.get("reasoning_effort")
+                    if effort is not None and (
+                        not isinstance(effort, str)
+                        or effort not in {"none", "low", "medium", "high"}
+                    ):
+                        raise ValueError(
+                            f"backends['{role}'].reasoning_effort must be one of "
+                            "['none', 'low', 'medium', 'high']"
+                        )
+                    max_comp = bcfg.get("max_completion_tokens")
+                    if max_comp is not None and (
+                        isinstance(max_comp, bool)
+                        or not isinstance(max_comp, int)
+                        or max_comp < 1
+                    ):
+                        raise ValueError(
+                            f"backends['{role}'].max_completion_tokens must be an integer >= 1"
+                        )
+                    max_turns = bcfg.get("max_turns")
+                    if max_turns is not None and (
+                        isinstance(max_turns, bool)
+                        or not isinstance(max_turns, int)
+                        or max_turns < 1
+                    ):
+                        raise ValueError(
+                            f"backends['{role}'].max_turns must be an integer >= 1"
+                        )
                     lp = bcfg.get("local_providers", ["ollama", "lm_studio"])
                     if isinstance(lp, dict):
                         if not lp or any(k not in _ALLOWED_LOCAL_PROVIDERS for k in lp):

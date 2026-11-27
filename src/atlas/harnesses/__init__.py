@@ -23,6 +23,7 @@ from .base import (
     HarnessUnavailableError,
 )
 from .claude_code import ClaudeCodeAdapter
+from .local_openai import LocalOpenAIAdapter
 
 if TYPE_CHECKING:
     from atlas.router import ModelRouter
@@ -35,6 +36,15 @@ def get_harness_adapter(provider: str) -> HarnessAdapter:
     if provider == "claude_code":
         return ClaudeCodeAdapter()
     raise ValueError(f"Unsupported harness provider: {provider}")
+
+
+def get_local_harness_adapter(name: str) -> AntigravitySDKAdapter | LocalOpenAIAdapter:
+    """Return the configured local builder harness adapter."""
+    if name == "local_openai":
+        return LocalOpenAIAdapter()
+    if name == "antigravity_sdk":
+        return AntigravitySDKAdapter()
+    raise ValueError(f"Unsupported local harness: {name}")
 
 
 _API_KEY_ENVS_BY_PROVIDER: dict[str, tuple[str, ...]] = {
@@ -68,11 +78,11 @@ async def run_doctor(
     backends = router.cfg.get("backends") or {}
     harness_configs: dict[tuple[str, str | None], None] = {}
     cloud_providers: set[str] = set()
-    needs_local_sdk = False
+    local_harnesses: set[str] = set()
     offload_configured = False
 
     def _collect_backend_deps(cfg: dict[str, Any], *, role_name: str | None = None) -> None:
-        nonlocal needs_local_sdk, offload_configured
+        nonlocal offload_configured
         btype = str(cfg.get("type", "openrouter") or "openrouter")
         if btype == "harness":
             prov = str(cfg.get("provider") or "")
@@ -80,7 +90,7 @@ async def run_doctor(
                 auth_val = str(cfg["auth"]) if cfg.get("auth") is not None else None
                 harness_configs[(prov, auth_val)] = None
         elif btype == "local_harness":
-            needs_local_sdk = True
+            local_harnesses.add(str(cfg.get("local_harness") or "antigravity_sdk"))
             offload = [t for t in (cfg.get("offload") or []) if isinstance(t, dict)]
             if offload:
                 offload_configured = True
@@ -129,11 +139,12 @@ async def run_doctor(
         if not (status.available and status.authenticated):
             all_ok = False
 
-    if needs_local_sdk:
-        sdk_status = await AntigravitySDKAdapter().check_auth()
-        checks.append(sdk_status.model_dump(mode="json"))
-        if not (sdk_status.available and sdk_status.authenticated):
-            all_ok = False
+    if local_harnesses:
+        for lh_name in sorted(local_harnesses):
+            lh_status = await get_local_harness_adapter(lh_name).check_auth()
+            checks.append(lh_status.model_dump(mode="json"))
+            if not (lh_status.available and lh_status.authenticated):
+                all_ok = False
 
         builder_cfg = backends.get("builder") or {}
         providers = builder_cfg.get("local_providers") or {
@@ -224,6 +235,8 @@ __all__ = [
     "HarnessError",
     "HarnessInvocationResult",
     "HarnessUnavailableError",
+    "LocalOpenAIAdapter",
     "get_harness_adapter",
+    "get_local_harness_adapter",
     "run_doctor",
 ]
